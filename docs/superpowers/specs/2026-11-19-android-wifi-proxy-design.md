@@ -1,0 +1,205 @@
+# Android Wi-Fi Proxy — Design Spec
+
+- **Date:** 2026-11-19
+- **Status:** Approved design, pending implementation plan
+- **Inputs:** 3-engineer design panel (network transport, platform/lifecycle, client UX & security)
+
+## 1. Goal and constraints
+
+Share a host Android phone's **cellular** data with up to **3** other phones over Wi-Fi, without using Android's system tethering/hotspot (the carrier blocks or meters tethering). Traffic must leave the host as host-originated connections.
+
+| Constraint | Decision |
+|---|---|
+| Client devices | Any phone (Android or iPhone). **No app install** — client only joins Wi-Fi and sets a proxy (PAC URL or `.mobileconfig`). |
+| Host | **Non-root, sideload only** (not Play Store). Public APIs only; no hidden APIs required. |
+| Platform | Kotlin, single process. `minSdk 29`, `targetSdk`/`compileSdk 37`. |
+| Clients | 1–3 concurrent, configurable in the app (default 1). |
+| Access | Wi-Fi password **predefined by the host user**; no default ships. |
+
+**Non-goals (v1):** SOCKS5, LocalOnlyHotspot fallback, proxy authentication, UDP of any kind, HTTP caching, Play Store distribution.
+
+**Planned v2 (out of scope here):** optional Android client app (`VpnService` + tun2socks) routing all client traffic to a SOCKS5 listener added to the host. Restores UDP, calls, games and proxy-ignoring apps for Android clients only.
+
+## 2. Key decisions and rationale
+
+1. **Link = Wi-Fi Direct autonomous group owner** via `WifiP2pManager.createGroup(channel, WifiP2pConfig, …)` with `WifiP2pConfig.Builder` (API 29+): `setNetworkName("DIRECT-xy-<suffix>")`, `setPassphrase(<user password>)`, `setGroupOperatingBand(GROUP_OWNER_BAND_5GHZ)` with fallback to `AUTO`. Legacy clients (iPhone, Android) join it as an ordinary WPA2-PSK network.
+   - *Rejected: LocalOnlyHotspot* — SSID/passphrase are random each start; setting them requires a `@SystemApi`, which conflicts with the predefined-password requirement.
+   - Neither P2P nor LOHS invokes the carrier tethering entitlement check (that runs only on `TetheringManager.startTethering`).
+2. **Proxy = pure Kotlin HTTP proxy** (CONNECT + absolute-URI forwarding) on coroutines over `java.nio`. Not Ktor server (its HTTP pipeline obstructs CONNECT tunnelling); not gomobile/native (would need a JNI callback for `Network.bindSocket`).
+3. **Egress = explicit cellular binding.** Every upstream socket and every DNS lookup is bound to a cellular `Network`. Rule: **bound-or-refuse** — never fall back to the default network.
+4. **Client config = PAC, not manual proxy.** Android's NetworkMonitor treats a successful PAC fetch as network validation (removes "No internet"); Apple documents APNs proxying only via PAC (iOS 13.4+).
+5. **Two-layer access control:** Wi-Fi password gates joining the network; per-device slot tokens gate proxy use and enforce the 1–3 cap.
+6. **No proxy auth** — Android's Wi-Fi proxy setting cannot carry credentials and many apps mishandle `407`.
+
+## 3. Architecture
+
+Single-process app. A `connectedDevice` foreground service (`ProxySessionService`) hosts all session components.
+
+| Unit | Responsibility | Interface (sketch) |
+|---|---|---|
+| `SessionController` | Single-owner coroutine actor; runs the session state machine | `start()`, `stop()`, `state: StateFlow<SessionState>` |
+| `P2pGroupLink` (implements `LinkManager`) | Create/maintain the Wi-Fi Direct group; read back and verify actual SSID/passphrase; recreate on teardown | `start(cfg): Flow<LinkState>`, `stop()` |
+| `EgressNetworkProvider` | Hold a cellular `requestNetwork`; provide bound sockets and DNS | `network: StateFlow<Network?>`, `connect(host, port)`, `resolve(host)` |
+| `ProxyServer` | Listener on group-owner IP; HTTP proxy, PAC, `.mobileconfig`, connectivity-probe answers | `start(bindAddr, port, egress, registry)`, `stop()`, `stats: Flow<TunnelStats>` |
+| `ClientRegistry` | Client slots, tokens, token→IP binding, cap enforcement, revocation | `addSlot(name): Slot`, `revoke(id)`, `onPacFetch(token, ip)`, `isAdmitted(ip): Slot?`, `maxClients` |
+| `CredentialStore` | SSID suffix + Wi-Fi password, encrypted with Android Keystore | `get()`, `set(suffix, password)` |
+| `PowerKeeper` | Partial wake lock + `WIFI_MODE_FULL_LOW_LATENCY` WifiLock, tied to state | `onState(state)` |
+| `SystemMonitor` | Wi-Fi, P2P, airplane mode, Data Saver, system hotspot, permissions, thermal status | `events: Flow<SystemEvent>` |
+| `HealthWatchdog` | Every 30 s: listener accepts, group exists, egress reachable | `events: Flow<HealthEvent>` |
+| `PreflightChecker` / `OemGuide` | Pre-start checks; manufacturer-specific battery guidance | `check(): List<Issue>` |
+| `NotificationPresenter`, Compose UI | Notification and screens (§8) | — |
+
+### Session state machine
+
+```
+Idle → Preflight → Starting → Running{AwaitingClient | Serving}
+Running ⇄ Degraded{LinkDown | NoEgress | WifiOff}
+Degraded → Recovering(backoff) → Running
+Degraded → Failed(needsUser)
+any → Stopping → Idle
+```
+
+Desired state ("session should be running") and credentials persist in DataStore / Keystore. Service returns `START_STICKY`; a null-intent restart reloads desired state and re-enters `Starting`.
+
+## 4. Access control and multi-client admission
+
+### Layer 1 — Wi-Fi password (user-defined)
+
+- Settings: SSID suffix (prefixed `DIRECT-xy-`, as the API requires) and password (8–63 ASCII chars, WPA2 rule) with a strength meter.
+- Stored encrypted (Keystore); reused every session, so clients auto-rejoin. Never auto-rotated.
+- First session cannot start until a password is set. No default password ships.
+- Changing the password restarts the group and drops all clients (confirm dialog).
+- **Read-back verification:** after `createGroup`, read `WifiP2pGroup.networkName`/`passphrase`. On mismatch (some OEM firmware ignores the config) → `Failed(needsUser)` with an error naming the device model; QR codes are not shown.
+- Wi-Fi QR (`WIFI:T:WPA;S:<ssid>;P:<password>;;`) is hidden behind tap-to-reveal.
+
+### Layer 2 — proxy slots (cap 1–3)
+
+- **Slot** = `{id, displayName, token (128-bit random, URL-safe), boundIp?, createdAt, lastSeen, byte counters}`.
+- "Add device" creates a slot if `activeSlots < maxClients`, and shows its PAC URL `http://<goIp>:<port>/<token>.pac` (or `<token>.mobileconfig` for iPhone).
+- **Identity is the token, not the IP.** Each fetch of a slot's PAC binds that slot to the fetching IP, replacing any previous IP. Clients re-fetch PAC on reconnect, so a new DHCP lease or randomized MAC moves the slot instead of consuming a new one.
+- Every proxy request: source IP must be bound to an active slot, else `403`.
+- Lowering `maxClients` below active slot count prompts the user to choose which slot(s) to revoke.
+- Revoke removes one slot and closes its tunnels; password change drops everyone.
+- A device that knows the Wi-Fi password but holds no slot can join Wi-Fi but every proxy request gets `403`.
+- Per-slot tunnel cap: 256 concurrent. No per-slot bandwidth shaping in v1; bandwidth is shared by ordinary TCP fairness across tunnels.
+
+## 5. Data flow
+
+### Client → host
+
+1. Client joins `DIRECT-xy-…` with the predefined password; group DHCP assigns 192.168.49.x. The group-owner IP is read from `WifiP2pInfo.groupOwnerAddress`, never hard-coded.
+2. Client fetches `/<token>.pac` → `ClientRegistry.onPacFetch` binds slot → response:
+   `function FindProxyForURL(u,h){return "PROXY <goIp>:<port>";}` (no `dnsResolve`/`isInNet` — the link has no DNS).
+3. `ProxyServer` reads the first request line on the single listener port (default 8080; non-root cannot bind <1024):
+   - `CONNECT host:port` → TLS tunnel.
+   - Absolute-URI request (`GET http://…`) → plain HTTP forward; strip `Proxy-*` hop-by-hop headers.
+   - `GET /<token>.pac` / `GET /<token>.mobileconfig` → served locally.
+   - Connectivity probes (`connectivitycheck.gstatic.com/generate_204`, `www.google.com/gen_204`, `captive.apple.com/hotspot-detect.html`) → answered locally **only while the cellular network is `VALIDATED`**; otherwise forwarded (and thus failed) so clients aren't told they're online when they aren't.
+   - Anything else → `400`.
+
+### Host → internet
+
+4. Admission: `ClientRegistry.isAdmitted(srcIp)` else `403`; per-slot tunnel cap else `503`.
+5. DNS via `cellNetwork.getAllByName()` (or `DnsResolver` bound to the network), with a TTL-respecting cache.
+6. Destination filter after resolution: reject loopback, RFC 1918, link-local, CGNAT `100.64.0.0/10`, the P2P subnet, and IPv6 equivalents (`::1`, `fc00::/7`, `fe80::/10`) → `403`.
+7. Open `SocketChannel`; `cellNetwork.bindSocket(channel.socket())` **before** `connect`. Happy-eyeballs: IPv6 first, IPv4 after 250 ms. No cellular network → immediate `503`.
+8. Bidirectional pump with pooled 64 KB direct buffers, `TCP_NODELAY`, kernel-default socket buffers, backpressure. Byte counts feed per-slot counters.
+
+### Listener binding
+
+`ServerSocketChannel` binds **only** to the group-owner IP. Never `0.0.0.0` or `::` — cellular IPv6 addresses are often globally routable, so a wildcard bind is an internet-open proxy. Each accepted peer is also checked against the P2P subnet.
+
+### Network change
+
+- Cellular `onLost`/new `onAvailable` → swap the egress handle atomically; close all tunnels bound to the old `Network`; `Degraded(NoEgress)` returns `503` while link and listener stay up.
+- Group teardown → `Degraded(LinkDown)`; recreate with identical credentials; clients rejoin and re-fetch PAC (re-binding slots).
+
+### Timeouts
+
+Idle tunnel timeout 5 min; 30 min for Apple push (destination port 5223 or `17.0.0.0/8`).
+
+## 6. Error handling and reliability
+
+### Self-healing (Degraded → Recovering → Running)
+
+| Event | Detection | Response |
+|---|---|---|
+| Cellular lost/changed | `NetworkCallback` | Close old tunnels, `503` meanwhile, rebind on available |
+| P2P group torn down | `WIFI_P2P_CONNECTION_CHANGED_ACTION`, `requestGroupInfo` → null | Recreate with same credentials; backoff 1 s → 2 s → … cap 60 s |
+| Wi-Fi off | `WIFI_P2P_STATE_CHANGED_ACTION` | `Degraded(WifiOff)`; notification action opens `Settings.Panel.ACTION_WIFI` (apps cannot enable Wi-Fi on API 29+) |
+| Airplane mode | `SystemMonitor` | Link + egress down; auto-recover on exit |
+| Process killed | `START_STICKY` + persisted desired state | Restore session; clients auto-rejoin (fixed credentials) |
+| Silent stall | `HealthWatchdog` (30 s) | Restart the failing component |
+
+### Needs the user → `Failed(needsUser)` with a specific message
+
+- Permission revoked: `NEARBY_WIFI_DEVICES`, `ACCESS_LOCAL_NETWORK` (API 37 — revocation manifests only as client timeouts, so it is re-checked on every resume and by the watchdog), `POST_NOTIFICATIONS`.
+- Firmware ignored requested SSID/password (read-back mismatch).
+- 10 consecutive failed recoveries.
+- System hotspot enabled (kills the P2P group on single-radio devices).
+
+### Proxy errors
+
+`403` unknown source IP or blocked destination · `503` no egress or tunnel cap · `502` DNS failure / connect refused · `504` connect timeout · `400` malformed request (close connection). Each tunnel is isolated; one failure never affects others.
+
+### Preflight (before every start)
+
+Permissions granted, password set, cellular available, battery-optimization exemption granted, OEM battery settings (Samsung "Never sleeping apps"/Unrestricted; Xiaomi Autostart + No restrictions; OnePlus/ColorOS background activity; link to dontkillmyapp.com).
+
+### Power and thermal
+
+- Partial wake lock while `Running`.
+- WifiLock `WIFI_MODE_FULL_LOW_LATENCY` acquired while `Running` (best-effort; GO-side power save is driver-controlled).
+- `PowerManager` thermal status ≥ `SEVERE` → throttle new tunnels, warn in notification.
+
+### Diagnostics and privacy
+
+- Ring-buffer file log of state transitions; exportable. `ApplicationExitInfo` reason recorded on startup.
+- **No URLs or hostnames logged** — byte and connection counters only.
+
+## 7. Permissions and manifest
+
+- `INTERNET`, `ACCESS_NETWORK_STATE`, `CHANGE_NETWORK_STATE`, `ACCESS_WIFI_STATE`, `CHANGE_WIFI_STATE`
+- `NEARBY_WIFI_DEVICES` with `usesPermissionFlags="neverForLocation"` (API 33+)
+- `ACCESS_FINE_LOCATION` with `maxSdkVersion="32"` (P2P on API 29–32)
+- `ACCESS_LOCAL_NETWORK` (API 37; same NEARBY_DEVICES group, no extra prompt)
+- `POST_NOTIFICATIONS` (API 33+)
+- `FOREGROUND_SERVICE`, `FOREGROUND_SERVICE_CONNECTED_DEVICE`; service `foregroundServiceType="connectedDevice"` (no time limit; not `dataSync`, which is capped at 6 h/24 h on API 35+)
+- `WAKE_LOCK`, `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`
+
+`startForeground()` is called immediately on start, before slow P2P setup.
+
+## 8. UI (Jetpack Compose)
+
+1. **Home** — Start/Stop, session state, cellular indicator, slots `n/max` with per-device name, live up/down counters, Revoke.
+2. **Add device** — QR 1: Wi-Fi (tap-to-reveal). QR 2: the slot's PAC URL, iPhone/Android toggle (iPhone → `.mobileconfig`). Short per-platform steps, including "turn off mobile data on the client" and (Android) "set Private DNS to Off/Automatic".
+3. **Settings** — SSID suffix, password, max clients (1–3), port (default 8080), prefer 5 GHz, data-usage history.
+4. **Setup check** — permissions, battery exemption, OEM steps; re-checked on every app open.
+5. **Diagnostics** — state log viewer, Export.
+
+In-app disclosure: "Web and most apps work. Calls, games and some apps won't." Plus a note that carriers define tethering by usage, so this may still breach the carrier's terms.
+
+### Client onboarding
+
+- **iPhone:** scan Wi-Fi QR → open `<token>.mobileconfig` link → install profile in Settings (contains Wi-Fi payload with `ProxyType=Auto`, `ProxyPACURL`). Manual alternative: Wi-Fi (i) → Configure Proxy → Automatic → PAC URL.
+- **Android:** scan Wi-Fi QR → network → Edit → Advanced → Proxy → Proxy Auto-Config → PAC URL.
+
+## 9. Expected client coverage
+
+- **Works:** browsers; apps using URLSession/CFNetwork (iOS) or HttpURLConnection/OkHttp (Android); iOS push via PAC.
+- **Fails:** all UDP (VoIP/WebRTC media, most games, QUIC — browsers fall back to TCP under a proxy); apps that bypass system proxy (some Flutter/custom-stack apps, games, media SDKs); Android FCM push (port 5228 ignores proxy).
+
+## 10. Testing
+
+- **Unit (JVM):** `SessionController` (fake link/egress/clock, Turbine, `TestDispatcher`); `ClientRegistry` (slot create, token→IP rebind, cap enforcement, revocation, cap reduction); request-line parsing; destination filter; backoff.
+- **Loopback integration:** real `ProxyServer` on 127.0.0.1 driven by OkHttp — CONNECT, absolute-URI HTTP, PAC/mobileconfig, `403`/`503`/`400`.
+- **Instrumented:** FGS lifecycle, permission flows (UiAutomator), cellular socket binding. Emulator lacks Wi-Fi Direct → link tests on real devices.
+- **Manual matrix:** Pixel (Android 15/16/17), Samsung One UI, Xiaomi HyperOS, OnePlus, one API 29 device. Scenarios: 4 h screen-off soak; `dumpsys deviceidle force-idle`; `am set-standby-bucket restricted`; `am kill`; Wi-Fi/data/airplane toggles; dead zone; host joins Wi-Fi mid-session; system hotspot on; reboot; **3 clients concurrently (mixed iPhone + Android)**; password change; slot revoke; client rejoin with new IP.
+
+## 11. Top risks
+
+1. **OEM Wi-Fi Direct variance** — idle group teardown, ignored SSID/passphrase, aggressive GO power save with screen off. Mitigation: read-back verification, recreate-with-same-credentials, watchdog, device matrix.
+2. **OEM process killers** despite FGS. Mitigation: battery exemption, OEM guide, `START_STICKY`, `ApplicationExitInfo` telemetry.
+3. **Client network-selection quirks** — Wi-Fi Assist / client mobile data, Private DNS strict mode, "No internet" on iOS. Mitigation: PAC, local probe answers, onboarding instructions.
+4. **Exposure** — wildcard bind or SSRF into host loopback. Mitigation: GO-IP-only bind, peer subnet check, post-resolution destination filter.
+5. **Egress correctness under churn** — stale `Network` handle or DNS slipping onto Wi-Fi. Mitigation: bound-or-refuse, atomic handle swap.
