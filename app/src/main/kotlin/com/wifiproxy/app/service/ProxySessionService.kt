@@ -75,6 +75,10 @@ class ProxySessionService : Service() {
      *  survives for the newer command, per the `stopSelf(int)` contract. */
     private var currentStartId: Int = 0
 
+    /** Set the instant [onDestroy] begins, so [updateNotification] can refuse to resurrect the
+     *  notification for a tick that was already in flight when teardown started. */
+    @Volatile private var serviceStopping = false
+
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
@@ -96,6 +100,11 @@ class ProxySessionService : Service() {
 
         val c = controller ?: buildController().also { controller = it }
         if (c.state.value == SessionPhase.IDLE) {
+            // Re-enter foreground state before every start, not just the first: a previous
+            // session reaching IDLE called stopForeground(STOP_FOREGROUND_REMOVE) (see
+            // removeNotification), so a later start on this same (still-alive) service instance
+            // needs its own startForeground() again, exactly like a fresh instance's onCreate.
+            startForeground(NOTIFICATION_ID, buildNotification(SessionPhase.STARTING, null, 0, 0))
             c.start()
         }
         return START_NOT_STICKY
@@ -107,8 +116,16 @@ class ProxySessionService : Service() {
         val newController = UsbSessionController(egress = egress, scope = serviceScope)
         // (C1) Set before this controller's start() is ever called: see the kdoc on
         // UsbSessionController.onIdle for why this must be a direct callback, not something this
-        // service subscribes to by collecting controller.state.
-        newController.onIdle = { stopSelf(currentStartId) }
+        // service subscribes to by collecting controller.state. Runs synchronously as part of
+        // teardown(), so the 5s re-post loop is guaranteed stopped - and the notification removed
+        // - before stopSelf ever gets a chance to tear the service down (no notification may
+        // outlive reaching IDLE, on any path: clean stop, a failed start, or a rebuild that gives
+        // up).
+        newController.onIdle = {
+            notificationJob?.cancel()
+            serviceScope.launch(Dispatchers.Main.immediate) { removeNotification() }
+            stopSelf(currentStartId)
+        }
         SessionHolder.bind(newController)
         startWakeLockManagement(newController)
         startNotificationUpdates(newController)
@@ -118,9 +135,14 @@ class ProxySessionService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
+        serviceStopping = true
         wakeLockJob?.cancel()
         notificationJob?.cancel()
         releaseWakeLock()
+        // Belt and braces alongside onIdle's removal: guarantees no notification survives
+        // onDestroy even on a path that never ran onIdle (e.g. the process dying mid-session, or
+        // the service being torn down for some other reason entirely).
+        removeNotification()
         // Deliberately no SessionHolder.unbind(): see its kdoc - the controller (and its
         // lastError, if a start() just failed) stays visible until the next bind() replaces it.
         val c = controller
@@ -173,11 +195,20 @@ class ProxySessionService : Service() {
 
     /** (M4) Updates the notification on every phase/reason change, and - while RUNNING/DEGRADED -
      *  re-posts it every [NOTIFICATION_REFRESH_INTERVAL_MS] so the byte counters keep moving, and
-     *  so a notification permission granted mid-session starts showing one within that interval. */
+     *  so a notification permission granted mid-session starts showing one within that interval.
+     *
+     *  Reaching IDLE here removes the notification instead of re-posting it; this is belt-and-
+     *  braces alongside `onIdle`'s synchronous removal above (collecting `c.state` asynchronously
+     *  means this could in principle lag behind an `onIdle` that already fired, which is exactly
+     *  why `onIdle` doesn't rely on this path to begin with). */
     private fun startNotificationUpdates(c: UsbSessionController) {
         notificationJob?.cancel()
         notificationJob = serviceScope.launch {
             combine(c.state, c.degradedReason) { phase, reason -> phase to reason }.collectLatest { (phase, reason) ->
+                if (phase == SessionPhase.IDLE) {
+                    removeNotification()
+                    return@collectLatest
+                }
                 updateNotification(phase, reason)
                 if (phase == SessionPhase.RUNNING || phase == SessionPhase.DEGRADED) {
                     while (isActive) {
@@ -189,12 +220,25 @@ class ProxySessionService : Service() {
         }
     }
 
+    /** No-op once the controller is IDLE or [onDestroy] has started (`serviceStopping`), so a
+     *  periodic tick already queued (e.g. mid-`delay`) when the session reached IDLE can't
+     *  resurrect a notification that was just removed. */
     private fun updateNotification(phase: SessionPhase, reason: String?) {
+        if (serviceStopping || controller?.state?.value == SessionPhase.IDLE) return
         val slots = controller?.registry?.slots().orEmpty()
         val bytesUp = slots.sumOf { it.bytesUp }
         val bytesDown = slots.sumOf { it.bytesDown }
         val manager = getSystemService(NotificationManager::class.java)
         manager.notify(NOTIFICATION_ID, buildNotification(phase, reason, bytesUp, bytesDown))
+    }
+
+    /** Removes the foreground notification on every path to IDLE (a clean stop, a failed start,
+     *  or [onDestroy]): detaches it from the foreground-service state first - a stale
+     *  `NotificationManager.notify()` call racing this would otherwise just resurrect it under the
+     *  system's foreground-service bookkeeping - then cancels it outright as belt and braces. */
+    private fun removeNotification() {
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        getSystemService(NotificationManager::class.java).cancel(NOTIFICATION_ID)
     }
 
     private fun buildNotification(phase: SessionPhase, reason: String?, bytesUp: Long, bytesDown: Long): Notification {
