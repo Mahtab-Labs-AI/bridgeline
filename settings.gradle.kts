@@ -15,3 +15,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "android-wifi-proxy"
 include(":proxy-core")
+include(":app")
