@@ -41,6 +41,15 @@ class CidrTest {
     @Test
     fun `rejects prefix longer than address`() {
         assertFailsWith<IllegalArgumentException> { Cidr.parse("10.0.0.0/33") }
+    }
+
+    @Test
+    fun `rejects missing prefix`() {
         assertFailsWith<IllegalArgumentException> { Cidr.parse("10.0.0.0") }
+    }
+
+    @Test
+    fun `rejects hostnames`() {
+        assertFailsWith<IllegalArgumentException> { Cidr.parse("localhost/8") }
     }
 }
