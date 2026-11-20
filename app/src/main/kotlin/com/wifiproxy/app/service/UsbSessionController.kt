@@ -65,6 +65,11 @@ private val defaultServerFactory = UsbProxyServerFactory { config, registry, egr
     RealUsbProxyServer(ProxyServer(config, registry, egress, filter, onError))
 }
 
+/** Raised internally when [UsbSessionController] notices, after a blocking/suspending start step,
+ *  that a concurrent [UsbSessionController.stop] has already moved the phase away from STARTING.
+ *  Never escapes [UsbSessionController.doStart]. */
+private class StartInterruptedByStopException : Exception()
+
 /**
  * Owns the session state machine for the USB (`adb forward`) path (design spec §8a):
  * `Idle -> Starting -> Running <-> Degraded(no mobile data) -> Stopping -> Idle`.
@@ -74,9 +79,15 @@ private val defaultServerFactory = UsbProxyServerFactory { config, registry, egr
  * with fakes; [ProxySessionService] supplies the real [com.wifiproxy.app.egress.CellularEgress]
  * and [defaultServerFactory].
  *
- * [start] and [stop] only ever launch work on [scope]; production wiring builds that scope on
- * `Dispatchers.Default` so the blocking parts of [ProxyServer.stop] (it joins the NIO loop
- * thread, up to ~1s) and `CellularEgress.stop` never run on the main thread.
+ * **Serialization (C2):** [start], [stop], the watchdog body, the network-generation rebuild and
+ * `onLinkChange`'s filter refresh all run as coroutines launched on [scope] and nowhere else, never
+ * synchronously on a caller's thread. In production, [ProxySessionService] builds [scope] on
+ * `Dispatchers.Default.limitedParallelism(1)`, so those coroutines are strictly serialized against
+ * each other - the watchdog can never rebuild a server that a concurrent `stop()` just tore down,
+ * and a `stop()` that arrives mid-`start()` is never lost, only queued or (if `start()` is already
+ * blocked inside a synchronous call like `ProxyServer.start()`) observed by `doStart()` re-checking
+ * [state] once that call returns. A JVM test can pass a non-serial scope (e.g. `backgroundScope`
+ * from `runTest`) since the virtual-time test dispatcher is itself effectively single-threaded.
  */
 class UsbSessionController(
     private val egress: SessionEgress,
@@ -96,6 +107,12 @@ class UsbSessionController(
     private val _degradedReason = MutableStateFlow<String?>(null)
     val degradedReason: StateFlow<String?> = _degradedReason.asStateFlow()
 
+    /** Set when the controller falls back to IDLE because `start()` itself failed (C1) - cleared
+     *  on the next successful start. Distinct from [degradedReason], which only ever applies while
+     *  RUNNING/DEGRADED; this is what the UI shows for "Start" having failed outright. */
+    private val _lastError = MutableStateFlow<String?>(null)
+    val lastError: StateFlow<String?> = _lastError.asStateFlow()
+
     /** Mirrors the egress's own availability, independent of [state] (e.g. still meaningful while
      *  [SessionPhase.STARTING] or [SessionPhase.STOPPING]). */
     val cellularAvailable: StateFlow<Boolean> get() = egress.available
@@ -112,59 +129,134 @@ class UsbSessionController(
     val registry: ClientRegistry? get() = activeRegistry
 
     private var availabilityJob: Job? = null
+    private var networkGenerationJob: Job? = null
     private var watchdogStarted = false
+
+    /**
+     * Invoked synchronously (on [scope]) every time [teardown] runs - i.e. every time the
+     * controller reaches IDLE from any other phase, however it got there (a deliberate [stop], or
+     * [doStart] rolling back a failed/interrupted start). [ProxySessionService] sets this
+     * *before* ever calling [start] and uses it to call `stopSelf(startId)` (C1).
+     *
+     * Deliberately a plain callback rather than something [ProxySessionService] subscribes to by
+     * collecting [state]: a `collectLatest` on [state] only sees the *current* value at whatever
+     * moment it happens to start collecting, not necessarily the transition into it, so a fast
+     * failure (`doStart` throwing and rolling back to IDLE within the same dispatch as `start()`)
+     * can complete before such a collector has even subscribed - at which point its first-ever
+     * observed value is already IDLE, indistinguishable from "was always idle". That subscription
+     * race doesn't exist here: this field is a plain property write on the calling (main) thread,
+     * already in place before [start] is ever invoked, with no Flow replay semantics to race.
+     */
+    @Volatile var onIdle: (() -> Unit)? = null
 
     init {
         egress.onLinkChange = ::onLinkChange
     }
 
+    /** Atomically moves IDLE -> STARTING; a no-op (not queued) from any other phase, so two
+     *  concurrent callers can never both schedule a [doStart]. */
     fun start() {
-        if (_state.value != SessionPhase.IDLE) return
-        _state.value = SessionPhase.STARTING
+        if (!_state.compareAndSet(SessionPhase.IDLE, SessionPhase.STARTING)) return
         appendLog("Starting USB session")
         ensureWatchdog()
-        scope.launch {
-            try {
-                doStart()
-            } catch (e: Exception) {
-                appendLog("Start failed: ${e::class.simpleName}")
-                teardown()
+        scope.launch { doStart() }
+    }
+
+    private suspend fun doStart() {
+        var server: UsbProxyServer? = null
+        try {
+            egress.start()
+            checkNotInterruptedByStop()
+
+            val registry = ClientRegistry(maxClients = maxClients().coerceIn(1, ClientRegistry.MAX_CLIENTS_LIMIT))
+            if (registry.addPinnedSlot(PINNED_SLOT_NAME, bindAddress) == null) {
+                appendLog("Could not pin the USB slot (no room)")
             }
+            val config = ProxyConfig(bindAddress = bindAddress, port = port, peerSubnet = peerSubnet)
+            val newServer = serverFactory.create(config, registry, egress, buildFilter(), ::onServerError)
+            server = newServer
+            newServer.start()
+            checkNotInterruptedByStop()
+
+            activeServer = newServer
+            activeRegistry = registry
+
+            // Set the initial Running/Degraded phase directly from the current value, rather than
+            // through applyAvailability's RUNNING/DEGRADED-only transitions below: at this point
+            // the phase is still STARTING, which neither of those transitions matches.
+            val available = egress.available.value
+            if (available) {
+                _state.value = SessionPhase.RUNNING
+                appendLog("USB session running")
+            } else {
+                _degradedReason.value = "No mobile data"
+                _state.value = SessionPhase.DEGRADED
+                appendLog("Degraded: no mobile data")
+            }
+            _lastError.value = null
+            observeAvailability()
+            observeNetworkGeneration()
+        } catch (e: StartInterruptedByStopException) {
+            appendLog("Stop arrived while starting; rolling back")
+            rollbackStart(server)
+        } catch (e: Exception) {
+            appendLog("Start failed: ${e::class.simpleName}")
+            _lastError.value = e.message ?: e::class.simpleName ?: "Start failed"
+            rollbackStart(server)
         }
     }
 
-    private fun doStart() {
-        egress.start()
-        val registry = ClientRegistry(maxClients = maxClients().coerceIn(1, ClientRegistry.MAX_CLIENTS_LIMIT))
-        activeRegistry = registry
-        if (registry.addPinnedSlot(PINNED_SLOT_NAME, bindAddress) == null) {
-            appendLog("Could not pin the USB slot (no room)")
-        }
-        val config = ProxyConfig(bindAddress = bindAddress, port = port, peerSubnet = peerSubnet)
-        val server = serverFactory.create(config, registry, egress, buildFilter(), ::onServerError)
-        server.start()
-        activeServer = server
+    /** (C2) Re-checked after every step in [doStart] that can block/suspend for a real amount of
+     *  time (`egress.start()`, `server.start()`): a concurrent [stop] moves [state] away from
+     *  STARTING directly (not through [scope]), so this is always safe to read. */
+    private fun checkNotInterruptedByStop() {
+        if (_state.value != SessionPhase.STARTING) throw StartInterruptedByStopException()
+    }
 
-        // Set the initial Running/Degraded phase directly from the current value, rather than
-        // through applyAvailability's RUNNING/DEGRADED-only transitions below: at this point the
-        // phase is still STARTING, which neither of those transitions matches.
-        val available = egress.available.value
-        if (available) {
-            _state.value = SessionPhase.RUNNING
-            appendLog("USB session running")
-        } else {
-            _degradedReason.value = "No mobile data"
-            _state.value = SessionPhase.DEGRADED
-            appendLog("Degraded: no mobile data")
-        }
-
-        observeAvailability()
+    /** (C1) Rolls back whatever [doStart] managed to start before it failed or was interrupted by
+     *  a concurrent [stop]: the server first (never leave a listener bound), then the egress, each
+     *  tolerant of throwing, then back to IDLE. */
+    private fun rollbackStart(server: UsbProxyServer?) {
+        runCatching { server?.stop() }
+        runCatching { egress.stop() }
+        teardown()
     }
 
     private fun observeAvailability() {
         availabilityJob?.cancel()
         availabilityJob = scope.launch {
             egress.available.collect(::applyAvailability)
+        }
+    }
+
+    /** (I5) Rebuilds the proxy server once per *distinct* cellular network, skipping the first
+     *  value this collector ever sees (that one is just the network already in place when we
+     *  subscribed, not a change). */
+    private fun observeNetworkGeneration() {
+        networkGenerationJob?.cancel()
+        networkGenerationJob = scope.launch {
+            var first = true
+            egress.networkGeneration.collect {
+                if (first) {
+                    first = false
+                    return@collect
+                }
+                rebuildForNetworkChange()
+            }
+        }
+    }
+
+    private fun rebuildForNetworkChange() {
+        val phase = _state.value
+        if (phase != SessionPhase.RUNNING && phase != SessionPhase.DEGRADED) return
+        val server = activeServer ?: return
+        appendLog("Cellular network changed; rebuilding the proxy server")
+        try {
+            server.stop()
+            server.updateFilter(buildFilter())
+            server.start()
+        } catch (e: Exception) {
+            handleRecoveryFailure("Network rebuild failed: ${e::class.simpleName}", e)
         }
     }
 
@@ -187,33 +279,71 @@ class UsbSessionController(
         }
     }
 
+    /** (M10) Hops onto [scope] - never runs on the connectivity callback thread that invokes it -
+     *  since [buildFilter] does IPC (`ConnectivityManager.getAllNetworks`/`getLinkProperties`) and
+     *  `NetworkInterface` enumeration. Also keeps it serialized against start/stop/watchdog (C2). */
     private fun onLinkChange() {
-        activeServer?.updateFilter(buildFilter())
+        scope.launch {
+            activeServer?.updateFilter(buildFilter())
+        }
     }
 
     private fun buildFilter(): DestinationFilter = DestinationFilter.default(wifiDirectSubnet, egress.hostAddresses())
 
+    /** Atomically moves any phase except IDLE/STOPPING to STOPPING, so two concurrent callers
+     *  never both schedule a [doStop]. */
     fun stop() {
-        if (_state.value == SessionPhase.IDLE || _state.value == SessionPhase.STOPPING) return
-        _state.value = SessionPhase.STOPPING
+        var shouldStop = false
+        _state.update { current ->
+            if (current == SessionPhase.IDLE || current == SessionPhase.STOPPING) {
+                current
+            } else {
+                shouldStop = true
+                SessionPhase.STOPPING
+            }
+        }
+        if (!shouldStop) return
         appendLog("Stopping USB session")
         scope.launch { doStop() }
     }
 
-    private fun doStop() {
-        activeServer?.stop()
-        egress.stop()
-        teardown()
-        appendLog("USB session stopped")
+    private suspend fun doStop() {
+        // A concurrent doStart() may already have rolled itself back to IDLE after noticing this
+        // stop() (see checkNotInterruptedByStop/rollbackStart) - in which case there is nothing
+        // left for this to do.
+        if (_state.value != SessionPhase.STOPPING) return
+        try {
+            runCatching { activeServer?.stop() }
+            runCatching { egress.stop() }
+        } finally {
+            teardown()
+            appendLog("USB session stopped")
+        }
     }
 
+    /** Always called from a phase other than IDLE (every call site above guards that), so
+     *  unconditionally notifying [onIdle] here is always a real non-idle -> IDLE transition. */
     private fun teardown() {
         availabilityJob?.cancel()
         availabilityJob = null
+        networkGenerationJob?.cancel()
+        networkGenerationJob = null
         activeServer = null
         activeRegistry = null
         _degradedReason.value = null
         _state.value = SessionPhase.IDLE
+        onIdle?.invoke()
+    }
+
+    /** Synchronous, best-effort shutdown for [ProxySessionService.onDestroy] when the controller
+     *  never reached IDLE through the normal [stop] path (I1) - e.g. the process is being torn
+     *  down mid-session. Bypasses [scope] entirely (which may already be cancelled/cancelling) and
+     *  blocks for as long as the server's NIO loop join takes (~1s) plus the egress unregister, so
+     *  it must only ever be called from a background thread, never main. */
+    fun shutdownBlocking() {
+        runCatching { activeServer?.stop() }
+        runCatching { egress.stop() }
+        teardown()
     }
 
     /** Goes through [UsbProxyServer.revoke] (in production, `ProxyServer.revoke`), never the
@@ -229,14 +359,38 @@ class UsbSessionController(
     private suspend fun watchdogLoop() {
         while (currentCoroutineContext().isActive) {
             delay(watchdogIntervalMs)
-            val phase = _state.value
-            if (phase != SessionPhase.RUNNING && phase != SessionPhase.DEGRADED) continue
-            val server = activeServer ?: continue
-            if (!server.isAccepting) {
-                appendLog("Watchdog: rebuilding the proxy server")
-                server.stop()
-                server.start()
+            try {
+                watchdogTick()
+            } catch (e: Exception) {
+                handleRecoveryFailure("Watchdog error: ${e::class.simpleName}", e)
             }
+        }
+    }
+
+    /** (C2) Runs inside the same [scope]-launched coroutine as the rest of the watchdog loop, so
+     *  it's already serialized against start/stop/network-change work; re-reads [state] itself
+     *  (I2) rather than trusting a value captured before the preceding `delay`. */
+    private fun watchdogTick() {
+        val phase = _state.value
+        if (phase != SessionPhase.RUNNING && phase != SessionPhase.DEGRADED) return
+        val server = activeServer ?: return
+        server.updateFilter(buildFilter()) // M3: refresh on every tick, not just on a link change.
+        if (!server.isAccepting) {
+            appendLog("Watchdog: rebuilding the proxy server")
+            server.stop()
+            server.start()
+        }
+    }
+
+    /** (I2) A watchdog or network-change rebuild that itself throws must never crash the process:
+     *  log it and fall back to DEGRADED while a session still exists to recover from, or leave the
+     *  phase alone if there's nothing left to degrade (already on the way to IDLE). */
+    private fun handleRecoveryFailure(message: String, e: Throwable) {
+        appendLog(message)
+        val phase = _state.value
+        if (phase == SessionPhase.RUNNING || phase == SessionPhase.DEGRADED) {
+            _degradedReason.value = "Recovery failed: ${e::class.simpleName}"
+            _state.value = SessionPhase.DEGRADED
         }
     }
 
