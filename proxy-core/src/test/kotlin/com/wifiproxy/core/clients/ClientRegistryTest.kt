@@ -130,4 +130,39 @@ class ClientRegistryTest {
         val t = SecureTokenSource().next()
         assertTrue(Regex("[A-Za-z0-9_-]{22}").matches(t), t)
     }
+
+    @Test
+    fun `clearBindings drops every admission but keeps the slots`() {
+        val r = registry()
+        val a = r.addSlot("a")!!
+        val b = r.addSlot("b")!!
+        r.onPacFetch(a.token, ip("192.168.49.10"))
+        r.onPacFetch(b.token, ip("192.168.49.20"))
+        r.clearBindings()
+        assertNull(r.admittedSlot(ip("192.168.49.10")))
+        assertNull(r.admittedSlot(ip("192.168.49.20")))
+        assertEquals(2, r.slots().size)
+        assertEquals(a.id, r.onPacFetch(a.token, ip("192.168.49.10"))?.id)
+    }
+
+    @Test
+    fun `unbind clears only that ip`() {
+        val r = registry()
+        val a = r.addSlot("a")!!
+        val b = r.addSlot("b")!!
+        r.onPacFetch(a.token, ip("192.168.49.10"))
+        r.onPacFetch(b.token, ip("192.168.49.20"))
+        r.unbind(ip("192.168.49.10"))
+        assertNull(r.admittedSlot(ip("192.168.49.10")))
+        assertEquals(b.id, r.admittedSlot(ip("192.168.49.20"))?.id)
+    }
+
+    @Test
+    fun `toString never contains the token`() {
+        val r = registry()
+        val slot = r.addSlot("a")!!
+        assertFalse(slot.toString().contains(slot.token), "Slot.toString() contains token: ${slot.toString()}")
+        val record = r.snapshot().single()
+        assertFalse(record.toString().contains(record.token), "SlotRecord.toString() contains token: ${record.toString()}")
+    }
 }

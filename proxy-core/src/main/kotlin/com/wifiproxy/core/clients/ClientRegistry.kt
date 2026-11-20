@@ -6,6 +6,7 @@ import java.security.SecureRandom
 import java.util.Base64
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicLong
+import kotlin.jvm.Volatile
 
 /** Point-in-time view of one client slot. */
 data class Slot(
@@ -18,10 +19,16 @@ data class Slot(
     val bytesUp: Long,
     val bytesDown: Long,
     val activeTunnels: Int,
-)
+) {
+    override fun toString(): String =
+        "Slot(id=$id, name=$name, token=<redacted>, boundIp=$boundIp, createdAtMs=$createdAtMs, lastSeenMs=$lastSeenMs, bytesUp=$bytesUp, bytesDown=$bytesDown, activeTunnels=$activeTunnels)"
+}
 
 /** The persistent part of a slot. The Android layer stores these and passes them back as `initial`. */
-data class SlotRecord(val id: String, val name: String, val token: String, val createdAtMs: Long)
+data class SlotRecord(val id: String, val name: String, val token: String, val createdAtMs: Long) {
+    override fun toString(): String =
+        "SlotRecord(id=$id, name=$name, token=<redacted>, createdAtMs=$createdAtMs)"
+}
 
 fun interface TokenSource {
     fun next(): String
@@ -62,7 +69,7 @@ class ClientRegistry(
     private val lock = Any()
     private val entries = LinkedHashMap<String, Entry>()
 
-    var maxClients: Int = maxClients
+    @Volatile var maxClients: Int = maxClients
         private set
 
     init {
@@ -121,6 +128,19 @@ class ClientRegistry(
         val entry = synchronized(lock) { entries[id] } ?: return
         entry.bytesUp.addAndGet(up)
         entry.bytesDown.addAndGet(down)
+    }
+
+    /**
+     * Call when the Wi-Fi Direct group is torn down or recreated, or the password changes.
+     * DHCP addresses may be reassigned, and clients re-fetch their PAC on reconnect.
+     */
+    fun clearBindings() = synchronized(lock) {
+        entries.values.forEach { it.boundIp = null }
+    }
+
+    /** Clear boundIp on the entry bound to that IP, if any. */
+    fun unbind(ip: InetAddress) = synchronized(lock) {
+        entries.values.forEach { if (it.boundIp == ip) it.boundIp = null }
     }
 
     fun slots(): List<Slot> = synchronized(lock) { entries.values.map { it.toSlot() } }
