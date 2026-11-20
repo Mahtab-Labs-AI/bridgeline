@@ -25,6 +25,10 @@ data class ProxyConfig(
     val maxConnections: Int = 832, // 3 * 256 + 64
     /** Per-peer-IP cap on connections still reading their request head. */
     val maxPendingHeadsPerPeer: Int = 16,
+    /** Global cap, across all peers, on connections still reading their request head; a
+     *  pre-admission share of [maxConnections] so a slotless peer with many IP aliases can't
+     *  crowd out admitted clients. */
+    val maxPendingHeads: Int = 64,
 ) {
     init {
         require(!bindAddress.isAnyLocalAddress) { "refusing wildcard bind address $bindAddress" }
@@ -36,5 +40,6 @@ data class ProxyConfig(
         require(connectTimeoutMs > 0) { "connectTimeoutMs must be positive" }
         require(maxConnections > 0) { "maxConnections must be positive" }
         require(maxPendingHeadsPerPeer > 0) { "maxPendingHeadsPerPeer must be positive" }
+        require(maxPendingHeads > 0) { "maxPendingHeads must be positive" }
     }
 }

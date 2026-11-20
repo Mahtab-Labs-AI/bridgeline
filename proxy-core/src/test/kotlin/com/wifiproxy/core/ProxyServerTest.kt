@@ -45,11 +45,13 @@ class ProxyServerTest {
         peerSubnet: Cidr = Cidr.parse("127.0.0.0/8"),
         maxConnections: Int = 832,
         maxPendingHeadsPerPeer: Int = 16,
+        maxPendingHeads: Int = 64,
         onError: (Throwable) -> Unit = {},
     ) {
         val config = ProxyConfig(
             bindAddress = loopback, port = 0, peerSubnet = peerSubnet, wifi = wifi, idleTimeoutMs = idleMs,
             maxConnections = maxConnections, maxPendingHeadsPerPeer = maxPendingHeadsPerPeer,
+            maxPendingHeads = maxPendingHeads,
         )
         server = ProxyServer(config, registry, egress, filter, onError).also { it.start() }
     }
@@ -391,25 +393,106 @@ class ProxyServerTest {
     }
 
     @Test
-    fun `oversized head without a blank line gets 400`() {
+    fun `isAccepting is true immediately after start`() {
         start()
-        val s = Socket(loopback, server.localPort)
-        closeables += s
-        s.soTimeout = 5000
-        s.getOutputStream().write("a".repeat(20 * 1024).toByteArray(Charsets.ISO_8859_1))
-        val input = s.getInputStream()
-        val sb = StringBuilder()
-        try {
-            var b = input.read()
-            while (b >= 0) {
-                sb.append(b.toChar())
-                b = input.read()
+        assertTrue(server.isAccepting)
+    }
+
+    @Test
+    fun `restart does not inherit counters`() {
+        start(maxPendingHeadsPerPeer = 2)
+        val old1 = Socket(loopback, server.localPort)
+        closeables += old1
+        val old2 = Socket(loopback, server.localPort)
+        closeables += old2
+        Thread.sleep(150)
+
+        // Both are still pending (never sent a head) when the server stops: this is exactly the
+        // state that used to leak into the next run's counters.
+        server.stop()
+        server.start()
+
+        val silent1 = Socket(loopback, server.localPort)
+        closeables += silent1
+        val silent2 = Socket(loopback, server.localPort)
+        closeables += silent2
+        Thread.sleep(150)
+
+        // Both of the new run's connections must be accepted: a leaked decrement or a leaked
+        // `accepting = false` from the old run must not affect them.
+        silent1.soTimeout = 300
+        silent2.soTimeout = 300
+        assertFailsWith<SocketTimeoutException> { silent1.getInputStream().read() }
+        assertFailsWith<SocketTimeoutException> { silent2.getInputStream().read() }
+
+        val third = Socket(loopback, server.localPort)
+        closeables += third
+        third.soTimeout = 1000
+        val r = try { third.getInputStream().read() } catch (e: SocketException) { -1 }
+        assertEquals(-1, r, "the 3rd connection past the new run's per-peer cap should be dropped")
+    }
+
+    @Test
+    fun `closing silent connections frees the per-peer cap`() {
+        start(maxPendingHeadsPerPeer = 2)
+        val silent1 = Socket(loopback, server.localPort)
+        val silent2 = Socket(loopback, server.localPort)
+        Thread.sleep(150)
+
+        silent1.close()
+        silent2.close()
+
+        var admitted: Socket? = null
+        eventually {
+            val probe = Socket(loopback, server.localPort)
+            probe.soTimeout = 200
+            val wasAdmitted = try {
+                probe.getInputStream().read()
+                false
+            } catch (e: SocketTimeoutException) {
+                true
+            } catch (e: SocketException) {
+                false
             }
-        } catch (e: SocketException) {
-            // Leftover unread bytes on the server side can trigger a reset on close instead of a
-            // clean EOF; the 400 response written before that should already be in `sb`.
+            if (wasAdmitted) admitted = probe else probe.close()
+            wasAdmitted
         }
-        assertTrue(sb.toString().startsWith("HTTP/1.1 400"), sb.toString())
+        admitted?.let { closeables += it }
+    }
+
+    @Test
+    fun `pending-heads total cap`() {
+        start(maxPendingHeads = 2, maxPendingHeadsPerPeer = 16)
+        val silent1 = Socket(loopback, server.localPort)
+        closeables += silent1
+        Thread.sleep(150)
+        val silent2 = Socket(loopback, server.localPort)
+        closeables += silent2
+        Thread.sleep(150)
+
+        val third = Socket(loopback, server.localPort)
+        closeables += third
+        third.soTimeout = 1000
+        val r = try { third.getInputStream().read() } catch (e: SocketException) { -1 }
+        assertEquals(-1, r, "the 3rd connection past the pending-heads total cap should be dropped")
+
+        silent1.soTimeout = 300
+        silent2.soTimeout = 300
+        assertFailsWith<SocketTimeoutException> { silent1.getInputStream().read() }
+        assertFailsWith<SocketTimeoutException> { silent2.getInputStream().read() }
+    }
+
+    @Test
+    fun `oversized head without a blank line gets 400`() {
+        // No SocketException tolerance here: the server now drains the unread request bytes
+        // before closing, so the close is always a clean FIN and the full response always
+        // arrives intact - no more Windows RST race truncating or discarding it.
+        start()
+        val response = rawRequest("a".repeat(20 * 1024))
+        assertEquals(
+            "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+            response,
+        )
     }
 
     @Test

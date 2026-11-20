@@ -13,6 +13,7 @@ import com.wifiproxy.core.io.HeadTooLargeException
 import com.wifiproxy.core.io.NioLoop
 import com.wifiproxy.core.io.Tunnel
 import com.wifiproxy.core.io.TunnelEnd
+import com.wifiproxy.core.io.monotonicMs
 import com.wifiproxy.core.io.readHead
 import com.wifiproxy.core.io.writeFully
 import com.wifiproxy.core.net.Cidr
@@ -35,6 +36,7 @@ import java.io.IOException
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.SocketTimeoutException
+import java.nio.ByteBuffer
 import java.nio.channels.ClosedChannelException
 import java.nio.channels.SelectionKey
 import java.nio.channels.ServerSocketChannel
@@ -58,37 +60,52 @@ class ProxyServer(
 ) {
     private class ProxyFailure(val response: HttpResponse) : Exception()
 
+    /** Everything that belongs to a single start()/stop() lifetime. A fresh instance per start()
+     *  so a handler left over from a stopped run can only ever touch its own run's counters and
+     *  flags, never a later run's. */
+    private class Run(
+        val nio: NioLoop,
+        val server: ServerSocketChannel,
+        val dialer: Dialer,
+        val local: LocalContent,
+        val scope: CoroutineScope,
+    ) {
+        /** Total connections accepted but not yet fully handled; a pre-admission DoS guard. */
+        val inFlight = AtomicInteger()
+
+        /** Per-peer count of connections still reading their request head. */
+        val pendingHeads = ConcurrentHashMap<InetAddress, Int>()
+
+        /** Total connections (across all peers) still reading their request head. */
+        val pendingHeadsTotal = AtomicInteger()
+
+        /** True before the accept loop is even launched, so [isAccepting] reads true as soon as
+         *  start() returns; false once the accept loop has exited, for any reason. */
+        @Volatile
+        var accepting = true
+    }
+
     /** Swappable so the Android host can refresh it when the device's interface addresses change. */
     @Volatile
     private var filter: DestinationFilter = initialFilter
 
     @Volatile
-    private var accepting = false
+    private var run: Run? = null
 
     /** True while the accept loop is running; false once it has exited, for any reason. */
     val isAccepting: Boolean
-        get() = accepting
+        get() = run?.accepting == true
 
+    /** Jobs are added/removed atomically per slot regardless of which run opened the tunnel, so
+     *  this can stay shared across restarts: revoke() only ever acts on live jobs. */
     private val tunnels = ConcurrentHashMap<String, MutableSet<Job>>()
 
-    /** Total connections accepted but not yet fully handled; a pre-admission DoS guard. */
-    private val inFlight = AtomicInteger(0)
-
-    /** Per-peer count of connections still reading their request head. */
-    private val pendingHeadsPerPeer = ConcurrentHashMap<InetAddress, AtomicInteger>()
-
-    private var scope: CoroutineScope? = null
-    private var server: ServerSocketChannel? = null
-    private var loop: NioLoop? = null
-    private lateinit var dialer: Dialer
-    private lateinit var local: LocalContent
-
     val localPort: Int
-        get() = (checkNotNull(server) { "not started" }.localAddress as InetSocketAddress).port
+        get() = (checkNotNull(run) { "not started" }.server.localAddress as InetSocketAddress).port
 
     @Synchronized
     fun start() {
-        check(server == null) { "already started" }
+        check(run == null) { "already started" }
         val nio = NioLoop()
         val ch = ServerSocketChannel.open()
         try {
@@ -99,26 +116,22 @@ class ProxyServer(
             nio.close()
             throw e
         }
-        loop = nio
-        server = ch
-        dialer = Dialer.forEgress(nio, egress, timeoutMs = config.connectTimeoutMs)
-        local = LocalContent(registry, config.bindAddress.hostAddress, localPort, config.wifi)
+        val dialer = Dialer.forEgress(nio, egress, timeoutMs = config.connectTimeoutMs)
+        val boundPort = (ch.localAddress as InetSocketAddress).port
+        val local = LocalContent(registry, config.bindAddress.hostAddress, boundPort, config.wifi)
         val s = CoroutineScope(SupervisorJob() + Dispatchers.Default + CoroutineExceptionHandler { _, e -> safeOnError(e) })
-        scope = s
-        s.launch { acceptLoop(s, nio, ch) }
+        val r = Run(nio, ch, dialer, local, s)
+        run = r
+        s.launch { acceptLoop(r) }
     }
 
     @Synchronized
     fun stop() {
-        scope?.cancel()
-        scope = null
-        server?.close()
-        server = null
-        loop?.close()
-        loop = null
-        tunnels.clear()
-        inFlight.set(0)
-        pendingHeadsPerPeer.clear()
+        val r = run ?: return
+        run = null
+        r.scope.cancel()
+        r.server.close()
+        r.nio.close()
     }
 
     /** Revokes the slot and closes every tunnel it owns. */
@@ -138,26 +151,30 @@ class ProxyServer(
         runCatching { onError(e) }
     }
 
-    private suspend fun acceptLoop(scope: CoroutineScope, nio: NioLoop, ch: ServerSocketChannel) {
-        accepting = true
+    private suspend fun acceptLoop(r: Run) {
         try {
             var backoffMs = ACCEPT_BACKOFF_INITIAL_MS
+            var lastFailureReportMs: Long? = null
             while (currentCoroutineContext().isActive) {
                 val client = try {
-                    ch.accept()
+                    r.server.accept()
                 } catch (e: ClosedChannelException) {
                     break
                 } catch (e: IOException) {
-                    safeOnError(AcceptFailedException(e))
+                    val now = monotonicMs()
+                    if (lastFailureReportMs == null || now - lastFailureReportMs!! >= ACCEPT_FAILURE_REPORT_INTERVAL_MS) {
+                        safeOnError(AcceptFailedException(e))
+                        lastFailureReportMs = now
+                    }
                     delay(backoffMs)
                     backoffMs = (backoffMs * 2).coerceAtMost(ACCEPT_BACKOFF_MAX_MS)
                     continue
                 }
                 if (client == null) {
                     try {
-                        nio.await(ch, SelectionKey.OP_ACCEPT)
+                        r.nio.await(r.server, SelectionKey.OP_ACCEPT)
                     } catch (e: ClosedChannelException) {
-                        if (ch.isOpen) {
+                        if (r.server.isOpen) {
                             safeOnError(IllegalStateException("NIO loop died; proxy no longer accepting", e))
                         }
                         break
@@ -165,80 +182,97 @@ class ProxyServer(
                     continue
                 }
                 backoffMs = ACCEPT_BACKOFF_INITIAL_MS
-                admitOrReject(scope, nio, client)
+                lastFailureReportMs = null
+                admitOrReject(r, client)
             }
         } finally {
-            accepting = false
+            r.accepting = false
         }
     }
 
     /** Pre-admission caps: reject before ever launching a handler, so a slotless peer can't DoS us. */
-    private fun admitOrReject(scope: CoroutineScope, nio: NioLoop, client: SocketChannel) {
+    private fun admitOrReject(r: Run, client: SocketChannel) {
         val peer = try {
             (client.remoteAddress as InetSocketAddress).address
         } catch (e: IOException) {
-            nio.closeChannel(client)
+            r.nio.closeChannel(client)
             return
         }
-        val overGlobalCap = inFlight.get() >= config.maxConnections
-        val overPeerCap = (pendingHeadsPerPeer[peer]?.get() ?: 0) >= config.maxPendingHeadsPerPeer
-        if (overGlobalCap || overPeerCap) {
-            runCatching { client.socket().setSoLinger(true, 0) }
-            nio.closeChannel(client)
-            return
-        }
-        inFlight.incrementAndGet()
-        pendingHeadsPerPeer.computeIfAbsent(peer) { AtomicInteger(0) }.incrementAndGet()
-        scope.launch(start = CoroutineStart.ATOMIC) { handle(nio, client, peer) }
-    }
-
-    private fun releasePendingHead(peer: InetAddress) {
-        pendingHeadsPerPeer.computeIfPresent(peer) { _, counter ->
-            if (counter.decrementAndGet() <= 0) null else counter
-        }
-    }
-
-    private suspend fun handle(nio: NioLoop, client: SocketChannel, peer: InetAddress) {
         try {
             client.configureBlocking(false)
-            if (!config.peerSubnet.contains(peer)) {
-                releasePendingHead(peer)
-                return
-            }
-            val head = try {
-                withTimeoutOrNull(config.headTimeoutMs) { readHead(nio, client) }
-            } finally {
-                releasePendingHead(peer)
-            }
+        } catch (e: IOException) {
+            r.nio.closeChannel(client)
+            return
+        }
+        val overGlobalCap = r.inFlight.get() >= config.maxConnections
+        val overPendingHeadsTotalCap = r.pendingHeadsTotal.get() >= config.maxPendingHeads
+        if (overGlobalCap || overPendingHeadsTotalCap) {
+            rejectPreAdmission(r, client)
+            return
+        }
+        var admittedPeer = false
+        r.pendingHeads.compute(peer) { _, c ->
+            val n = c ?: 0
+            if (n >= config.maxPendingHeadsPerPeer) c else { admittedPeer = true; n + 1 }
+        }
+        if (!admittedPeer) {
+            rejectPreAdmission(r, client)
+            return
+        }
+        r.pendingHeadsTotal.incrementAndGet()
+        r.inFlight.incrementAndGet()
+        r.scope.launch(start = CoroutineStart.ATOMIC) { handle(r, client, peer) }
+    }
+
+    private fun rejectPreAdmission(r: Run, client: SocketChannel) {
+        runCatching { client.socket().setSoLinger(true, 0) }
+        r.nio.closeChannel(client)
+    }
+
+    private fun releasePendingHead(r: Run, peer: InetAddress) {
+        r.pendingHeads.computeIfPresent(peer) { _, count -> if (count <= 1) null else count - 1 }
+        r.pendingHeadsTotal.decrementAndGet()
+    }
+
+    private suspend fun handle(r: Run, client: SocketChannel, peer: InetAddress) {
+        // Released exactly once, on every path: readHead success, throw, timeout, cancel, and
+        // the peer-outside-subnet early return below.
+        var headPending = true
+        try {
+            if (!config.peerSubnet.contains(peer)) return
+            val head = withTimeoutOrNull(config.headTimeoutMs) { readHead(r.nio, client) }
+            releasePendingHead(r, peer)
+            headPending = false
             val h = head ?: return
             when (val request = RequestParser.parse(h.text)) {
-                is ProxyRequest.Malformed -> respond(nio, client, HttpResponse.BAD_REQUEST)
-                is ProxyRequest.Local -> respond(nio, client, local.serve(request, peer))
+                is ProxyRequest.Malformed -> respond(r.nio, client, HttpResponse.BAD_REQUEST)
+                is ProxyRequest.Local -> respond(r.nio, client, r.local.serve(request, peer))
                 is ProxyRequest.Connect ->
-                    proxy(nio, client, peer, request.host, request.port, h.leftover, forward = null)
+                    proxy(r, client, peer, request.host, request.port, h.leftover, forward = null)
                 is ProxyRequest.Forward ->
-                    proxy(nio, client, peer, request.host, request.port, h.leftover, forward = request)
+                    proxy(r, client, peer, request.host, request.port, h.leftover, forward = request)
             }
         } catch (e: CancellationException) {
             throw e
         } catch (e: HeadTooLargeException) {
-            runCatching { respond(nio, client, HttpResponse.BAD_REQUEST) }
+            runCatching { respond(r.nio, client, HttpResponse.BAD_REQUEST) }
         } catch (e: IOException) {
             // Routine peer reset/abort: expected, not reported.
         } catch (e: Exception) {
             safeOnError(e)
         } finally {
-            inFlight.decrementAndGet()
+            if (headPending) releasePendingHead(r, peer)
+            r.inFlight.decrementAndGet()
             // A direct client.close() can defer the fd release (and the RST of an abortive close)
             // until the loop's selector wakes up and processes the cancelled key; closeChannel
             // nudges it so a revoked or aborted peer is never left waiting on a close that
             // already happened.
-            nio.closeChannel(client)
+            r.nio.closeChannel(client)
         }
     }
 
     private suspend fun proxy(
-        nio: NioLoop,
+        r: Run,
         client: SocketChannel,
         peer: InetAddress,
         host: String,
@@ -246,36 +280,36 @@ class ProxyServer(
         leftover: ByteArray,
         forward: ProxyRequest.Forward?,
     ) {
-        val slot = registry.admittedSlot(peer) ?: return respond(nio, client, HttpResponse.FORBIDDEN)
+        val slot = registry.admittedSlot(peer) ?: return respond(r.nio, client, HttpResponse.FORBIDDEN)
         if (forward != null && egress.isValidated) {
-            Probes.match(forward)?.let { return respond(nio, client, it) }
+            Probes.match(forward)?.let { return respond(r.nio, client, it) }
         }
-        if (!registry.tryAcquireTunnel(slot.id)) return respond(nio, client, HttpResponse.SERVICE_UNAVAILABLE)
+        if (!registry.tryAcquireTunnel(slot.id)) return respond(r.nio, client, HttpResponse.SERVICE_UNAVAILABLE)
 
         val job = currentCoroutineContext().job
         tunnels.compute(slot.id) { _, existing -> (existing ?: ConcurrentHashMap.newKeySet()).apply { add(job) } }
         var upstream: SocketChannel? = null
         try {
             // A revoke that raced with the admission check above must still win.
-            if (registry.admittedSlot(peer)?.id != slot.id) return respond(nio, client, HttpResponse.FORBIDDEN)
+            if (registry.admittedSlot(peer)?.id != slot.id) return respond(r.nio, client, HttpResponse.FORBIDDEN)
             val up = try {
-                open(host, port)
+                open(r, host, port)
             } catch (e: ProxyFailure) {
-                return respond(nio, client, e.response)
+                return respond(r.nio, client, e.response)
             }
             upstream = up
             if (forward == null) {
-                writeFully(nio, client, HttpResponse.CONNECTION_ESTABLISHED)
+                writeFully(r.nio, client, HttpResponse.CONNECTION_ESTABLISHED)
             } else {
-                writeFully(nio, up, forward.upstreamHead())
+                writeFully(r.nio, up, forward.upstreamHead())
             }
             if (leftover.isNotEmpty()) {
-                writeFully(nio, up, leftover)
+                writeFully(r.nio, up, leftover)
                 registry.addBytes(slot.id, leftover.size.toLong(), 0)
             }
             val result = try {
                 Tunnel(
-                    nio, client, up, idleTimeoutFor(up, port),
+                    r.nio, client, up, idleTimeoutFor(up, port),
                     onUp = { registry.addBytes(slot.id, it.toLong(), 0) },
                     onDown = { registry.addBytes(slot.id, 0, it.toLong()) },
                 ).run(closeWhenResponseEnds = forward != null)
@@ -302,11 +336,11 @@ class ProxyServer(
             tunnels.computeIfPresent(slot.id) { _, s -> s.remove(job); s.ifEmpty { null } }
             // See the comment in handle()'s finally: closeChannel nudges the loop so a deferred
             // close (and the abort above, if any) is visible to the upstream peer promptly.
-            nio.closeChannel(upstream)
+            r.nio.closeChannel(upstream)
         }
     }
 
-    private suspend fun open(host: String, port: Int): SocketChannel {
+    private suspend fun open(r: Run, host: String, port: Int): SocketChannel {
         if (!egress.isAvailable) throw ProxyFailure(HttpResponse.SERVICE_UNAVAILABLE)
         val currentFilter = filter
         try {
@@ -314,7 +348,7 @@ class ProxyServer(
             if (resolved.isEmpty()) throw ProxyFailure(HttpResponse.BAD_GATEWAY)
             val allowed = resolved.filter(currentFilter::isAllowed)
             if (allowed.isEmpty()) throw ProxyFailure(HttpResponse.FORBIDDEN)
-            return dialer.dial(allowed, port)
+            return r.dialer.dial(allowed, port)
         } catch (e: EgressUnavailableException) {
             throw ProxyFailure(HttpResponse.SERVICE_UNAVAILABLE)
         } catch (e: SocketTimeoutException) {
@@ -332,6 +366,32 @@ class ProxyServer(
     private suspend fun respond(nio: NioLoop, client: SocketChannel, response: HttpResponse) {
         writeFully(nio, client, response.toBytes())
         runCatching { client.shutdownOutput() }
+        // Unread request bytes left in the kernel's receive buffer make the next close() send an
+        // RST instead of a clean FIN; on Windows that can discard the response we just wrote
+        // before the client has read it. Drain whatever the peer already sent (or will send in
+        // the next moment) so the eventual close in handle()'s finally is always clean.
+        drainBeforeClose(nio, client)
+    }
+
+    private suspend fun drainBeforeClose(nio: NioLoop, client: SocketChannel) {
+        try {
+            withTimeoutOrNull(DRAIN_TIMEOUT_MS) {
+                val buf = ByteBuffer.allocate(DRAIN_BUFFER_SIZE)
+                var total = 0
+                while (total < DRAIN_MAX_BYTES) {
+                    buf.clear()
+                    val n = client.read(buf)
+                    if (n < 0) break
+                    if (n == 0) {
+                        nio.await(client, SelectionKey.OP_READ)
+                        continue
+                    }
+                    total += n
+                }
+            }
+        } catch (e: IOException) {
+            // Best-effort: the peer may already be gone, which is fine - we're about to close anyway.
+        }
     }
 
     private companion object {
@@ -339,5 +399,9 @@ class ProxyServer(
         val APPLE_PUSH_RANGE = Cidr.parse("17.0.0.0/8")
         const val ACCEPT_BACKOFF_INITIAL_MS = 50L
         const val ACCEPT_BACKOFF_MAX_MS = 1000L
+        const val ACCEPT_FAILURE_REPORT_INTERVAL_MS = 60_000L
+        const val DRAIN_TIMEOUT_MS = 1000L
+        const val DRAIN_MAX_BYTES = 64 * 1024
+        const val DRAIN_BUFFER_SIZE = 4096
     }
 }
