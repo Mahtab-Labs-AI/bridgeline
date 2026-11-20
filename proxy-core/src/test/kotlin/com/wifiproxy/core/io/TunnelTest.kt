@@ -12,10 +12,13 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import java.nio.channels.SocketChannel
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
 class TunnelTest {
@@ -46,7 +49,7 @@ class TunnelTest {
             val result = withTimeout(2000) { run.await() }
             assertEquals(4, up.get())
             assertEquals(5, down.get())
-            assertEquals(TunnelResult(TunnelEnd.BOTH_EOF), result)
+            assertEquals(TunnelResult(TunnelEnd.BOTH_EOF, responseComplete = true), result)
         } finally {
             closeAll(app, clientSide, upSide, server)
         }
@@ -94,8 +97,10 @@ class TunnelTest {
         val (upSide, server) = socketPair()
         try {
             upSide.shutdownOutput()
+            val downBytes = AtomicLong()
             val run = async(Dispatchers.Default) {
-                Tunnel(loop, clientSide, upSide, idleTimeoutMs = 60_000).run(closeWhenResponseEnds = false)
+                Tunnel(loop, clientSide, upSide, idleTimeoutMs = 60_000, onDown = { downBytes.addAndGet(it.toLong()) })
+                    .run(closeWhenResponseEnds = false)
             }
             app.writeBlocking("x")
             val payload = ByteArray(1024 * 1024) { (it % 251).toByte() }
@@ -107,6 +112,9 @@ class TunnelTest {
             val result = withTimeout(5000) { run.await() }
             assertContentEquals(payload, withTimeout(5000) { received.await() })
             assertEquals(TunnelEnd.UPSTREAM_FAILED, result.end)
+            assertTrue(result.responseComplete)
+            assertNotNull(result.error)
+            assertEquals(payload.size.toLong(), downBytes.get())
         } finally {
             closeAll(app, clientSide, upSide, server)
         }
@@ -137,8 +145,11 @@ class TunnelTest {
             val run = launch(Dispatchers.Default) {
                 Tunnel(loop, clientSide, upSide, idleTimeoutMs = 60_000).run(closeWhenResponseEnds = false)
             }
+            app.writeBlocking("p")
+            assertEquals("p", server.readExactlyBlocking(1))
             run.cancel()
             withTimeout(2000) { run.join() }
+            assertTrue(run.isCancelled)
         } finally {
             closeAll(app, clientSide, upSide, server)
         }
@@ -153,11 +164,52 @@ class TunnelTest {
                 Tunnel(loop, clientSide, upSide, idleTimeoutMs = 60_000).run(closeWhenResponseEnds = false)
             }
             app.shutdownOutput()
+            // Confirms up reached EOF and half-closed upstream before the other direction moves.
+            assertEquals("", server.readAllBlocking().toString(Charsets.ISO_8859_1))
             server.writeBlocking("late")
             server.shutdownOutput()
             val result = withTimeout(2000) { run.await() }
             assertEquals("late", app.readAllBlocking().toString(Charsets.ISO_8859_1))
-            assertEquals(TunnelResult(TunnelEnd.BOTH_EOF), result)
+            assertEquals(TunnelResult(TunnelEnd.BOTH_EOF, responseComplete = true), result)
+        } finally {
+            closeAll(app, clientSide, upSide, server)
+        }
+    }
+
+    @Test
+    fun `client write failure leaves up running, ends CLIENT_FAILED`() = runBlocking {
+        val (app, clientSide) = socketPair()
+        val (upSide, server) = socketPair()
+        try {
+            clientSide.shutdownOutput()
+            val run = async(Dispatchers.Default) {
+                Tunnel(loop, clientSide, upSide, idleTimeoutMs = 60_000).run(closeWhenResponseEnds = false)
+            }
+            server.writeBlocking("x")
+            app.writeBlocking("hello")
+            app.shutdownOutput()
+            assertEquals("hello", server.readAllBlocking().toString(Charsets.ISO_8859_1))
+            server.shutdownOutput()
+            val result = withTimeout(2000) { run.await() }
+            assertEquals(TunnelEnd.CLIENT_FAILED, result.end)
+            assertFalse(result.responseComplete)
+        } finally {
+            closeAll(app, clientSide, upSide, server)
+        }
+    }
+
+    @Test
+    fun `forward idle mid-response is not complete`() = runBlocking {
+        val (app, clientSide) = socketPair()
+        val (upSide, server) = socketPair()
+        try {
+            val run = async(Dispatchers.Default) {
+                Tunnel(loop, clientSide, upSide, idleTimeoutMs = 300).run(closeWhenResponseEnds = true)
+            }
+            server.writeBlocking("HTTP/1.1 200 OK\r\n")
+            val result = withTimeout(3000) { run.await() }
+            assertEquals(TunnelEnd.IDLE, result.end)
+            assertFalse(result.responseComplete)
         } finally {
             closeAll(app, clientSide, upSide, server)
         }

@@ -17,7 +17,7 @@ fun monotonicMs(): Long = System.nanoTime() / 1_000_000
 /** Why a [Tunnel] stopped pumping. */
 enum class TunnelEnd { BOTH_EOF, RESPONSE_ENDED, IDLE, CLIENT_FAILED, UPSTREAM_FAILED }
 
-data class TunnelResult(val end: TunnelEnd, val error: IOException? = null)
+data class TunnelResult(val end: TunnelEnd, val error: IOException? = null, val responseComplete: Boolean = false)
 
 /**
  * Pumps client<->upstream until both directions reach EOF, the tunnel is idle for
@@ -31,6 +31,12 @@ data class TunnelResult(val end: TunnelEnd, val error: IOException? = null)
  * The first recorded failure wins the result, then IDLE if the watchdog fired, then
  * RESPONSE_ENDED, otherwise BOTH_EOF.
  *
+ * [TunnelResult.responseComplete] is true once the upstream->client pump reaches EOF: every
+ * byte upstream sent was written to the client, followed by a shutdownOutput. It can be true
+ * together with CLIENT_FAILED or UPSTREAM_FAILED - e.g. the client's write failed only after
+ * it had already received the whole response - which matters to a caller deciding whether an
+ * abort would discard a complete response still sitting in the client socket's send buffer.
+ *
  * [run] throws only on cancellation (e.g. an outer revoke) or a non-I/O bug.
  * The caller owns and closes both channels.
  */
@@ -43,11 +49,16 @@ class Tunnel(
     private val onUp: (Int) -> Unit = {},
     private val onDown: (Int) -> Unit = {},
 ) {
+    init {
+        require(idleTimeoutMs > 0) { "idleTimeoutMs must be positive" }
+    }
+
     suspend fun run(closeWhenResponseEnds: Boolean): TunnelResult = coroutineScope {
         val lastActivity = AtomicLong(clock())
         val failure = AtomicReference<TunnelResult?>()
         val idled = AtomicBoolean(false)
         val responseEnded = AtomicBoolean(false)
+        val responseComplete = AtomicBoolean(false)
 
         // Declared lazily and started together below so each side can cancel the other by
         // referencing a Job that is guaranteed to be assigned before either one actually runs.
@@ -73,9 +84,12 @@ class Tunnel(
                 lastActivity.set(clock())
                 onDown(n)
             }) {
-                PumpResult.Eof -> if (closeWhenResponseEnds) {
-                    responseEnded.set(true)
-                    up.cancel()
+                PumpResult.Eof -> {
+                    responseComplete.set(true)
+                    if (closeWhenResponseEnds) {
+                        responseEnded.set(true)
+                        up.cancel()
+                    }
                 }
                 is PumpResult.ReadFailed -> {
                     failure.compareAndSet(null, TunnelResult(TunnelEnd.UPSTREAM_FAILED, result.error))
@@ -105,11 +119,12 @@ class Tunnel(
         down.join()
         idle.cancel()
 
-        failure.get() ?: when {
+        val outcome = failure.get() ?: when {
             idled.get() -> TunnelResult(TunnelEnd.IDLE)
             responseEnded.get() -> TunnelResult(TunnelEnd.RESPONSE_ENDED)
             else -> TunnelResult(TunnelEnd.BOTH_EOF)
         }
+        outcome.copy(responseComplete = responseComplete.get())
     }
 
     companion object {
