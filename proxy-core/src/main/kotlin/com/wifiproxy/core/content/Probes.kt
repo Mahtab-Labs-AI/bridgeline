@@ -18,13 +18,16 @@ object Probes {
 
     fun match(request: ProxyRequest.Forward): HttpResponse? {
         if (request.method != "GET" && request.method != "HEAD") return null
+        if (request.port != 80) return null
         val host = request.host.lowercase()
         val path = request.target.substringBefore('?')
         return when {
             (host to path) in NO_CONTENT -> HttpResponse(204, "No Content")
             host == "captive.apple.com" ||
-                (host == "www.apple.com" && path == "/library/test/success.html") ->
-                HttpResponse(200, "OK", "text/html", APPLE_SUCCESS)
+                (host == "www.apple.com" && path == "/library/test/success.html") -> {
+                val body = if (request.method == "HEAD") ByteArray(0) else APPLE_SUCCESS
+                HttpResponse(200, "OK", "text/html", body)
+            }
             else -> null
         }
     }

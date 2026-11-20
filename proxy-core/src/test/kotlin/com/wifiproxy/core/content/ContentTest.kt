@@ -7,6 +7,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertNotEquals
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
+import kotlin.test.assertFailsWith
 
 class ContentTest {
     private fun request(line: String) = RequestParser.parse(line) as ProxyRequest.Forward
@@ -53,5 +54,28 @@ class ContentTest {
     fun `other requests are not probes`() {
         assertNull(Probes.match(request("GET http://example.com/generate_204 HTTP/1.1")))
         assertNull(Probes.match(request("POST http://connectivitycheck.gstatic.com/generate_204 HTTP/1.1")))
+    }
+
+    @Test
+    fun `head probe has no body`() {
+        val r = Probes.match(request("HEAD http://captive.apple.com/hotspot-detect.html HTTP/1.1"))!!
+        assertEquals(200, r.status)
+        assertEquals(0, r.body.size)
+    }
+
+    @Test
+    fun `probe on a non-default port is not answered locally`() {
+        assertNull(Probes.match(request("GET http://captive.apple.com:8080/hotspot-detect.html HTTP/1.1")))
+    }
+
+    @Test
+    fun `mobileconfig escapes newlines so trimMargin cannot touch data`() {
+        val xml = MobileConfig.render("a\n   |b", "password1", "http://h/t.pac", "tok")
+        assertTrue("<string>a&#10;   |b</string>" in xml)
+    }
+
+    @Test
+    fun `mobileconfig rejects control characters`() {
+        assertFailsWith<IllegalArgumentException> { MobileConfig.render("bad\u0001ssid", "password1", "http://h/t.pac", "tok") }
     }
 }

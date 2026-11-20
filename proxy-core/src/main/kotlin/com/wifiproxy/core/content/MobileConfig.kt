@@ -42,10 +42,15 @@ object MobileConfig {
         """.trimMargin() + "\n"
     }
 
-    private fun escape(s: String) = s
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace("\"", "&quot;")
-        .replace("'", "&apos;")
+    private fun escape(s: String): String {
+        require(s.none { it < ' ' && it != '\t' && it != '\n' && it != '\r' }) { "control characters are not allowed in profile values" }
+        return s
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace("\"", "&quot;")
+            .replace("'", "&apos;")
+            .replace("\n", "&#10;")
+            .replace("\r", "&#13;")
+    }
 }
