@@ -5,6 +5,7 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import java.io.Closeable
 import java.io.IOException
 import java.nio.channels.CancelledKeyException
+import java.nio.channels.Channel
 import java.nio.channels.ClosedChannelException
 import java.nio.channels.ClosedSelectorException
 import java.nio.channels.SelectableChannel
@@ -68,7 +69,26 @@ class NioLoop : Closeable {
         if (Thread.currentThread() !== thread) thread.join(1000)
     }
 
-    /** Forces a zero-result `select()` pass so tests can exercise idle-key sweeping deterministically. */
+    /**
+     * Closes a channel that may be registered with this loop, then wakes the selector so the
+     * close is actually observed promptly. Closing a selector-registered channel directly can
+     * defer the RST of an abortive (SO_LINGER(0)) close, the fd release, and - for an unconnected
+     * channel - the whole close, until the selector deregisters the cancelled key; if the loop
+     * thread is parked in an untimed `select()` with nothing else to wake it, that can take
+     * indefinitely long. Always close loop-registered channels through this instead of calling
+     * `channel.close()` directly.
+     */
+    fun closeChannel(ch: Channel?) {
+        if (ch == null) return
+        runCatching { ch.close() }
+        runCatching { selector.wakeup() }
+    }
+
+    /**
+     * Forces a zero-result `select()` pass. Internal: used only by tests to deterministically
+     * exercise idle-key sweeping. Production code that needs to wake the selector after closing a
+     * channel should use [closeChannel], not this.
+     */
     internal fun nudge() {
         runCatching { selector.wakeup() }
     }

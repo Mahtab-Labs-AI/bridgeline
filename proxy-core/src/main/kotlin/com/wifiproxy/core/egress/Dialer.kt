@@ -27,6 +27,7 @@ import java.util.concurrent.atomic.AtomicReference
 class Dialer(
     private val staggerMs: Long = 250,
     private val timeoutMs: Long = 10_000,
+    private val close: (SocketChannel) -> Unit = { runCatching { it.close() } },
     private val connect: suspend (InetAddress, Int) -> SocketChannel,
 ) {
     suspend fun dial(addresses: List<InetAddress>, port: Int): SocketChannel {
@@ -39,7 +40,7 @@ class Dialer(
         } catch (t: Throwable) {
             // An attempt can hand the winner a connected channel after withTimeoutOrNull has
             // already given up on (or race() otherwise failed) the result; never leak it.
-            winnerChannel.get()?.let { ch -> runCatching { ch.close() } }
+            winnerChannel.get()?.let(close)
             throw t
         }
     }
@@ -67,7 +68,7 @@ class Dialer(
                 if (winner.complete(ch)) {
                     winnerChannel.set(ch)
                 } else {
-                    ch.close()
+                    close(ch)
                 }
             }
         }
@@ -91,7 +92,7 @@ class Dialer(
         }
 
         fun forEgress(loop: NioLoop, egress: Egress, staggerMs: Long = 250, timeoutMs: Long = 10_000) =
-            Dialer(staggerMs, timeoutMs) { address, port ->
+            Dialer(staggerMs, timeoutMs, close = loop::closeChannel) { address, port ->
                 connectChannel(loop, egress.newChannel(), InetSocketAddress(address, port))
             }
     }
@@ -116,7 +117,7 @@ suspend fun connectChannel(loop: NioLoop, ch: SocketChannel, target: InetSocketA
         ch.socket().tcpNoDelay = true
         return ch
     } catch (t: Throwable) {
-        runCatching { ch.close() }
+        loop.closeChannel(ch)
         throw t
     }
 }

@@ -17,6 +17,13 @@ interface Egress {
     /** True when the egress network has validated internet; gates local probe answers. */
     val isValidated: Boolean
 
+    /**
+     * Resolves [host] on this egress's network. Implementations must be cancellable and
+     * time-bounded: a blocking `InetAddress.getAllByName` wrapped in `withContext(Dispatchers.IO)`
+     * cannot actually be cancelled (the underlying blocking call keeps running on the IO thread
+     * after the coroutine gives up on it), so the Android implementation must resolve via
+     * `DnsResolver` with an explicit timeout instead.
+     */
     suspend fun resolve(host: String): List<InetAddress>
 
     /**

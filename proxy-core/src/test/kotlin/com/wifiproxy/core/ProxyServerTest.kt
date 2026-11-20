@@ -19,6 +19,7 @@ import java.net.Proxy
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketException
+import java.net.SocketTimeoutException
 import java.net.UnknownHostException
 import java.nio.channels.SocketChannel
 import java.util.concurrent.CopyOnWriteArrayList
@@ -26,6 +27,7 @@ import kotlin.concurrent.thread
 import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 import kotlin.test.fail
 
@@ -41,9 +43,14 @@ class ProxyServerTest {
         idleMs: Long = 60_000,
         wifi: WifiCredentials? = null,
         peerSubnet: Cidr = Cidr.parse("127.0.0.0/8"),
+        maxConnections: Int = 832,
+        maxPendingHeadsPerPeer: Int = 16,
         onError: (Throwable) -> Unit = {},
     ) {
-        val config = ProxyConfig(bindAddress = loopback, port = 0, peerSubnet = peerSubnet, wifi = wifi, idleTimeoutMs = idleMs)
+        val config = ProxyConfig(
+            bindAddress = loopback, port = 0, peerSubnet = peerSubnet, wifi = wifi, idleTimeoutMs = idleMs,
+            maxConnections = maxConnections, maxPendingHeadsPerPeer = maxPendingHeadsPerPeer,
+        )
         server = ProxyServer(config, registry, egress, filter, onError).also { it.start() }
     }
 
@@ -309,13 +316,13 @@ class ProxyServerTest {
     fun `routine client reset is not reported as an error`() {
         val errors = CopyOnWriteArrayList<Throwable>()
         start(onError = { errors += it })
-        admit()
+        val slot = admit()
         val echo = startEcho()
         val (s, head) = openConnect(echo.localPort)
         assertTrue(head.startsWith("HTTP/1.1 200"), head)
         s.setSoLinger(true, 0)
         s.close()
-        Thread.sleep(300)
+        eventually { registry.slots().single { it.id == slot.id }.activeTunnels == 0 }
         assertTrue(errors.isEmpty(), errors.toString())
     }
 
@@ -328,5 +335,127 @@ class ProxyServerTest {
         assertTrue(firstHead.startsWith("HTTP/1.1 200"), firstHead)
         server.updateFilter(DestinationFilter.default(Cidr.parse("192.168.49.0/24")))
         assertTrue(rawRequest("CONNECT 127.0.0.1:${echo.localPort} HTTP/1.1\r\n\r\n").startsWith("HTTP/1.1 403"))
+    }
+
+    @Test
+    fun `per-peer pending head cap`() {
+        start(maxPendingHeadsPerPeer = 2)
+        val silent1 = Socket(loopback, server.localPort)
+        closeables += silent1
+        Thread.sleep(150)
+        val silent2 = Socket(loopback, server.localPort)
+        closeables += silent2
+        Thread.sleep(150)
+
+        val third = Socket(loopback, server.localPort)
+        closeables += third
+        third.soTimeout = 1000
+        val r = try { third.getInputStream().read() } catch (e: SocketException) { -1 }
+        assertEquals(-1, r, "the 3rd connection past the per-peer cap should be dropped")
+
+        // The first two are still open and simply idle: reading times out, it doesn't close.
+        silent1.soTimeout = 300
+        silent2.soTimeout = 300
+        assertFailsWith<SocketTimeoutException> { silent1.getInputStream().read() }
+        assertFailsWith<SocketTimeoutException> { silent2.getInputStream().read() }
+    }
+
+    @Test
+    fun `global connection cap`() {
+        start(maxConnections = 2)
+        val silent1 = Socket(loopback, server.localPort)
+        closeables += silent1
+        Thread.sleep(150)
+        val silent2 = Socket(loopback, server.localPort)
+        closeables += silent2
+        Thread.sleep(150)
+
+        val third = Socket(loopback, server.localPort)
+        closeables += third
+        third.soTimeout = 1000
+        val r = try { third.getInputStream().read() } catch (e: SocketException) { -1 }
+        assertEquals(-1, r, "the 3rd connection past the global cap should be dropped")
+
+        silent1.soTimeout = 300
+        silent2.soTimeout = 300
+        assertFailsWith<SocketTimeoutException> { silent1.getInputStream().read() }
+        assertFailsWith<SocketTimeoutException> { silent2.getInputStream().read() }
+    }
+
+    @Test
+    fun `isAccepting reflects the accept loop lifecycle`() {
+        start()
+        eventually { server.isAccepting }
+        server.stop()
+        eventually { !server.isAccepting }
+    }
+
+    @Test
+    fun `oversized head without a blank line gets 400`() {
+        start()
+        val s = Socket(loopback, server.localPort)
+        closeables += s
+        s.soTimeout = 5000
+        s.getOutputStream().write("a".repeat(20 * 1024).toByteArray(Charsets.ISO_8859_1))
+        val input = s.getInputStream()
+        val sb = StringBuilder()
+        try {
+            var b = input.read()
+            while (b >= 0) {
+                sb.append(b.toChar())
+                b = input.read()
+            }
+        } catch (e: SocketException) {
+            // Leftover unread bytes on the server side can trigger a reset on close instead of a
+            // clean EOF; the 400 response written before that should already be in `sb`.
+        }
+        assertTrue(sb.toString().startsWith("HTTP/1.1 400"), sb.toString())
+    }
+
+    @Test
+    fun `revoke during a forward response aborts the client`() {
+        start()
+        val slot = admit()
+        val origin = ServerSocket(0, 50, loopback)
+        closeables += origin
+        thread(isDaemon = true) {
+            val s = try { origin.accept() } catch (e: IOException) { return@thread }
+            runCatching { readHeadBlocking(s.getInputStream()) }
+            runCatching {
+                s.getOutputStream().write("HTTP/1.1 200 OK\r\n\r\npart".toByteArray(Charsets.ISO_8859_1))
+                s.getOutputStream().flush()
+            }
+            // Deliberately holds the connection open: no close here.
+        }
+        val port = origin.localPort
+        val s = Socket(loopback, server.localPort)
+        closeables += s
+        s.soTimeout = 5000
+        s.getOutputStream().write("GET http://127.0.0.1:$port/ HTTP/1.1\r\nHost: x\r\n\r\n".toByteArray())
+        val input = s.getInputStream()
+        // A forward tunnels the origin's bytes verbatim, so the client sees the origin's own
+        // response head first, then its body.
+        val head = readHeadBlocking(input)
+        assertTrue(head.startsWith("HTTP/1.1 200"), head)
+        val body = ByteArray(4)
+        var total = 0
+        while (total < 4) {
+            val n = input.read(body, total, 4 - total)
+            if (n < 0) fail("origin connection closed before sending the body")
+            total += n
+        }
+        assertEquals("part", String(body, Charsets.ISO_8859_1))
+
+        assertTrue(server.revoke(slot.id))
+
+        var reset = false
+        try {
+            while (input.read() >= 0) {
+                // drain until EOF or an exception
+            }
+        } catch (e: SocketException) {
+            reset = true
+        }
+        assertTrue(reset, "expected the client read to end with a connection reset after revoke, not a clean EOF")
     }
 }

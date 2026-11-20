@@ -21,6 +21,10 @@ data class ProxyConfig(
     val pushIdleTimeoutMs: Long = 30 * 60_000L,
     val headTimeoutMs: Long = 10_000L,
     val connectTimeoutMs: Long = 10_000L,
+    /** Global cap on in-flight connections (accepted through closed); a pre-admission DoS guard. */
+    val maxConnections: Int = 832, // 3 * 256 + 64
+    /** Per-peer-IP cap on connections still reading their request head. */
+    val maxPendingHeadsPerPeer: Int = 16,
 ) {
     init {
         require(!bindAddress.isAnyLocalAddress) { "refusing wildcard bind address $bindAddress" }
@@ -30,5 +34,7 @@ data class ProxyConfig(
         require(pushIdleTimeoutMs > 0) { "pushIdleTimeoutMs must be positive" }
         require(headTimeoutMs > 0) { "headTimeoutMs must be positive" }
         require(connectTimeoutMs > 0) { "connectTimeoutMs must be positive" }
+        require(maxConnections > 0) { "maxConnections must be positive" }
+        require(maxPendingHeadsPerPeer > 0) { "maxPendingHeadsPerPeer must be positive" }
     }
 }
