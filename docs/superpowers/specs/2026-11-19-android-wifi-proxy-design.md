@@ -40,8 +40,8 @@ Single-process app. A `connectedDevice` foreground service (`ProxySessionService
 | `SessionController` | Single-owner coroutine actor; runs the session state machine | `start()`, `stop()`, `state: StateFlow<SessionState>` |
 | `P2pGroupLink` (implements `LinkManager`) | Create/maintain the Wi-Fi Direct group; read back and verify actual SSID/passphrase; recreate on teardown | `start(cfg): Flow<LinkState>`, `stop()` |
 | `EgressNetworkProvider` | Hold a cellular `requestNetwork`; provide bound sockets and DNS | `network: StateFlow<Network?>`, `connect(host, port)`, `resolve(host)` |
-| `ProxyServer` | Listener on group-owner IP; HTTP proxy, PAC, `.mobileconfig`, connectivity-probe answers | `start(bindAddr, port, egress, registry)`, `stop()`, `stats: Flow<TunnelStats>` |
-| `ClientRegistry` | Client slots, tokens, token→IP binding, cap enforcement, revocation | `addSlot(name): Slot`, `revoke(id)`, `onPacFetch(token, ip)`, `isAdmitted(ip): Slot?`, `maxClients` |
+| `ProxyServer` (`:proxy-core`) | Listener on group-owner IP; HTTP proxy, PAC, `.mobileconfig`, connectivity-probe answers | `ProxyServer(config, registry, egress, filter, onError)`, `start()`, `stop()`, `revoke(slotId)`, `updateFilter(f)`, `isAccepting`, `localPort`; stats by polling `registry.slots()` |
+| `ClientRegistry` (`:proxy-core`) | Client slots, tokens, token→IP binding, cap enforcement | `addSlot(name): Slot?`, `onPacFetch(token, ip)`, `admittedSlot(ip): Slot?`, `setMaxClients(n)`, `clearBindings()`, `unbind(ip)`, `slots()`, `snapshot()`; revoke only via `ProxyServer.revoke` |
 | `CredentialStore` | SSID suffix + Wi-Fi password, encrypted with Android Keystore | `get()`, `set(suffix, password)` |
 | `PowerKeeper` | Partial wake lock + `WIFI_MODE_FULL_LOW_LATENCY` WifiLock, tied to state | `onState(state)` |
 | `SystemMonitor` | Wi-Fi, P2P, airplane mode, Data Saver, system hotspot, permissions, thermal status | `events: Flow<SystemEvent>` |
@@ -96,13 +96,12 @@ Desired state ("session should be running") and credentials persist in DataStore
    - `CONNECT host:port` → TLS tunnel.
    - Absolute-URI request (`GET http://…`) → plain HTTP forward; strip `Proxy-*` hop-by-hop headers.
    - `GET /<token>.pac` / `GET /<token>.mobileconfig` → served locally.
-   - Connectivity probes (`connectivitycheck.gstatic.com/generate_204`, `www.google.com/gen_204`, `captive.apple.com/hotspot-detect.html`) → answered locally **only while the cellular network is `VALIDATED`**; otherwise forwarded (and thus failed) so clients aren't told they're online when they aren't.
-   - Anything else → `400`.
+   - Other origin-form paths → `404`; non-`GET` on a token path → `405`; malformed request line/headers → `400`.
 
 ### Host → internet
 
-4. Admission: `ClientRegistry.isAdmitted(srcIp)` else `403`; per-slot tunnel cap else `503`.
-5. DNS via `cellNetwork.getAllByName()` (or `DnsResolver` bound to the network), with a TTL-respecting cache.
+4. Admission: `ClientRegistry.admittedSlot(srcIp)` else `403`. For admitted clients only, connectivity probes (`connectivitycheck.gstatic.com/generate_204`, `www.google.com/gen_204`, `captive.apple.com/hotspot-detect.html`, port 80) are answered locally **only while the cellular network is `VALIDATED`**; otherwise forwarded (and thus failed) so clients aren't told they're online when they aren't. Then the per-slot tunnel cap, else `503`.
+5. DNS through the `Egress` (Android: `DnsResolver` bound to the cellular network, cancellable, with a timeout and a TTL-respecting cache owned by the Egress); core adds a `connectTimeoutMs` deadline → `504`.
 6. Destination filter after resolution: reject loopback, RFC 1918, link-local, CGNAT `100.64.0.0/10`, `192.0.0.0/24` (includes Android's CLAT address `192.0.0.4`), the P2P subnet, **the host's own interface addresses** (cellular/Wi-Fi global IPv6 etc., as /32 and /128 — connecting to any local address reaches the host regardless of socket binding; the Android layer supplies them and refreshes them on network change), and IPv6 equivalents (`::/96`, `fc00::/7`, `fe80::/10`) → `403`. IPv4-mapped IPv6 addresses are unwrapped before checking. NAT64 (`64:ff9b::/96`) is deliberately **not** blocked — it carries all IPv4-only sites on IPv6-only carriers; decoding the embedded IPv4 is a possible follow-up.
 7. Open `SocketChannel`; `cellNetwork.bindSocket(channel.socket())` **before** `connect`. Happy-eyeballs: IPv6 first, IPv4 after 250 ms. No cellular network → immediate `503`.
 8. Bidirectional pump with one 16 KB heap buffer per direction (no pool; revisit if profiling shows GC pressure), `TCP_NODELAY`, kernel-default socket buffers, backpressure. Byte counts feed per-slot counters (reported per write). Plain-HTTP forwards carry exactly one request per upstream connection (`Connection: close`); the tunnel closes when the response ends.
@@ -212,4 +211,4 @@ In-app disclosure: "Web and most apps work. Calls, games and some apps won't." P
 3. **Client network-selection quirks** — Wi-Fi Assist / client mobile data, Private DNS strict mode, "No internet" on iOS. Mitigation: PAC, local probe answers, onboarding instructions.
 4. **Slot hijack by a password holder** — admission is source-IP + token, and the token travels over plain HTTP on a shared WPA2-PSK link. Anyone who knows the Wi-Fi password and captures a victim's handshake can decrypt a PAC re-fetch and steal the token, or spoof a bound IP; victim and attacker then rebind the slot back and forth. Inherent to the no-client-app design. Mitigation: treat the Wi-Fi password as the real trust boundary, rotate it after sharing with someone untrusted, revoke unknown slots.
 5. **Exposure** — wildcard bind or SSRF into host loopback. Mitigation: GO-IP-only bind, peer subnet check, post-resolution destination filter.
-5. **Egress correctness under churn** — stale `Network` handle or DNS slipping onto Wi-Fi. Mitigation: bound-or-refuse, atomic handle swap.
+6. **Egress correctness under churn** — stale `Network` handle or DNS slipping onto Wi-Fi. Mitigation: bound-or-refuse, atomic handle swap.
