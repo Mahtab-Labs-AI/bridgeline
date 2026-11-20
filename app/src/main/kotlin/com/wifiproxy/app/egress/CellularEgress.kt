@@ -20,6 +20,28 @@ import java.nio.channels.SocketChannel
 import java.util.concurrent.Executors
 
 /**
+ * What `UsbSessionController` needs from the cellular egress: the [Egress] contract `ProxyServer`
+ * uses, plus the lifecycle and liveness signals a JVM test can fake without touching
+ * `ConnectivityManager`. [CellularEgress] is the only real implementation.
+ */
+interface SessionEgress : Egress {
+    /** Mirrors [Egress.isAvailable] as a flow so the controller can react to egress loss/regain
+     *  instead of polling. */
+    val available: StateFlow<Boolean>
+
+    /** Fires (on an arbitrary thread) whenever the tracked network's link addresses may have
+     *  changed; the controller refreshes the proxy's destination filter in response. */
+    var onLinkChange: (() -> Unit)?
+
+    fun start()
+    fun stop()
+
+    /** The host's own interface addresses, as /32 or /128 [Cidr]s, so the destination filter
+     *  never lets the proxy dial back into the host itself. */
+    fun hostAddresses(): List<Cidr>
+}
+
+/**
  * [Egress] bound to the device's cellular network.
  *
  * One long-lived instance swaps its current [Network] internally: [start] registers a
@@ -30,7 +52,7 @@ import java.util.concurrent.Executors
  */
 class CellularEgress(
     private val connectivityManager: ConnectivityManager,
-) : Egress {
+) : SessionEgress {
 
     private val _network = MutableStateFlow<Network?>(null)
 
@@ -39,6 +61,10 @@ class CellularEgress(
 
     override val isAvailable: Boolean
         get() = _network.value != null
+
+    private val _available = MutableStateFlow(false)
+
+    override val available: StateFlow<Boolean> = _available.asStateFlow()
 
     private val _isValidated = MutableStateFlow(false)
 
@@ -49,7 +75,7 @@ class CellularEgress(
      * Fires (on the connectivity callback thread) whenever the tracked network's
      * [LinkProperties] change. Callers should treat this as a hint to recompute [hostAddresses].
      */
-    var onLinkChange: (() -> Unit)? = null
+    override var onLinkChange: (() -> Unit)? = null
 
     // Lives for the process; DnsResolver queries are infrequent enough that a single thread is
     // plenty, and there is no restart cost worth tearing this down across start()/stop() cycles.
@@ -62,7 +88,7 @@ class CellularEgress(
     private var callback: ConnectivityManager.NetworkCallback? = null
 
     /** Starts tracking the cellular network. Call [stop] before calling this again. */
-    fun start() {
+    override fun start() {
         check(callback == null) { "CellularEgress already started" }
         val request = NetworkRequest.Builder()
             .addTransportType(NetworkCapabilities.TRANSPORT_CELLULAR)
@@ -71,11 +97,13 @@ class CellularEgress(
         val newCallback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
                 _network.value = network
+                _available.value = true
             }
 
             override fun onLost(network: Network) {
                 if (_network.value == network) {
                     _network.value = null
+                    _available.value = false
                     _isValidated.value = false
                 }
             }
@@ -95,10 +123,11 @@ class CellularEgress(
     }
 
     /** Stops tracking the cellular network. Safe to call when not started. */
-    fun stop() {
+    override fun stop() {
         callback?.let { connectivityManager.unregisterNetworkCallback(it) }
         callback = null
         _network.value = null
+        _available.value = false
         _isValidated.value = false
     }
 
@@ -144,7 +173,7 @@ class CellularEgress(
     @Suppress("DEPRECATION") // getAllNetworks() is deprecated in favour of callbacks, but there is
     // no non-deprecated way to enumerate every currently known network on demand, which is
     // exactly what the spec asks for here; this is the call the design/plan name explicitly.
-    fun hostAddresses(): List<Cidr> {
+    override fun hostAddresses(): List<Cidr> {
         val addresses = mutableListOf<InetAddress>()
         for (net in connectivityManager.allNetworks) {
             val linkProperties = connectivityManager.getLinkProperties(net) ?: continue
