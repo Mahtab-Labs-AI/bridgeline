@@ -33,6 +33,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import com.wifiproxy.app.session.CheckStatus
 import com.wifiproxy.app.session.SessionRepository
@@ -45,6 +46,7 @@ fun SetupCheckScreen(repository: SessionRepository, modifier: Modifier = Modifie
     val checks by repository.checks.collectAsState()
     val snackbarHostState = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
+    val context = LocalContext.current
 
     Box(modifier = modifier.fillMaxSize()) {
         Column(
@@ -60,7 +62,12 @@ fun SetupCheckScreen(repository: SessionRepository, modifier: Modifier = Modifie
                 SetupCheckCard(
                     check = check,
                     onFixClick = {
-                        scope.launch { snackbarHostState.showSnackbar("Would open system settings") }
+                        val intent = check.fixIntent
+                        if (intent != null) {
+                            context.startActivity(intent)
+                        } else {
+                            scope.launch { snackbarHostState.showSnackbar("Would open system settings") }
+                        }
                     },
                 )
             }

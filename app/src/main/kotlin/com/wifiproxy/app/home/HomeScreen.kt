@@ -17,8 +17,6 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.PhoneAndroid
-import androidx.compose.material.icons.filled.PhoneIphone
 import androidx.compose.material.icons.filled.SignalCellularAlt
 import androidx.compose.material.icons.filled.SignalCellularOff
 import androidx.compose.material3.AlertDialog
@@ -43,17 +41,17 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
-import com.wifiproxy.app.session.ClientPlatform
 import com.wifiproxy.app.session.SessionPhase
 import com.wifiproxy.app.session.SessionRepository
 import com.wifiproxy.app.session.SlotUi
 import com.wifiproxy.app.ui.ScreenTitle
 import com.wifiproxy.app.ui.color
 import com.wifiproxy.app.ui.formatBytes
+import com.wifiproxy.app.ui.icon
 import com.wifiproxy.app.ui.label
 
 @Composable
-fun HomeScreen(repository: SessionRepository, modifier: Modifier = Modifier) {
+fun HomeScreen(repository: SessionRepository, modifier: Modifier = Modifier, onBeforeStart: () -> Unit = {}) {
     val session by repository.session.collectAsState()
     var slotPendingRevoke by remember { mutableStateOf<SlotUi?>(null) }
 
@@ -70,7 +68,10 @@ fun HomeScreen(repository: SessionRepository, modifier: Modifier = Modifier) {
 
         StartStopButton(
             phase = session.phase,
-            onStart = repository::start,
+            onStart = {
+                onBeforeStart()
+                repository.start()
+            },
             onStop = repository::stop,
         )
 
@@ -194,7 +195,7 @@ private fun SlotRow(slot: SlotUi, onRevokeClick: () -> Unit) {
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Icon(
-                imageVector = if (slot.platform == ClientPlatform.IPHONE) Icons.Filled.PhoneIphone else Icons.Filled.PhoneAndroid,
+                imageVector = slot.platform.icon(),
                 contentDescription = slot.platform.name,
                 modifier = Modifier.size(32.dp),
             )

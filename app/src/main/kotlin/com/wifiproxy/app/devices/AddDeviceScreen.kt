@@ -20,8 +20,6 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ContentCopy
-import androidx.compose.material.icons.filled.PhoneAndroid
-import androidx.compose.material.icons.filled.PhoneIphone
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -59,12 +57,26 @@ import com.wifiproxy.app.session.SessionRepository
 import com.wifiproxy.app.session.SlotUi
 import com.wifiproxy.app.ui.QrCode
 import com.wifiproxy.app.ui.ScreenTitle
+import com.wifiproxy.app.ui.formatBytes
+import com.wifiproxy.app.ui.icon
 
 private data class ActiveInvite(val invite: DeviceInvite, val platform: ClientPlatform, val name: String)
 
+/** `isDemoMode` picks between the demo invite flow (QR codes, Add device) and the 2a real-mode
+ *  content: a static "Laptop (USB)" card, since the pinned USB slot needs no QR/invite at all. */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun AddDeviceScreen(repository: SessionRepository, modifier: Modifier = Modifier) {
+fun AddDeviceScreen(repository: SessionRepository, modifier: Modifier = Modifier, isDemoMode: Boolean = true) {
+    if (isDemoMode) {
+        DemoDevicesContent(repository, modifier)
+    } else {
+        UsbDevicesContent(repository, modifier)
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun DemoDevicesContent(repository: SessionRepository, modifier: Modifier) {
     val session by repository.session.collectAsState()
 
     var showAddDialog by remember { mutableStateOf(false) }
@@ -137,6 +149,110 @@ fun AddDeviceScreen(repository: SessionRepository, modifier: Modifier = Modifier
 }
 
 @Composable
+private fun UsbDevicesContent(repository: SessionRepository, modifier: Modifier) {
+    val session by repository.session.collectAsState()
+    val laptopSlot = session.slots.firstOrNull()
+
+    Column(
+        modifier = modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp),
+    ) {
+        ScreenTitle(text = "Devices")
+
+        LaptopUsbCard(slot = laptopSlot)
+
+        Button(onClick = {}, enabled = false, modifier = Modifier.fillMaxWidth()) {
+            Icon(Icons.Filled.Add, contentDescription = null)
+            Spacer(modifier = Modifier.width(8.dp))
+            Text("Add device")
+        }
+        Text(
+            text = "Wi-Fi devices arrive in the next version",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+@Composable
+private fun LaptopUsbCard(slot: SlotUi?) {
+    val context = LocalContext.current
+
+    ElevatedCard(modifier = Modifier.fillMaxWidth()) {
+        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    imageVector = ClientPlatform.LAPTOP.icon(),
+                    contentDescription = "Laptop (USB)",
+                    modifier = Modifier.size(32.dp),
+                )
+                Spacer(modifier = Modifier.width(12.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(text = "Laptop (USB)", style = MaterialTheme.typography.titleSmall)
+                    val status = when {
+                        slot == null -> "Not connected"
+                        slot.ip != null -> "Connected: ${slot.ip}"
+                        else -> "Waiting for the laptop"
+                    }
+                    Text(
+                        text = status,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+            if (slot != null) {
+                Text(
+                    text = "↑ ${formatBytes(slot.bytesUp)}   ↓ ${formatBytes(slot.bytesDown)}",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+
+            HorizontalDivider()
+
+            Text(text = "Connect steps", style = MaterialTheme.typography.titleSmall)
+            Text(text = "1. Turn on USB debugging in Developer options.", style = MaterialTheme.typography.bodyMedium)
+            Text(text = "2. Plug the phone into this laptop over USB.", style = MaterialTheme.typography.bodyMedium)
+            Text(
+                text = "3. On the laptop, run tools\\usb-client\\connect-usb.ps1.",
+                style = MaterialTheme.typography.bodyMedium,
+            )
+
+            CopyableCommand(label = "Forward (run first)", command = "adb forward tcp:8081 tcp:8081", context = context)
+            CopyableCommand(
+                label = "Laptop script",
+                command = ".\\tools\\usb-client\\connect-usb.ps1",
+                context = context,
+            )
+        }
+    }
+}
+
+@Composable
+private fun CopyableCommand(label: String, command: String, context: Context) {
+    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        Text(text = label, style = MaterialTheme.typography.labelMedium)
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                text = command,
+                style = MaterialTheme.typography.bodySmall,
+                fontFamily = FontFamily.Monospace,
+                modifier = Modifier.weight(1f),
+            )
+            IconButton(onClick = {
+                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                clipboard.setPrimaryClip(ClipData.newPlainText(label, command))
+            }) {
+                Icon(Icons.Filled.ContentCopy, contentDescription = "Copy $label")
+            }
+        }
+    }
+}
+
+@Composable
 private fun DeviceRow(slot: SlotUi, onClick: () -> Unit) {
     ElevatedCard(modifier = Modifier.fillMaxWidth().clickable(onClick = onClick)) {
         Row(
@@ -144,7 +260,7 @@ private fun DeviceRow(slot: SlotUi, onClick: () -> Unit) {
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Icon(
-                imageVector = if (slot.platform == ClientPlatform.IPHONE) Icons.Filled.PhoneIphone else Icons.Filled.PhoneAndroid,
+                imageVector = slot.platform.icon(),
                 contentDescription = slot.platform.name,
                 modifier = Modifier.size(32.dp),
             )

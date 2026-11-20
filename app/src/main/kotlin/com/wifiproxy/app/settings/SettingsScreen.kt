@@ -27,6 +27,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -45,7 +46,13 @@ import com.wifiproxy.app.session.passwordStrength
 import com.wifiproxy.app.ui.ScreenTitle
 
 @Composable
-fun SettingsScreen(repository: SessionRepository, modifier: Modifier = Modifier) {
+fun SettingsScreen(
+    repository: SessionRepository,
+    prefs: AppPreferences,
+    isDemoMode: Boolean,
+    onDemoModeChange: (Boolean) -> Unit,
+    modifier: Modifier = Modifier,
+) {
     val savedSettings by repository.settings.collectAsState()
     val initial = remember { repository.settings.value }
     var suffix by remember { mutableStateOf(initial.ssidSuffix) }
@@ -58,6 +65,10 @@ fun SettingsScreen(repository: SessionRepository, modifier: Modifier = Modifier)
     var rejectionMessage by remember { mutableStateOf<String?>(null) }
     var savedMessage by remember { mutableStateOf(false) }
     var pendingPasswordConfirm by remember { mutableStateOf(false) }
+
+    // USB sharing has no real toggle in 2a; persist the always-on value so a future version that
+    // does let it vary reads a well-defined starting point.
+    LaunchedEffect(Unit) { prefs.usbSharingEnabled = true }
 
     fun applySave() {
         val port = portText.toIntOrNull() ?: initial.port
@@ -88,6 +99,44 @@ fun SettingsScreen(repository: SessionRepository, modifier: Modifier = Modifier)
         verticalArrangement = Arrangement.spacedBy(20.dp),
     ) {
         ScreenTitle(text = "Settings")
+
+        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(text = "USB sharing (laptop)", style = MaterialTheme.typography.titleMedium)
+                Switch(checked = true, onCheckedChange = {}, enabled = false)
+            }
+            Text(
+                text = "Always on in this version: start sharing, then connect a laptop over USB.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+
+        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(text = "Demo mode", style = MaterialTheme.typography.titleMedium)
+                Switch(
+                    checked = isDemoMode,
+                    onCheckedChange = {
+                        prefs.demoMode = it
+                        onDemoModeChange(it)
+                    },
+                )
+            }
+            Text(
+                text = "Shows fake devices and traffic instead of really sharing cellular data.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
 
         Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Text(text = "Network name", style = MaterialTheme.typography.titleMedium)

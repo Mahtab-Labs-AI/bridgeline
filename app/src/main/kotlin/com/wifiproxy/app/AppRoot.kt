@@ -26,6 +26,7 @@ import com.wifiproxy.app.devices.AddDeviceScreen
 import com.wifiproxy.app.home.HomeScreen
 import com.wifiproxy.app.logs.DiagnosticsScreen
 import com.wifiproxy.app.session.SessionRepository
+import com.wifiproxy.app.settings.AppPreferences
 import com.wifiproxy.app.settings.SettingsScreen
 import com.wifiproxy.app.setup.SetupCheckScreen
 
@@ -38,7 +39,13 @@ private enum class Tab(val route: String, val label: String, val icon: ImageVect
 }
 
 @Composable
-fun AppRoot(repository: SessionRepository) {
+fun AppRoot(
+    repository: SessionRepository,
+    prefs: AppPreferences,
+    isDemoMode: Boolean,
+    onDemoModeChange: (Boolean) -> Unit,
+    onBeforeStart: () -> Unit = {},
+) {
     val navController = rememberNavController()
 
     Scaffold(
@@ -71,9 +78,16 @@ fun AppRoot(repository: SessionRepository) {
             startDestination = Tab.Home.route,
             modifier = Modifier.padding(innerPadding),
         ) {
-            composable(Tab.Home.route) { HomeScreen(repository) }
-            composable(Tab.Devices.route) { AddDeviceScreen(repository) }
-            composable(Tab.Settings.route) { SettingsScreen(repository) }
+            composable(Tab.Home.route) { HomeScreen(repository, onBeforeStart = onBeforeStart) }
+            composable(Tab.Devices.route) { AddDeviceScreen(repository, isDemoMode = isDemoMode) }
+            composable(Tab.Settings.route) {
+                SettingsScreen(
+                    repository = repository,
+                    prefs = prefs,
+                    isDemoMode = isDemoMode,
+                    onDemoModeChange = onDemoModeChange,
+                )
+            }
             composable(Tab.Setup.route) { SetupCheckScreen(repository) }
             composable(Tab.Logs.route) { DiagnosticsScreen(repository) }
         }

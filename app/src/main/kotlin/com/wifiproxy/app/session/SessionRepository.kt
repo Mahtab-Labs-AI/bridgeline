@@ -1,11 +1,13 @@
 package com.wifiproxy.app.session
 
+import android.content.Intent
 import kotlinx.coroutines.flow.StateFlow
 
 /** Lifecycle of the shared-proxy session. Mirrors the real session state machine (design spec §3). */
 enum class SessionPhase { IDLE, STARTING, RUNNING, DEGRADED, STOPPING }
 
-enum class ClientPlatform { ANDROID, IPHONE }
+/** LAPTOP is the pinned USB slot (design spec §8a); it has no QR/invite flow of its own. */
+enum class ClientPlatform { ANDROID, IPHONE, LAPTOP }
 
 data class SlotUi(
     val id: String,
@@ -49,6 +51,9 @@ data class SetupCheck(
     val title: String,
     val detail: String,
     val status: CheckStatus,
+    /** Opens system settings to fix the problem, if there's a direct one; null when there isn't
+     *  (e.g. the fake's checks, or a check with no single settings screen to send the user to). */
+    val fixIntent: Intent? = null,
 )
 
 data class LogEntry(
