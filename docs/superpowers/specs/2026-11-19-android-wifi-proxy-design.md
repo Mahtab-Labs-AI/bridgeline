@@ -202,5 +202,6 @@ In-app disclosure: "Web and most apps work. Calls, games and some apps won't." P
 1. **OEM Wi-Fi Direct variance** — idle group teardown, ignored SSID/passphrase, aggressive GO power save with screen off. Mitigation: read-back verification, recreate-with-same-credentials, watchdog, device matrix.
 2. **OEM process killers** despite FGS. Mitigation: battery exemption, OEM guide, `START_STICKY`, `ApplicationExitInfo` telemetry.
 3. **Client network-selection quirks** — Wi-Fi Assist / client mobile data, Private DNS strict mode, "No internet" on iOS. Mitigation: PAC, local probe answers, onboarding instructions.
-4. **Exposure** — wildcard bind or SSRF into host loopback. Mitigation: GO-IP-only bind, peer subnet check, post-resolution destination filter.
+4. **Slot hijack by a password holder** — admission is source-IP + token, and the token travels over plain HTTP on a shared WPA2-PSK link. Anyone who knows the Wi-Fi password and captures a victim's handshake can decrypt a PAC re-fetch and steal the token, or spoof a bound IP; victim and attacker then rebind the slot back and forth. Inherent to the no-client-app design. Mitigation: treat the Wi-Fi password as the real trust boundary, rotate it after sharing with someone untrusted, revoke unknown slots.
+5. **Exposure** — wildcard bind or SSRF into host loopback. Mitigation: GO-IP-only bind, peer subnet check, post-resolution destination filter.
 5. **Egress correctness under churn** — stale `Network` handle or DNS slipping onto Wi-Fi. Mitigation: bound-or-refuse, atomic handle swap.
