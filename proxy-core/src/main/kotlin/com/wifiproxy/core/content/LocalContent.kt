@@ -32,6 +32,6 @@ class LocalContent(
     }
 
     private companion object {
-        val PATH = Regex("^/([A-Za-z0-9_-]{22})\\.(pac|mobileconfig)$")
+        val PATH = Regex("^/(${ClientRegistry.TOKEN_PATTERN.pattern})\\.(pac|mobileconfig)$")
     }
 }

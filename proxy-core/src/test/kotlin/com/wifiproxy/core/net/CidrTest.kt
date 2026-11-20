@@ -52,4 +52,9 @@ class CidrTest {
     fun `rejects hostnames`() {
         assertFailsWith<IllegalArgumentException> { Cidr.parse("localhost/8") }
     }
+
+    @Test
+    fun `rejects hex-only words that look like ip literals`() {
+        assertFailsWith<IllegalArgumentException> { Cidr.parse("dead/8") }
+    }
 }

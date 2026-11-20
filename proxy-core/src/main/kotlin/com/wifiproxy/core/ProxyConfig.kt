@@ -1,5 +1,6 @@
 package com.wifiproxy.core
 
+import com.wifiproxy.core.clients.ClientRegistry
 import com.wifiproxy.core.net.Cidr
 import java.net.Inet4Address
 import java.net.InetAddress
@@ -22,7 +23,7 @@ data class ProxyConfig(
     val headTimeoutMs: Long = 10_000L,
     val connectTimeoutMs: Long = 10_000L,
     /** Global cap on in-flight connections (accepted through closed); a pre-admission DoS guard. */
-    val maxConnections: Int = 832, // 3 * 256 + 64
+    val maxConnections: Int = ClientRegistry.MAX_CLIENTS_LIMIT * ClientRegistry.DEFAULT_TUNNEL_CAP + 64,
     /** Per-peer-IP cap on connections still reading their request head. */
     val maxPendingHeadsPerPeer: Int = 16,
     /** Global cap, across all peers, on connections still reading their request head; a

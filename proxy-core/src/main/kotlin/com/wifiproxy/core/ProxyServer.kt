@@ -22,6 +22,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.DelicateCoroutinesApi
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -146,11 +147,15 @@ class ProxyServer(
         val r = run ?: return
         run = null
         r.scope.cancel()
-        r.server.close()
+        r.nio.closeChannel(r.server)
         r.nio.close()
     }
 
-    /** Revokes the slot and closes every tunnel it owns. */
+    /**
+     * Revokes the slot and closes every tunnel it owns. This is the only revoke API: a host
+     * must never call [ClientRegistry.revoke] directly, which would drop the slot's admission
+     * without cancelling its tunnels.
+     */
     fun revoke(slotId: String): Boolean {
         val removed = registry.revoke(slotId)
         tunnels.remove(slotId)?.forEach { it.cancel() }
@@ -237,12 +242,24 @@ class ProxyServer(
         }
         r.pendingHeadsTotal.incrementAndGet()
         r.inFlight.incrementAndGet()
+        startHandler(r, client, peer)
+    }
+
+    // ATOMIC guarantees handle()'s finally runs, so the counters and channel are always released.
+    @OptIn(DelicateCoroutinesApi::class)
+    private fun startHandler(r: Run, client: SocketChannel, peer: InetAddress) {
         r.scope.launch(start = CoroutineStart.ATOMIC) { handle(r, client, peer) }
     }
 
     private fun rejectPreAdmission(r: Run, client: SocketChannel) {
-        runCatching { client.socket().setSoLinger(true, 0) }
+        abortOnClose(client)
         r.nio.closeChannel(client)
+    }
+
+    /** Aborts (RST) on the next close instead of a clean FIN: used whenever closing a connection
+     *  whose unread or undelivered bytes would otherwise make a truncated exchange look complete. */
+    private fun abortOnClose(ch: SocketChannel) {
+        runCatching { ch.socket().setSoLinger(true, 0) }
     }
 
     private suspend fun handle(r: Run, client: SocketChannel, peer: InetAddress) {
@@ -336,9 +353,21 @@ class ProxyServer(
                 // here would make a connection-close-delimited response look complete when it
                 // wasn't. Abort instead, then let the cancellation keep propagating.
                 if (forward != null) {
-                    runCatching { client.socket().setSoLinger(true, 0) }
+                    abortOnClose(client)
                 }
                 throw e
+            }
+
+            // An early response (e.g. a 401/413) cancels the upload pump mid-stream, which can
+            // leave unread request bytes sitting in the client's receive buffer. Draining them
+            // now, before handle()'s finally closes the client, turns what would otherwise be an
+            // RST - discarding the tail of the response we just delivered - into a clean close.
+            if (forward != null && result.end == TunnelEnd.RESPONSE_ENDED) {
+                try {
+                    drainBeforeClose(r.nio, client)
+                } catch (e: IOException) {
+                    // Best-effort: the peer may already be gone, which is fine - we're about to close anyway.
+                }
             }
 
             // Abort (RST) only when the response to the client was cut off mid-stream: a clean
@@ -347,7 +376,7 @@ class ProxyServer(
             val mustAbort = !result.responseComplete &&
                 (result.end == TunnelEnd.UPSTREAM_FAILED || (forward != null && result.end == TunnelEnd.IDLE))
             if (mustAbort) {
-                runCatching { client.socket().setSoLinger(true, 0) }
+                abortOnClose(client)
             }
         } finally {
             registry.releaseTunnel(slot.id)
@@ -362,7 +391,8 @@ class ProxyServer(
         if (!egress.isAvailable) throw ProxyFailure(HttpResponse.SERVICE_UNAVAILABLE)
         val currentFilter = filter
         try {
-            val resolved = egress.resolve(host)
+            val resolved = withTimeoutOrNull(config.connectTimeoutMs) { egress.resolve(host) }
+                ?: throw ProxyFailure(HttpResponse.GATEWAY_TIMEOUT)
             if (resolved.isEmpty()) throw ProxyFailure(HttpResponse.BAD_GATEWAY)
             val allowed = resolved.filter(currentFilter::isAllowed)
             if (allowed.isEmpty()) throw ProxyFailure(HttpResponse.FORBIDDEN)
@@ -378,7 +408,11 @@ class ProxyServer(
 
     private fun idleTimeoutFor(upstream: SocketChannel, port: Int): Long {
         val address = (upstream.remoteAddress as InetSocketAddress).address
-        return if (port == APPLE_PUSH_PORT || APPLE_PUSH_RANGE.contains(address)) config.pushIdleTimeoutMs else config.idleTimeoutMs
+        return if (port == APPLE_PUSH_PORT || APPLE_PUSH_RANGES.any { it.contains(address) }) {
+            config.pushIdleTimeoutMs
+        } else {
+            config.idleTimeoutMs
+        }
     }
 
     private suspend fun respond(nio: NioLoop, client: SocketChannel, response: HttpResponse) {
@@ -414,7 +448,13 @@ class ProxyServer(
 
     private companion object {
         const val APPLE_PUSH_PORT = 5223
-        val APPLE_PUSH_RANGE = Cidr.parse("17.0.0.0/8")
+        // Apple's push infrastructure: the classic 17.0.0.0/8 plus its IPv6 ranges.
+        val APPLE_PUSH_RANGES = listOf(
+            Cidr.parse("17.0.0.0/8"),
+            Cidr.parse("2620:149::/32"),
+            Cidr.parse("2403:300::/32"),
+            Cidr.parse("2a01:b740::/32"),
+        )
         const val ACCEPT_BACKOFF_INITIAL_MS = 50L
         const val ACCEPT_BACKOFF_MAX_MS = 1000L
         const val ACCEPT_FAILURE_REPORT_INTERVAL_MS = 60_000L

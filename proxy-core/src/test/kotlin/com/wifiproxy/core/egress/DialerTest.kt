@@ -1,6 +1,7 @@
 package com.wifiproxy.core.egress
 
 import com.wifiproxy.core.io.NioLoop
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
@@ -22,6 +23,7 @@ import kotlin.test.assertFalse
 import kotlin.test.assertSame
 import kotlin.test.assertTrue
 
+@OptIn(ExperimentalCoroutinesApi::class)
 class DialerTest {
     private val v6a = InetAddress.getByName("2001:db8::1")
     private val v6b = InetAddress.getByName("2001:db8::2")

@@ -7,6 +7,7 @@ import com.wifiproxy.core.egress.Egress
 import com.wifiproxy.core.egress.EgressUnavailableException
 import com.wifiproxy.core.net.Cidr
 import com.wifiproxy.core.net.DestinationFilter
+import kotlinx.coroutines.awaitCancellation
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.mockwebserver.MockResponse
@@ -46,12 +47,13 @@ class ProxyServerTest {
         maxConnections: Int = 832,
         maxPendingHeadsPerPeer: Int = 16,
         maxPendingHeads: Int = 64,
+        connectTimeoutMs: Long = 10_000,
         onError: (Throwable) -> Unit = {},
     ) {
         val config = ProxyConfig(
             bindAddress = loopback, port = 0, peerSubnet = peerSubnet, wifi = wifi, idleTimeoutMs = idleMs,
             maxConnections = maxConnections, maxPendingHeadsPerPeer = maxPendingHeadsPerPeer,
-            maxPendingHeads = maxPendingHeads,
+            maxPendingHeads = maxPendingHeads, connectTimeoutMs = connectTimeoutMs,
         )
         server = ProxyServer(config, registry, egress, filter, onError).also { it.start() }
     }
@@ -116,6 +118,22 @@ class ProxyServerTest {
             Thread.sleep(20)
         }
         fail("condition not met within 2s")
+    }
+
+    /** Polls until a short read on [s] times out, confirming the connection is still open
+     *  (admitted, not pre-emptively rejected) before the test opens the next one. */
+    private fun awaitOpen(s: Socket) {
+        s.soTimeout = 50
+        eventually {
+            try {
+                s.getInputStream().read()
+                false
+            } catch (e: SocketTimeoutException) {
+                true
+            } catch (e: SocketException) {
+                false
+            }
+        }
     }
 
     private val failingDns = object : Egress by DirectEgress() {
@@ -344,10 +362,10 @@ class ProxyServerTest {
         start(maxPendingHeadsPerPeer = 2)
         val silent1 = Socket(loopback, server.localPort)
         closeables += silent1
-        Thread.sleep(150)
+        awaitOpen(silent1)
         val silent2 = Socket(loopback, server.localPort)
         closeables += silent2
-        Thread.sleep(150)
+        awaitOpen(silent2)
 
         val third = Socket(loopback, server.localPort)
         closeables += third
@@ -367,10 +385,10 @@ class ProxyServerTest {
         start(maxConnections = 2)
         val silent1 = Socket(loopback, server.localPort)
         closeables += silent1
-        Thread.sleep(150)
+        awaitOpen(silent1)
         val silent2 = Socket(loopback, server.localPort)
         closeables += silent2
-        Thread.sleep(150)
+        awaitOpen(silent2)
 
         val third = Socket(loopback, server.localPort)
         closeables += third
@@ -403,9 +421,10 @@ class ProxyServerTest {
         start(maxPendingHeadsPerPeer = 2)
         val old1 = Socket(loopback, server.localPort)
         closeables += old1
+        awaitOpen(old1)
         val old2 = Socket(loopback, server.localPort)
         closeables += old2
-        Thread.sleep(150)
+        awaitOpen(old2)
 
         // Both are still pending (never sent a head) when the server stops: this is exactly the
         // state that used to leak into the next run's counters.
@@ -414,9 +433,10 @@ class ProxyServerTest {
 
         val silent1 = Socket(loopback, server.localPort)
         closeables += silent1
+        awaitOpen(silent1)
         val silent2 = Socket(loopback, server.localPort)
         closeables += silent2
-        Thread.sleep(150)
+        awaitOpen(silent2)
 
         // Both of the new run's connections must be accepted: a leaked decrement or a leaked
         // `accepting = false` from the old run must not affect them.
@@ -437,7 +457,8 @@ class ProxyServerTest {
         start(maxPendingHeadsPerPeer = 2)
         val silent1 = Socket(loopback, server.localPort)
         val silent2 = Socket(loopback, server.localPort)
-        Thread.sleep(150)
+        awaitOpen(silent1)
+        awaitOpen(silent2)
 
         silent1.close()
         silent2.close()
@@ -465,10 +486,10 @@ class ProxyServerTest {
         start(maxPendingHeads = 2, maxPendingHeadsPerPeer = 16)
         val silent1 = Socket(loopback, server.localPort)
         closeables += silent1
-        Thread.sleep(150)
+        awaitOpen(silent1)
         val silent2 = Socket(loopback, server.localPort)
         closeables += silent2
-        Thread.sleep(150)
+        awaitOpen(silent2)
 
         val third = Socket(loopback, server.localPort)
         closeables += third
@@ -568,5 +589,63 @@ class ProxyServerTest {
             reset = true
         }
         assertTrue(reset, "expected the client read to end with a connection reset after revoke, not a clean EOF")
+    }
+
+    @Test
+    fun `resolve that never returns gets 504`() {
+        val neverResolves = object : Egress by DirectEgress() {
+            override suspend fun resolve(host: String): List<InetAddress> = awaitCancellation()
+        }
+        start(egress = neverResolves, connectTimeoutMs = 300)
+        admit()
+        assertTrue(rawRequest("CONNECT example.com:443 HTTP/1.1\r\n\r\n").startsWith("HTTP/1.1 504"))
+    }
+
+    @Test
+    fun `early upstream response during an upload is fully delivered`() {
+        start()
+        admit()
+        val origin = ServerSocket(0, 50, loopback)
+        closeables += origin
+        thread(isDaemon = true) {
+            val s = try { origin.accept() } catch (e: IOException) { return@thread }
+            runCatching { readHeadBlocking(s.getInputStream()) }
+            runCatching {
+                s.getOutputStream().write(
+                    "HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .toByteArray(Charsets.ISO_8859_1),
+                )
+                s.getOutputStream().flush()
+            }
+            // A full close here, with the POST body still arriving unread, can turn into a
+            // Windows RST that aborts the proxy's upstream read before it sees a clean EOF; a
+            // half-close (FIN on the write side only) is unaffected by the unread input and is
+            // always delivered cleanly.
+            runCatching { s.shutdownOutput() }
+        }
+        val port = origin.localPort
+        val client = Socket(loopback, server.localPort)
+        closeables += client
+        client.soTimeout = 5000
+        client.getOutputStream().write(
+            "POST http://127.0.0.1:$port/ HTTP/1.1\r\nHost: x\r\nContent-Length: 200000\r\n\r\n".toByteArray(Charsets.ISO_8859_1),
+        )
+        thread(isDaemon = true) {
+            // Ignores write errors: the upload is cut short once the proxy cancels the pump on
+            // the early response, and that's expected, not a test failure.
+            runCatching {
+                client.getOutputStream().write(ByteArray(64 * 1024))
+                client.getOutputStream().flush()
+            }
+        }
+        val head = readHeadBlocking(client.getInputStream())
+        assertTrue(head.startsWith("HTTP/1.1 413"), head)
+    }
+
+    @Test
+    fun `CONNECT to an IPv6 loopback literal is blocked`() {
+        start(filter = DestinationFilter.default(Cidr.parse("192.168.49.0/24")))
+        admit()
+        assertTrue(rawRequest("CONNECT [::1]:443 HTTP/1.1\r\n\r\n").startsWith("HTTP/1.1 403"))
     }
 }

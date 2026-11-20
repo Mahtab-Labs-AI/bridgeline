@@ -32,6 +32,7 @@ class Cidr(network: InetAddress, val prefix: Int) {
             require(slash > 0) { "missing prefix in '$text'" }
             val host = text.substring(0, slash)
             require(host.isNotEmpty() && host.all { it.isDigit() || it in 'a'..'f' || it in 'A'..'F' || it == '.' || it == ':' }) { "not an IP literal: '$host'" }
+            require('.' in host || ':' in host) { "not an IP literal: '$host'" }
             return Cidr(InetAddress.getByName(host), text.substring(slash + 1).toInt())
         }
     }

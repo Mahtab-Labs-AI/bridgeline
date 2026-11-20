@@ -6,7 +6,6 @@ import java.security.SecureRandom
 import java.util.Base64
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicLong
-import kotlin.jvm.Volatile
 
 /** Point-in-time view of one client slot. */
 data class Slot(
@@ -75,16 +74,23 @@ class ClientRegistry(
     init {
         requireValidMax(maxClients)
         require(initial.size <= maxClients) { "${initial.size} slots exceed maxClients $maxClients" }
-        initial.forEach { entries[it.id] = Entry(it) }
+        initial.forEach {
+            require(TOKEN_PATTERN.matches(it.token)) { "restored slot ${it.id} has an invalid token format" }
+            entries[it.id] = Entry(it)
+        }
     }
 
     fun addSlot(name: String): Slot? = synchronized(lock) {
         if (entries.size >= maxClients) return null
-        val record = SlotRecord(UUID.randomUUID().toString(), name, tokens.next(), clock())
+        val token = tokens.next()
+        require(TOKEN_PATTERN.matches(token)) { "generated token has an invalid format" }
+        val record = SlotRecord(UUID.randomUUID().toString(), name, token, clock())
         Entry(record).also { entries[record.id] = it }.toSlot()
     }
 
-    fun revoke(id: String): Boolean = synchronized(lock) { entries.remove(id) != null }
+    /** Package-internal: revoking must go through `ProxyServer.revoke`, which also cancels the
+     *  slot's live tunnels. The Android app is a different Gradle module, so it can't bypass that. */
+    internal fun revoke(id: String): Boolean = synchronized(lock) { entries.remove(id) != null }
 
     /** Returns false (and changes nothing) if more slots are active than [n]; revoke first. */
     fun setMaxClients(n: Int): Boolean = synchronized(lock) {
@@ -150,6 +156,9 @@ class ClientRegistry(
     companion object {
         const val MAX_CLIENTS_LIMIT = 3
         const val DEFAULT_TUNNEL_CAP = 256
+
+        /** The one token format: 22 base64url characters, as produced by [SecureTokenSource]. */
+        val TOKEN_PATTERN = Regex("[A-Za-z0-9_-]{22}")
 
         private fun requireValidMax(n: Int) =
             require(n in 1..MAX_CLIENTS_LIMIT) { "maxClients must be 1..$MAX_CLIENTS_LIMIT, was $n" }

@@ -1,6 +1,5 @@
 package com.wifiproxy.core.net
 
-import java.net.Inet6Address
 import java.net.InetAddress
 import kotlin.test.Test
 import kotlin.test.assertFalse
