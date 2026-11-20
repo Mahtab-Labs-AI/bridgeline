@@ -216,6 +216,17 @@ Laptop app → laptop 127.0.0.1:8081 ──adb forward (USB)──► host 127.0
 
   macOS and Linux users run `adb forward` and set the proxy manually (README).
 - **Requirements:** USB debugging stays enabled on the host while sharing, and the laptop needs Android platform-tools (`adb`).
+- **Offline laptops: the Laptop kit.** A laptop with no internet can't download `adb`, so the phone fetches it.
+  1. "Prepare laptop kit" (Devices → Laptop (USB)) reads Google's SDK repository index (`https://dl.google.com/android/repository/repository2-3.xml`, falling back to `repository2-1.xml`). It finds the current `platform-tools` Windows archive URL and its **SHA-1**, downloads it over the phone's connection, and **verifies the checksum**.
+  2. It writes these files to `Download/WiFiProxy-LaptopKit/` via MediaStore:
+     - the extracted `platform-tools/`;
+     - `connect-usb.ps1`, bundled from `tools/usb-client/` at build time;
+     - `connect-usb.cmd`, a double-click launcher running `powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0connect-usb.ps1"`;
+     - `README.txt`.
+  3. The user copies the folder to the laptop over USB **File transfer** (MTP). MTP and USB debugging work together.
+
+  The app never redistributes Google's binaries: they're downloaded by the user's phone from Google, which respects the SDK license's redistribution terms. Windows normally binds its built-in WinUSB driver to a Pixel's ADB interface automatically. If it doesn't, the README explains that the Google USB driver is needed (out of scope for the kit).
+- **No-install alternative:** a laptop can always use **Wi-Fi Direct + PAC** instead (Plan 2b), which needs nothing installed. Plan 2b follows 2a directly.
 - **Coverage:** same as §9. Proxy-aware apps work; UDP, games and apps that ignore the system proxy don't. Windows apps using WinHTTP may need `netsh winhttp import proxy source=ie`; the script prints this hint.
 
 ## 9. Expected client coverage

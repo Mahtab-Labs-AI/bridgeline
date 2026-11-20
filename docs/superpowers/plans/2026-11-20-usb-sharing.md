@@ -146,5 +146,34 @@ Also add `tools/usb-client/README.md` covering usage and macOS/Linux manual step
 3. Run `connect-usb.ps1 -Serial emulator-5554` and confirm a browser on this PC loads a page through it. Then restore and remove the forward.
 4. When the user's Pixel is connected (`adb devices`), repeat with `-Serial <pixel>` and hand over to the user.
 
+### Task 7: Laptop kit (offline laptops; spec §8a "Laptop kit")
+
+**Script changes**
+- In `connect-usb.ps1`, the `-AdbPath` search also checks `$PSScriptRoot\platform-tools\adb.exe` **first**.
+
+**Build: bundle the scripts**
+- A Gradle `Copy` task in `:app` puts `tools/usb-client/connect-usb.ps1` into `app/src/main/assets/laptop-kit/`. Run it before `preBuild`, into a generated assets dir, so the source of truth stays in `tools/`.
+- Also add the files `connect-usb.cmd` (CRLF) and `README.txt` there. README.txt covers the steps: plug in, File transfer, copy the folder, double-click `connect-usb.cmd`, then the driver note.
+
+**`LaptopKitBuilder` (`com.wifiproxy.app.kit`)**
+- `suspend fun prepare(progress: (KitProgress) -> Unit): KitResult`.
+- Fetch `repository2-3.xml`, falling back to `repository2-1.xml`. Parse it with `XmlPullParser` and pick the `remotePackage path="platform-tools"` on the stable channel whose `archive` has `host-os` `windows`. Read the `complete/url` (relative to `https://dl.google.com/android/repository/`), the `size` and the `checksum` (sha1).
+- Download with `HttpURLConnection` over the default network, with timeouts and progress. Verify the size and SHA-1, and **refuse on mismatch**.
+- Extract with `ZipInputStream`. Reject entries with `..` or absolute paths (zip-slip).
+- Write every file through `MediaStore.Downloads` with `RELATIVE_PATH = "Download/WiFiProxy-LaptopKit/<subdir>"` and `IS_PENDING` set then cleared.
+- Re-preparing replaces the previous kit: delete our own previous MediaStore entries first, tracking their IDs in prefs.
+- Add the three asset files.
+- Unit-test the pure parts on the JVM: index parsing (use a trimmed real-shape XML fixture), checksum verification and the zip-slip guard.
+
+**UI**
+- On Devices → the "Laptop (USB)" card, add a **Prepare laptop kit** button.
+- States: not prepared / downloading N% / verifying / ready ("Download/WiFiProxy-LaptopKit, copy it to the laptop over USB File transfer") / failed (with the reason).
+- Works in both demo and real mode, since it's real either way.
+
+**Verify on the emulator**
+- Prepare the kit.
+- `adb shell ls /sdcard/Download/WiFiProxy-LaptopKit/` shows `platform-tools/adb.exe`, `connect-usb.ps1`, `connect-usb.cmd` and `README.txt`.
+- `adb pull` the folder to the scratchpad, then run `connect-usb.cmd -DryRun`. Passing args through the cmd is fine; add `%*` forwarding. It must find the bundled `adb.exe`.
+
 ## Out of scope (2a)
 Wi-Fi Direct, slot persistence, restart-on-death, OEM guide, thermal, `ACCESS_LOCAL_NETWORK` (target 37).
