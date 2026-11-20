@@ -274,6 +274,18 @@ class ProxyServerTest {
     }
 
     @Test
+    fun `a pinned slot is admitted and revoked without any pac fetch`() {
+        start()
+        val pinned = registry.addPinnedSlot("Laptop (USB)", loopback)!!
+        val echo = startEcho()
+        val (_, head) = openConnect(echo.localPort)
+        assertTrue(head.startsWith("HTTP/1.1 200"), head)
+
+        assertTrue(server.revoke(pinned.id))
+        assertTrue(rawRequest("CONNECT 127.0.0.1:${echo.localPort} HTTP/1.1\r\n\r\n").startsWith("HTTP/1.1 403"))
+    }
+
+    @Test
     fun `idle tunnel is closed`() {
         start(idleMs = 300)
         admit()

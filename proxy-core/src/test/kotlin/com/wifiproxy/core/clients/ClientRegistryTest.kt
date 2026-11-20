@@ -158,11 +158,105 @@ class ClientRegistryTest {
     }
 
     @Test
+    fun `addPinnedSlot counts toward maxClients and returns null when full`() {
+        val r = registry(max = 1)
+        assertNotNull(r.addPinnedSlot("Laptop (USB)", ip("127.0.0.1")))
+        assertNull(r.addSlot("phone"))
+    }
+
+    @Test
+    fun `addPinnedSlot returns null if another pinned slot already holds the ip`() {
+        val r = registry()
+        assertNotNull(r.addPinnedSlot("Laptop (USB)", ip("127.0.0.1")))
+        assertNull(r.addPinnedSlot("Laptop 2 (USB)", ip("127.0.0.1")))
+        assertEquals(1, r.slots().count { it.pinned })
+    }
+
+    @Test
+    fun `addPinnedSlot clears a non-pinned slot bound to the same ip`() {
+        val r = registry()
+        val a = r.addSlot("a")!!
+        r.onPacFetch(a.token, ip("127.0.0.1"))
+        assertEquals(a.id, r.admittedSlot(ip("127.0.0.1"))?.id)
+        val pinned = r.addPinnedSlot("Laptop (USB)", ip("127.0.0.1"))!!
+        assertEquals(pinned.id, r.admittedSlot(ip("127.0.0.1"))?.id)
+        assertNull(r.slots().first { it.id == a.id }.boundIp)
+    }
+
+    @Test
+    fun `pinned slot is admitted without any pac fetch`() {
+        val r = registry()
+        val pinned = r.addPinnedSlot("Laptop (USB)", ip("127.0.0.1"))!!
+        assertTrue(pinned.pinned)
+        assertEquals(pinned.id, r.admittedSlot(ip("127.0.0.1"))?.id)
+    }
+
+    @Test
+    fun `clearBindings never touches a pinned slot`() {
+        val r = registry()
+        val pinned = r.addPinnedSlot("Laptop (USB)", ip("127.0.0.1"))!!
+        val a = r.addSlot("a")!!
+        r.onPacFetch(a.token, ip("192.168.49.10"))
+        r.clearBindings()
+        assertEquals(pinned.id, r.admittedSlot(ip("127.0.0.1"))?.id)
+        assertNull(r.admittedSlot(ip("192.168.49.10")))
+    }
+
+    @Test
+    fun `unbind never touches a pinned slot`() {
+        val r = registry()
+        val pinned = r.addPinnedSlot("Laptop (USB)", ip("127.0.0.1"))!!
+        r.unbind(ip("127.0.0.1"))
+        assertEquals(pinned.id, r.admittedSlot(ip("127.0.0.1"))?.id)
+    }
+
+    @Test
+    fun `onPacFetch returns null and changes nothing when the ip is held by a pinned slot`() {
+        val r = registry()
+        val pinned = r.addPinnedSlot("Laptop (USB)", ip("127.0.0.1"))!!
+        val a = r.addSlot("a")!!
+        assertNull(r.onPacFetch(a.token, ip("127.0.0.1")))
+        assertEquals(pinned.id, r.admittedSlot(ip("127.0.0.1"))?.id)
+        assertNull(r.slots().first { it.id == a.id }.boundIp)
+    }
+
+    @Test
+    fun `onPacFetch on a pinned slot's own token never rebinds it`() {
+        val r = registry()
+        val pinned = r.addPinnedSlot("Laptop (USB)", ip("127.0.0.1"))!!
+        assertNull(r.onPacFetch(pinned.token, ip("192.168.49.10")))
+        assertEquals(pinned.id, r.admittedSlot(ip("127.0.0.1"))?.id)
+        assertNull(r.admittedSlot(ip("192.168.49.10")))
+    }
+
+    @Test
+    fun `setMaxClients counts pinned slots as active slots`() {
+        val r = registry(max = 3)
+        r.addPinnedSlot("Laptop (USB)", ip("127.0.0.1"))
+        r.addSlot("a")
+        assertFalse(r.setMaxClients(1))
+        assertEquals(3, r.maxClients)
+        assertTrue(r.setMaxClients(2))
+        assertEquals(2, r.maxClients)
+    }
+
+    @Test
+    fun `snapshot excludes pinned slots`() {
+        val r = registry()
+        r.addPinnedSlot("Laptop (USB)", ip("127.0.0.1"))
+        val a = r.addSlot("a")!!
+        assertEquals(listOf(a.id), r.snapshot().map { it.id })
+    }
+
+    @Test
     fun `toString never contains the token`() {
         val r = registry()
         val slot = r.addSlot("a")!!
         assertFalse(slot.toString().contains(slot.token), "Slot.toString() contains token: ${slot.toString()}")
         val record = r.snapshot().single()
         assertFalse(record.toString().contains(record.token), "SlotRecord.toString() contains token: ${record.toString()}")
+        val pinned = r.addPinnedSlot("Laptop (USB)", ip("127.0.0.1"))!!
+        assertFalse(pinned.toString().contains(pinned.token), "pinned Slot.toString() contains token: ${pinned.toString()}")
+        assertTrue(pinned.toString().contains("pinned=true"), pinned.toString())
     }
 }

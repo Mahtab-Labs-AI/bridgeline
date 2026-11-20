@@ -18,9 +18,10 @@ data class Slot(
     val bytesUp: Long,
     val bytesDown: Long,
     val activeTunnels: Int,
+    val pinned: Boolean = false,
 ) {
     override fun toString(): String =
-        "Slot(id=$id, name=$name, token=<redacted>, boundIp=$boundIp, createdAtMs=$createdAtMs, lastSeenMs=$lastSeenMs, bytesUp=$bytesUp, bytesDown=$bytesDown, activeTunnels=$activeTunnels)"
+        "Slot(id=$id, name=$name, token=<redacted>, boundIp=$boundIp, createdAtMs=$createdAtMs, lastSeenMs=$lastSeenMs, bytesUp=$bytesUp, bytesDown=$bytesDown, activeTunnels=$activeTunnels, pinned=$pinned)"
 }
 
 /** The persistent part of a slot. The Android layer stores these and passes them back as `initial`. */
@@ -52,7 +53,7 @@ class ClientRegistry(
     private val clock: () -> Long = System::currentTimeMillis,
     initial: List<SlotRecord> = emptyList(),
 ) {
-    private class Entry(val record: SlotRecord) {
+    private class Entry(val record: SlotRecord, val pinned: Boolean = false) {
         var boundIp: InetAddress? = null
         var lastSeenMs: Long? = null
         var activeTunnels = 0
@@ -61,7 +62,7 @@ class ClientRegistry(
 
         fun toSlot() = Slot(
             record.id, record.name, record.token, boundIp, record.createdAtMs,
-            lastSeenMs, bytesUp.get(), bytesDown.get(), activeTunnels,
+            lastSeenMs, bytesUp.get(), bytesDown.get(), activeTunnels, pinned,
         )
     }
 
@@ -88,6 +89,25 @@ class ClientRegistry(
         Entry(record).also { entries[record.id] = it }.toSlot()
     }
 
+    /**
+     * Creates a slot pinned to [ip]: it needs no token or PAC fetch to be admitted, counts
+     * toward [maxClients], and is never persisted (excluded from [snapshot]), cleared by
+     * [clearBindings]/[unbind], or rebound by [onPacFetch]. A pinned slot still carries a valid
+     * token for format consistency, but the token is never used for admission.
+     */
+    fun addPinnedSlot(name: String, ip: InetAddress): Slot? = synchronized(lock) {
+        if (entries.size >= maxClients) return null
+        if (entries.values.any { it.pinned && it.boundIp == ip }) return null
+        entries.values.forEach { if (!it.pinned && it.boundIp == ip) it.boundIp = null }
+        val token = tokens.next()
+        require(TOKEN_PATTERN.matches(token)) { "generated token has an invalid format" }
+        val record = SlotRecord(UUID.randomUUID().toString(), name, token, clock())
+        Entry(record, pinned = true).also {
+            it.boundIp = ip
+            entries[record.id] = it
+        }.toSlot()
+    }
+
     /** Package-internal: revoking must go through `ProxyServer.revoke`, which also cancels the
      *  slot's live tunnels. The Android app is a different Gradle module, so it can't bypass that. */
     internal fun revoke(id: String): Boolean = synchronized(lock) { entries.remove(id) != null }
@@ -101,10 +121,13 @@ class ClientRegistry(
     }
 
     fun onPacFetch(token: String, ip: InetAddress): Slot? = synchronized(lock) {
+        // A pinned slot's IP (and the slot itself) can never be moved by a PAC fetch.
+        if (entries.values.any { it.pinned && it.boundIp == ip }) return null
         val presented = token.toByteArray()
         val entry = entries.values.firstOrNull { MessageDigest.isEqual(it.record.token.toByteArray(), presented) }
             ?: return null
-        entries.values.forEach { if (it !== entry && it.boundIp == ip) it.boundIp = null }
+        if (entry.pinned) return null
+        entries.values.forEach { if (it !== entry && !it.pinned && it.boundIp == ip) it.boundIp = null }
         entry.boundIp = ip
         entry.lastSeenMs = clock()
         entry.toSlot()
@@ -141,17 +164,18 @@ class ClientRegistry(
      * DHCP addresses may be reassigned, and clients re-fetch their PAC on reconnect.
      */
     fun clearBindings() = synchronized(lock) {
-        entries.values.forEach { it.boundIp = null }
+        entries.values.forEach { if (!it.pinned) it.boundIp = null }
     }
 
-    /** Clear boundIp on the entry bound to that IP, if any. */
+    /** Clear boundIp on the entry bound to that IP, if any. Pinned slots are never touched. */
     fun unbind(ip: InetAddress) = synchronized(lock) {
-        entries.values.forEach { if (it.boundIp == ip) it.boundIp = null }
+        entries.values.forEach { if (!it.pinned && it.boundIp == ip) it.boundIp = null }
     }
 
     fun slots(): List<Slot> = synchronized(lock) { entries.values.map { it.toSlot() } }
 
-    fun snapshot(): List<SlotRecord> = synchronized(lock) { entries.values.map { it.record } }
+    /** Pinned slots are never persisted: they're recreated from app settings, not restored. */
+    fun snapshot(): List<SlotRecord> = synchronized(lock) { entries.values.filterNot { it.pinned }.map { it.record } }
 
     companion object {
         const val MAX_CLIENTS_LIMIT = 3
