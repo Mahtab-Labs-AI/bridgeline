@@ -192,6 +192,32 @@ In-app disclosure: "Web and most apps work. Calls, games and some apps won't." P
 - **iPhone:** scan Wi-Fi QR → open `<token>.mobileconfig` link **in Safari** (only Safari hands profiles to Settings; a third-party default browser may not) → install profile in Settings (contains Wi-Fi payload with `ProxyType=Auto`, `ProxyPACURL`). Manual alternative: Wi-Fi (i) → Configure Proxy → Automatic → PAC URL.
 - **Android:** scan Wi-Fi QR → network → Edit → Advanced → Proxy → Proxy Auto-Config → PAC URL.
 
+## 8a. USB sharing to a laptop (adb forward)
+
+A second, independent transport for **one laptop/PC over USB**, added 2026-11-20. It does not use system tethering (`TetheringManager`), so it avoids the carrier entitlement check just as Wi-Fi Direct does.
+
+```
+Laptop app → laptop 127.0.0.1:8081 ──adb forward (USB)──► host 127.0.0.1:8081 → USB ProxyServer → cellular
+```
+
+- **Host listener:** a second `ProxyServer` instance bound to `127.0.0.1:8081` with `peerSubnet = 127.0.0.0/8`. It shares the `ClientRegistry`, the `Egress` and the `DestinationFilter` with the Wi-Fi listener, so caps, counters, filtering, error mapping and the abort rule are identical. It runs whenever the **"USB sharing"** toggle is on, with or without the Wi-Fi Direct group.
+- **Admission: pinned slot.** Enabling USB sharing creates a built-in slot "Laptop (USB)" **pinned** to `127.0.0.1`. It needs no token or PAC fetch; turning on USB debugging and running the laptop script is the deliberate act. Pinned slots:
+  - count toward the 1–3 device limit;
+  - are never cleared by `clearBindings()` or `unbind()`;
+  - can't be stolen: `onPacFetch` from a pinned IP never rebinds it to another slot;
+  - are removed when USB sharing is turned off.
+- **Accepted exposure:** other apps on the host phone can also reach `127.0.0.1:8081`. They already have mobile data, and the destination filter still blocks the host's loopback and LAN, so this grants nothing new.
+- **Laptop side:** `tools/usb-client/connect-usb.ps1` (Windows) does the following:
+  - locates `adb`;
+  - checks exactly one device is attached;
+  - runs `adb forward tcp:8081 tcp:8081`;
+  - saves and sets the user's WinINet system proxy to `127.0.0.1:8081`, with `<local>` bypass;
+  - waits for Enter, then restores the previous proxy and removes the forward. It also restores on Ctrl+C.
+
+  macOS and Linux users run `adb forward` and set the proxy manually (README).
+- **Requirements:** USB debugging stays enabled on the host while sharing, and the laptop needs Android platform-tools (`adb`).
+- **Coverage:** same as §9. Proxy-aware apps work; UDP, games and apps that ignore the system proxy don't. Windows apps using WinHTTP may need `netsh winhttp import proxy source=ie`; the script prints this hint.
+
 ## 9. Expected client coverage
 
 - **Works:** browsers; apps using URLSession/CFNetwork (iOS) or HttpURLConnection/OkHttp (Android); iOS push via PAC.
