@@ -32,7 +32,7 @@ Useful parameters:
 
 | Parameter   | Default                                   | Purpose |
 |-------------|--------------------------------------------|---------|
-| `-AdbPath`  | auto-detected                              | Path to `adb.exe`. If omitted, the script checks `$env:ANDROID_HOME\platform-tools`, then `E:\Source\Android\sdk\platform-tools`, then your `PATH`. |
+| `-AdbPath`  | auto-detected                              | Path to `adb.exe`. If omitted, the script checks `$PSScriptRoot\platform-tools` (the bundled copy from the app's offline "Laptop kit"), then `$env:ANDROID_HOME\platform-tools`, then `E:\Source\Android\sdk\platform-tools`, then your `PATH`. |
 | `-Port`     | `8081`                                      | TCP port used on both ends of the forward and for the proxy. |
 | `-Serial`   | (none)                                      | adb device serial. Required if more than one device is attached. |
 | `-DryRun`   | off                                         | Prints every step it would take; makes no changes (no forward, no registry writes). |

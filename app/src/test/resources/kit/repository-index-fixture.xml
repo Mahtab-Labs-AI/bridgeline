@@ -1,0 +1,94 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Trimmed-but-real-shape fixture modelled on Google's actual
+  https://dl.google.com/android/repository/repository2-3.xml (fetched and diffed against while
+  writing this parser): named channels declared up front - each one's name is its own text
+  content, not a nested element - remotePackage entries referencing one by id via <channelRef>,
+  and a per-host-os <archive> list nested under <archives>. Used by RepositoryIndexParserTest;
+  not a real, current repository index.
+-->
+<sdk:sdk-repository
+    xmlns:sdk="http://schemas.android.com/sdk/android/repo/repository2/03"
+    xmlns:generic="http://schemas.android.com/repository/android/generic/02"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+
+    <!-- Real indexes declare several channels; only "stable" (any case) should ever be picked. -->
+    <channel id="channel-0">stable</channel>
+    <channel id="channel-1">beta</channel>
+    <channel id="channel-2">dev</channel>
+    <channel id="channel-3">canary</channel>
+
+    <!-- The stable platform-tools package: this is the one the parser must return. -->
+    <remotePackage path="platform-tools">
+        <type-details xsi:type="generic:genericDetailsType" />
+        <revision>
+            <major>37</major>
+            <minor>0</minor>
+            <micro>3</micro>
+        </revision>
+        <display-name>Android SDK Platform-Tools</display-name>
+        <uses-license ref="android-sdk-license" />
+        <channelRef ref="channel-0" />
+        <archives>
+            <!-- Non-Windows archives in the same package must be ignored. -->
+            <archive>
+                <complete>
+                    <size>11111111</size>
+                    <checksum type="sha1">bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb</checksum>
+                    <url>platform-tools_r37.0.3-linux.zip</url>
+                </complete>
+                <host-os>linux</host-os>
+            </archive>
+            <archive>
+                <complete>
+                    <size>22222222</size>
+                    <checksum type="sha1">cccccccccccccccccccccccccccccccccccccccc</checksum>
+                    <url>platform-tools_r37.0.3-darwin.zip</url>
+                </complete>
+                <host-os>macosx</host-os>
+            </archive>
+            <archive>
+                <complete>
+                    <size>12345678</size>
+                    <checksum type="sha1">aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa</checksum>
+                    <url>platform-tools_r37.0.3-win.zip</url>
+                </complete>
+                <host-os>windows</host-os>
+            </archive>
+        </archives>
+    </remotePackage>
+
+    <!-- A non-stable (Canary) platform-tools package must be ignored entirely, even though it
+         also has a Windows archive - otherwise this would win since it comes after the stable
+         one and the parser could overwrite its result instead of keeping the first match. -->
+    <remotePackage path="platform-tools">
+        <display-name>Android SDK Platform-Tools 38 Canary</display-name>
+        <channelRef ref="channel-3" />
+        <archives>
+            <archive>
+                <complete>
+                    <size>99999999</size>
+                    <checksum type="sha1">dddddddddddddddddddddddddddddddddddddddd</checksum>
+                    <url>platform-tools_r38.0.0-canary-win.zip</url>
+                </complete>
+                <host-os>windows</host-os>
+            </archive>
+        </archives>
+    </remotePackage>
+
+    <!-- An unrelated package on the stable channel must also be ignored. -->
+    <remotePackage path="build-tools;37.0.0">
+        <display-name>Android SDK Build-Tools 37</display-name>
+        <channelRef ref="channel-0" />
+        <archives>
+            <archive>
+                <complete>
+                    <size>55555555</size>
+                    <checksum type="sha1">eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee</checksum>
+                    <url>build-tools_r37-windows.zip</url>
+                </complete>
+                <host-os>windows</host-os>
+            </archive>
+        </archives>
+    </remotePackage>
+</sdk:sdk-repository>

@@ -6,6 +6,34 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
+// --- Laptop kit assets (design spec section 8a / plan Task 7) ----------------------------------
+//
+// connect-usb.ps1's source of truth stays in tools/usb-client/ (also used directly from there by
+// a developer at the laptop's PowerShell prompt); connect-usb.cmd and README.txt have no other
+// use, so they live next to this build file instead of under src/main. Both get copied into a
+// generated assets directory, which LaptopKitBuilder reads at runtime (`assets.open("laptop-kit/...")`)
+// to bundle them into the Download/WiFiProxy-LaptopKit kit alongside the downloaded platform-tools.
+//
+// Declared as plain Provider-based paths (no Project/Task reference captured by a task action), so
+// this task is configuration-cache compatible.
+val laptopKitAssetsDir = layout.buildDirectory.dir("generated/laptopKitAssets")
+
+val copyLaptopKitAssets = tasks.register<Copy>("copyLaptopKitAssets") {
+    group = "build"
+    description = "Copies the laptop-kit scripts (connect-usb.ps1/.cmd, README.txt) into a generated assets dir."
+    from(rootProject.layout.projectDirectory.dir("tools/usb-client")) {
+        include("connect-usb.ps1")
+    }
+    from(project.layout.projectDirectory.dir("laptop-kit-static")) {
+        include("connect-usb.cmd", "README.txt")
+    }
+    into(laptopKitAssetsDir.map { it.dir("laptop-kit") })
+}
+
+tasks.named("preBuild") {
+    dependsOn(copyLaptopKitAssets)
+}
+
 android {
     namespace = "com.wifiproxy.app"
     compileSdk = 36
@@ -49,6 +77,7 @@ android {
     sourceSets {
         getByName("main") {
             kotlin.srcDirs("src/main/kotlin")
+            assets.srcDir(laptopKitAssetsDir)
         }
         getByName("test") {
             kotlin.srcDirs("src/test/kotlin")
@@ -82,4 +111,9 @@ dependencies {
     testImplementation(libs.junit.jupiter)
     testRuntimeOnly(libs.junit.launcher)
     testImplementation(libs.coroutines.test)
+    // Pure-JVM org.xmlpull.v1.XmlPullParser implementation, so LaptopKitBuilder's repository-index
+    // parsing (which takes an XmlPullParser, not an Android type) can be unit-tested without
+    // Android/Robolectric. Never shipped in the app itself (android.util.Xml.newPullParser()
+    // supplies the real implementation there).
+    testImplementation(libs.kxml2)
 }

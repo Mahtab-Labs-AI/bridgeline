@@ -26,9 +26,12 @@
 
 .PARAMETER AdbPath
     Path to adb.exe. If omitted, this script searches, in order:
-      1. $env:ANDROID_HOME\platform-tools\adb.exe
-      2. E:\Source\Android\sdk\platform-tools\adb.exe
-      3. adb on PATH
+      1. $PSScriptRoot\platform-tools\adb.exe (the bundled copy, present when this script was
+         unpacked from the app's offline "Laptop kit" - see docs/superpowers/specs/
+         2026-11-19-android-wifi-proxy-design.md section 8a)
+      2. $env:ANDROID_HOME\platform-tools\adb.exe
+      3. E:\Source\Android\sdk\platform-tools\adb.exe
+      4. adb on PATH
 
 .PARAMETER Port
     TCP port used on both the laptop and the phone. Default 8081.
@@ -131,6 +134,9 @@ function Resolve-AdbPath {
     }
 
     $candidates = @()
+    if ($PSScriptRoot) {
+        $candidates += (Join-Path $PSScriptRoot 'platform-tools\adb.exe')
+    }
     if ($env:ANDROID_HOME) {
         $candidates += (Join-Path $env:ANDROID_HOME 'platform-tools\adb.exe')
     }
@@ -147,7 +153,7 @@ function Resolve-AdbPath {
         return $onPath.Source
     }
 
-    throw "Could not locate adb. Checked -AdbPath, `$env:ANDROID_HOME\platform-tools, E:\Source\Android\sdk\platform-tools, and PATH."
+    throw "Could not locate adb. Checked -AdbPath, `$PSScriptRoot\platform-tools, `$env:ANDROID_HOME\platform-tools, E:\Source\Android\sdk\platform-tools, and PATH."
 }
 
 function Get-AdbDeviceLines {

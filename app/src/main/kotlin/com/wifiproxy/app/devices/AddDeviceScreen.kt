@@ -42,6 +42,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import android.content.ClipData
 import android.content.ClipboardManager
@@ -51,6 +52,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
+import com.wifiproxy.app.kit.KitProgress
+import com.wifiproxy.app.kit.LaptopKitBuilder
 import com.wifiproxy.app.session.ClientPlatform
 import com.wifiproxy.app.session.DeviceInvite
 import com.wifiproxy.app.session.SessionRepository
@@ -59,6 +62,8 @@ import com.wifiproxy.app.ui.QrCode
 import com.wifiproxy.app.ui.ScreenTitle
 import com.wifiproxy.app.ui.formatBytes
 import com.wifiproxy.app.ui.icon
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
 
 private data class ActiveInvite(val invite: DeviceInvite, val platform: ClientPlatform, val name: String)
 
@@ -124,6 +129,11 @@ private fun DemoDevicesContent(repository: SessionRepository, modifier: Modifier
             Spacer(modifier = Modifier.width(8.dp))
             Text("Add device")
         }
+
+        // The laptop kit is real either way (design spec §8a): it downloads straight from Google
+        // to this phone, independent of whatever the rest of this screen is demoing.
+        Spacer(modifier = Modifier.height(8.dp))
+        LaptopKitCard()
     }
 
     if (showAddDialog) {
@@ -163,6 +173,7 @@ private fun UsbDevicesContent(repository: SessionRepository, modifier: Modifier)
         ScreenTitle(text = "Devices")
 
         LaptopUsbCard(slot = laptopSlot)
+        LaptopKitCard()
 
         Button(onClick = {}, enabled = false, modifier = Modifier.fillMaxWidth()) {
             Icon(Icons.Filled.Add, contentDescription = null)
@@ -227,6 +238,75 @@ private fun LaptopUsbCard(slot: SlotUi?) {
                 command = ".\\tools\\usb-client\\connect-usb.ps1",
                 context = context,
             )
+        }
+    }
+}
+
+/**
+ * "Prepare laptop kit" (design spec §8a "Offline laptops: the Laptop kit" / plan Task 7): downloads
+ * a verified `platform-tools` plus the bundled scripts to this phone's `Download/WiFiProxy-LaptopKit/`,
+ * for a laptop with no internet of its own. Independent of demo/real mode and of the "Laptop (USB)"
+ * slot above - it's a real download either way, so it's shown in both [DemoDevicesContent] and
+ * [UsbDevicesContent].
+ */
+@Composable
+private fun LaptopKitCard() {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val builder = remember(context) { LaptopKitBuilder(context.applicationContext) }
+
+    var progress by remember { mutableStateOf<KitProgress>(KitProgress.NotPrepared) }
+    var job by remember { mutableStateOf<Job?>(null) }
+    val busy = progress is KitProgress.Downloading || progress is KitProgress.Verifying
+
+    ElevatedCard(modifier = Modifier.fillMaxWidth()) {
+        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(text = "Laptop kit (offline laptops)", style = MaterialTheme.typography.titleSmall)
+            Text(
+                text = "Downloads a verified adb plus the connect scripts to this phone's Downloads, " +
+                    "for a laptop with no internet of its own.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+
+            when (val p = progress) {
+                KitProgress.NotPrepared -> Unit
+                is KitProgress.Downloading -> Text(
+                    text = "Downloading… ${p.percent}%",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+
+                KitProgress.Verifying -> Text(
+                    text = "Verifying…",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+
+                is KitProgress.Ready -> Text(
+                    text = p.message,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+
+                is KitProgress.Failed -> Text(
+                    text = "Failed: ${p.reason}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+
+            Button(
+                onClick = {
+                    job?.cancel() // guards against a double-tap racing ahead of recomposition
+                    progress = KitProgress.Downloading(0)
+                    job = scope.launch {
+                        builder.prepare { update -> progress = update }
+                    }
+                },
+                enabled = !busy,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(if (progress is KitProgress.Ready) "Prepare laptop kit again" else "Prepare laptop kit")
+            }
         }
     }
 }
