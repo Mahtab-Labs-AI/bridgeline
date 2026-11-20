@@ -33,7 +33,6 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -41,6 +40,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.wifiproxy.app.session.SessionPhase
 import com.wifiproxy.app.session.SessionRepository
 import com.wifiproxy.app.session.SlotUi
@@ -52,7 +52,7 @@ import com.wifiproxy.app.ui.label
 
 @Composable
 fun HomeScreen(repository: SessionRepository, modifier: Modifier = Modifier, onBeforeStart: () -> Unit = {}) {
-    val session by repository.session.collectAsState()
+    val session by repository.session.collectAsStateWithLifecycle()
     var slotPendingRevoke by remember { mutableStateOf<SlotUi?>(null) }
 
     Column(
@@ -64,7 +64,13 @@ fun HomeScreen(repository: SessionRepository, modifier: Modifier = Modifier, onB
     ) {
         ScreenTitle(text = "Wi-Fi Proxy")
 
-        StatusCard(phase = session.phase, degradedReason = session.degradedReason, ssid = session.ssid)
+        StatusCard(
+            phase = session.phase,
+            degradedReason = session.degradedReason,
+            ssid = session.ssid,
+            proxyAddress = "${session.proxyHost}:${session.port}",
+            lastError = session.lastError,
+        )
 
         StartStopButton(
             phase = session.phase,
@@ -114,7 +120,13 @@ fun HomeScreen(repository: SessionRepository, modifier: Modifier = Modifier, onB
 }
 
 @Composable
-private fun StatusCard(phase: SessionPhase, degradedReason: String?, ssid: String) {
+private fun StatusCard(
+    phase: SessionPhase,
+    degradedReason: String?,
+    ssid: String,
+    proxyAddress: String,
+    lastError: String?,
+) {
     Card(
         colors = CardDefaults.cardColors(containerColor = phase.color().copy(alpha = 0.15f)),
         modifier = Modifier.fillMaxWidth(),
@@ -129,11 +141,25 @@ private fun StatusCard(phase: SessionPhase, degradedReason: String?, ssid: Strin
                 Text(text = phase.label(), style = MaterialTheme.typography.headlineSmall)
             }
             Text(text = ssid, style = MaterialTheme.typography.bodyMedium)
+            Text(
+                text = proxyAddress,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
             if (phase == SessionPhase.DEGRADED && degradedReason != null) {
                 Text(
                     text = degradedReason,
                     style = MaterialTheme.typography.bodyMedium,
                     color = phase.color(),
+                )
+            }
+            // (C1) Surfaces a start() failure (e.g. port 8081 already bound) once the session has
+            // fallen back to IDLE, so "Start did nothing" never looks like silent failure.
+            if (phase == SessionPhase.IDLE && lastError != null) {
+                Text(
+                    text = "Couldn't start: $lastError",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.error,
                 )
             }
         }

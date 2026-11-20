@@ -28,6 +28,9 @@ data class SessionUi(
     val port: Int,
     val slots: List<SlotUi>,
     val maxClients: Int,
+    /** Set when the last `start()` itself failed and the session fell back to IDLE (C1); cleared
+     *  by the next successful start. Null for the fake, which never fails to start. */
+    val lastError: String? = null,
 )
 
 data class HostSettings(
@@ -88,4 +91,10 @@ interface SessionRepository {
      *  to re-check; [ServiceSessionRepository] rebuilds [checks] from the live Android state.
      *  Call on every Setup-tab view and app resume (design spec §8: "re-checked on every app open"). */
     fun refreshChecks() {}
+
+    /** Cancels this repository's own background work (collectors, pollers). [RepositoryProvider]
+     *  calls this on the outgoing repository before swapping in a new one on a demo-mode change
+     *  (I7), so switching modes back and forth can never pile up abandoned collectors. A no-op
+     *  default since a repository with no background work of its own has nothing to cancel. */
+    fun close() {}
 }

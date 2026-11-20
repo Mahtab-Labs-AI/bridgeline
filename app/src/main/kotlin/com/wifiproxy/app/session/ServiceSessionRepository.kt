@@ -14,6 +14,7 @@ import com.wifiproxy.app.service.UsbSessionController
 import com.wifiproxy.core.clients.Slot
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -43,6 +44,12 @@ class ServiceSessionRepository(
     private val scope: CoroutineScope,
 ) : SessionRepository {
 
+    // A child Job of [scope] (I7): [close] cancels only this repository's own collectors/pollers,
+    // never the activity-lifetime scope it was handed, so a demo-mode round trip can create and
+    // close any number of these without leaking work on the shared parent.
+    private val repositoryJob = Job(scope.coroutineContext[Job])
+    private val repositoryScope = CoroutineScope(scope.coroutineContext + repositoryJob)
+
     private val _settings = MutableStateFlow(
         HostSettings(ssidSuffix = "", password = "", maxClients = 1, port = PROXY_PORT, prefer5Ghz = false),
     )
@@ -59,20 +66,35 @@ class ServiceSessionRepository(
         }
     }
 
+    // WhileSubscribed (M7), not Eagerly: nobody is polling registry.slots() once every screen
+    // observing this has gone away (e.g. the app backgrounded with the session idle), and the
+    // 5s grace period means a quick tab switch doesn't restart the ticker from scratch.
     override val session: StateFlow<SessionUi> = SessionHolder.controller
         .flatMapLatest { controller -> controller?.let(::sessionFlowFor) ?: flowOf(idleUi()) }
-        .stateIn(scope, SharingStarted.Eagerly, idleUi())
+        .stateIn(repositoryScope, SharingStarted.WhileSubscribed(5_000), idleUi())
 
     override val log: StateFlow<List<LogEntry>> = SessionHolder.controller
         .flatMapLatest { it?.log ?: flowOf(emptyList()) }
-        .stateIn(scope, SharingStarted.Eagerly, emptyList())
+        .stateIn(repositoryScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
     private fun sessionFlowFor(controller: UsbSessionController) =
-        combine(controller.state, controller.degradedReason, controller.cellularAvailable, ticker) { phase, reason, cellular, _ ->
-            buildUi(phase, reason, cellular, controller.registry?.slots().orEmpty())
+        combine(
+            controller.state,
+            controller.degradedReason,
+            controller.cellularAvailable,
+            controller.lastError,
+            ticker,
+        ) { phase, reason, cellular, lastError, _ ->
+            buildUi(phase, reason, cellular, lastError, controller.registry?.slots().orEmpty())
         }
 
-    private fun buildUi(phase: SessionPhase, reason: String?, cellularUp: Boolean, slots: List<Slot>) = SessionUi(
+    private fun buildUi(
+        phase: SessionPhase,
+        reason: String?,
+        cellularUp: Boolean,
+        lastError: String?,
+        slots: List<Slot>,
+    ) = SessionUi(
         phase = phase,
         degradedReason = reason,
         cellularUp = cellularUp,
@@ -81,9 +103,16 @@ class ServiceSessionRepository(
         port = _settings.value.port,
         slots = slots.map { it.toSlotUi() },
         maxClients = _settings.value.maxClients,
+        lastError = lastError,
     )
 
-    private fun idleUi() = buildUi(phase = SessionPhase.IDLE, reason = null, cellularUp = false, slots = emptyList())
+    private fun idleUi() = buildUi(
+        phase = SessionPhase.IDLE,
+        reason = null,
+        cellularUp = false,
+        lastError = null,
+        slots = emptyList(),
+    )
 
     private fun Slot.toSlotUi() = SlotUi(
         id = id,
@@ -119,6 +148,10 @@ class ServiceSessionRepository(
 
     override fun refreshChecks() {
         _checks.value = buildChecks()
+    }
+
+    override fun close() {
+        repositoryJob.cancel()
     }
 
     private fun buildChecks(): List<SetupCheck> = listOf(

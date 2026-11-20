@@ -1,5 +1,8 @@
 package com.wifiproxy.app.setup
 
+import android.content.ActivityNotFoundException
+import android.content.Intent
+import android.provider.Settings
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -26,7 +29,6 @@ import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -40,6 +42,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.wifiproxy.app.session.CheckStatus
 import com.wifiproxy.app.session.SessionRepository
 import com.wifiproxy.app.session.SetupCheck
@@ -48,7 +51,7 @@ import kotlinx.coroutines.launch
 
 @Composable
 fun SetupCheckScreen(repository: SessionRepository, modifier: Modifier = Modifier) {
-    val checks by repository.checks.collectAsState()
+    val checks by repository.checks.collectAsStateWithLifecycle()
     val snackbarHostState = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
@@ -83,10 +86,22 @@ fun SetupCheckScreen(repository: SessionRepository, modifier: Modifier = Modifie
                     check = check,
                     onFixClick = {
                         val intent = check.fixIntent
-                        if (intent != null) {
-                            context.startActivity(intent)
-                        } else {
+                        if (intent == null) {
                             scope.launch { snackbarHostState.showSnackbar("Would open system settings") }
+                        } else {
+                            // (I8) Some OEMs don't ship the developer-settings or battery-exemption
+                            // activity a fixIntent targets; fall back to the general settings
+                            // screen, and only if even that is missing, tell the user instead of
+                            // crashing.
+                            try {
+                                context.startActivity(intent)
+                            } catch (e: ActivityNotFoundException) {
+                                try {
+                                    context.startActivity(Intent(Settings.ACTION_SETTINGS))
+                                } catch (e2: ActivityNotFoundException) {
+                                    scope.launch { snackbarHostState.showSnackbar("Couldn't open Settings on this device") }
+                                }
+                            }
                         }
                     },
                 )

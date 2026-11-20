@@ -18,7 +18,14 @@ class RepositoryProvider(
     val repository: StateFlow<SessionRepository> = _repository.asStateFlow()
 
     fun setDemoMode(demoMode: Boolean) {
-        _repository.value = create(demoMode)
+        val old = _repository.value
+        val new = create(demoMode)
+        // Cancel the outgoing repository's own collectors/pollers before swapping it out (I7):
+        // closing after would leave a window where both repositories are doing live work at once,
+        // and closing it at all is what keeps a demo <-> real round trip from piling up abandoned
+        // work on the shared parent scope.
+        old.close()
+        _repository.value = new
     }
 
     private fun create(demoMode: Boolean) = if (demoMode) createFake() else createReal()

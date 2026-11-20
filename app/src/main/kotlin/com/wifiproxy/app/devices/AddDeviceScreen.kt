@@ -38,7 +38,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -82,7 +82,7 @@ fun AddDeviceScreen(repository: SessionRepository, modifier: Modifier = Modifier
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun DemoDevicesContent(repository: SessionRepository, modifier: Modifier) {
-    val session by repository.session.collectAsState()
+    val session by repository.session.collectAsStateWithLifecycle()
 
     var showAddDialog by remember { mutableStateOf(false) }
     var activeInvite by remember { mutableStateOf<ActiveInvite?>(null) }
@@ -160,7 +160,7 @@ private fun DemoDevicesContent(repository: SessionRepository, modifier: Modifier
 
 @Composable
 private fun UsbDevicesContent(repository: SessionRepository, modifier: Modifier) {
-    val session by repository.session.collectAsState()
+    val session by repository.session.collectAsStateWithLifecycle()
     val laptopSlot = session.slots.firstOrNull()
 
     Column(

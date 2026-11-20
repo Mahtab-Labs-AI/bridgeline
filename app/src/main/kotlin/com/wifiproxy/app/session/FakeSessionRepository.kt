@@ -30,6 +30,12 @@ class FakeSessionRepository(
     private val delayMs: suspend (Long) -> Unit = { delay(it) },
 ) : SessionRepository {
 
+    // A child Job of [scope] (I7), mirroring ServiceSessionRepository: [close] stops this
+    // repository's own run/tick coroutines without touching the activity-lifetime [scope] it was
+    // handed, so RepositoryProvider can swap demo <-> real freely without leaking either side.
+    private val repositoryJob = Job(scope.coroutineContext[Job])
+    private val repositoryScope = CoroutineScope(scope.coroutineContext + repositoryJob)
+
     private val random = SecureRandom()
     private val tokens = mutableMapOf<String, String>()
     private var nextSlotIndex = 2 // seed data below already uses slot-0 and slot-1
@@ -130,7 +136,7 @@ class FakeSessionRepository(
 
     override fun start() {
         if (_session.value.phase != SessionPhase.IDLE) return
-        runJob = scope.launch {
+        runJob = repositoryScope.launch {
             _session.update { it.copy(phase = SessionPhase.STARTING) }
             appendLog("Starting session")
             delayMs(STARTING_DELAY_MS)
@@ -175,7 +181,7 @@ class FakeSessionRepository(
     override fun stop() {
         if (_session.value.phase == SessionPhase.IDLE) return
         runJob?.cancel()
-        runJob = scope.launch {
+        runJob = repositoryScope.launch {
             _session.update { it.copy(phase = SessionPhase.STOPPING) }
             appendLog("Stopping session")
             delayMs(STOPPING_DELAY_MS)
@@ -249,5 +255,9 @@ class FakeSessionRepository(
         }
         appendLog("Settings updated")
         return true
+    }
+
+    override fun close() {
+        repositoryJob.cancel()
     }
 }
