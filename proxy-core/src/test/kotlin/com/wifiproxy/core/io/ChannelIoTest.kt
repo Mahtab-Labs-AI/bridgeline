@@ -65,6 +65,13 @@ class ChannelIoTest {
     }
 
     @Test
+    fun `readHead rejects tiny limits`() = runBlocking {
+        val (a, b) = socketPair()
+        assertFailsWith<IllegalArgumentException> { readHead(loop, b, maxBytes = 3) }
+        a.close(); b.close()
+    }
+
+    @Test
     fun `writeFully survives backpressure`() = runBlocking {
         val (a, b) = socketPair()
         val payload = ByteArray(4 * 1024 * 1024) { (it % 251).toByte() }

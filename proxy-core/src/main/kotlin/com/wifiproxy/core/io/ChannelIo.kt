@@ -14,6 +14,7 @@ class Head(val text: String, val leftover: ByteArray)
 
 /** Reads until CRLFCRLF. Returns null if the peer closes first. */
 suspend fun readHead(loop: NioLoop, ch: SocketChannel, maxBytes: Int = MAX_HEAD_BYTES): Head? {
+    require(maxBytes >= 4) { "maxBytes must be at least 4 to hold a blank line" }
     val buf = ByteBuffer.allocate(maxBytes)
     var scanFrom = 0
     while (true) {
