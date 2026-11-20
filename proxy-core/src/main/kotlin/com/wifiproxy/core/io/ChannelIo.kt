@@ -1,5 +1,7 @@
 package com.wifiproxy.core.io
 
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.channels.SelectionKey
@@ -41,24 +43,59 @@ suspend fun writeFully(loop: NioLoop, ch: SocketChannel, bytes: ByteArray) {
     }
 }
 
-/** Copies [src] to [dst] until EOF, then half-closes [dst]. [onBytes] runs after each chunk is written. */
-suspend fun pump(loop: NioLoop, src: SocketChannel, dst: SocketChannel, buf: ByteBuffer, onBytes: (Int) -> Unit) {
+/** Outcome of a [pump] run: a clean EOF, or which side's I/O failed. */
+sealed interface PumpResult {
+    data object Eof : PumpResult
+    data class ReadFailed(val error: IOException) : PumpResult
+    data class WriteFailed(val error: IOException) : PumpResult
+}
+
+/**
+ * Copies [src] to [dst] until EOF, then half-closes [dst]. [onBytes] runs after every write
+ * that delivers bytes, with the number that write delivered.
+ *
+ * Returns how the copy ended instead of throwing, so the two directions of a [Tunnel] can fail
+ * independently: an [PumpResult.ReadFailed] means [src] is dead, an [PumpResult.WriteFailed]
+ * means [dst] is. Cancellation and non-I/O exceptions still propagate.
+ */
+suspend fun pump(loop: NioLoop, src: SocketChannel, dst: SocketChannel, buf: ByteBuffer, onBytes: (Int) -> Unit): PumpResult {
     while (true) {
+        currentCoroutineContext().ensureActive()
         buf.clear()
-        val n = src.read(buf)
+        val n = try {
+            src.read(buf)
+        } catch (e: IOException) {
+            return PumpResult.ReadFailed(e)
+        }
         if (n < 0) {
             runCatching { dst.shutdownOutput() }
-            return
+            return PumpResult.Eof
         }
         if (n == 0) {
-            loop.await(src, SelectionKey.OP_READ)
+            try {
+                loop.await(src, SelectionKey.OP_READ)
+            } catch (e: IOException) {
+                return PumpResult.ReadFailed(e)
+            }
             continue
         }
         buf.flip()
         while (buf.hasRemaining()) {
-            if (dst.write(buf) == 0) loop.await(dst, SelectionKey.OP_WRITE)
+            val written = try {
+                dst.write(buf)
+            } catch (e: IOException) {
+                return PumpResult.WriteFailed(e)
+            }
+            if (written == 0) {
+                try {
+                    loop.await(dst, SelectionKey.OP_WRITE)
+                } catch (e: IOException) {
+                    return PumpResult.WriteFailed(e)
+                }
+            } else {
+                onBytes(written)
+            }
         }
-        onBytes(n)
     }
 }
 

@@ -1,18 +1,37 @@
 package com.wifiproxy.core.io
 
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.channels.SocketChannel
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 
 fun monotonicMs(): Long = System.nanoTime() / 1_000_000
+
+/** Why a [Tunnel] stopped pumping. */
+enum class TunnelEnd { BOTH_EOF, RESPONSE_ENDED, IDLE, CLIENT_FAILED, UPSTREAM_FAILED }
+
+data class TunnelResult(val end: TunnelEnd, val error: IOException? = null)
 
 /**
  * Pumps client<->upstream until both directions reach EOF, the tunnel is idle for
  * [idleTimeoutMs], or (when closeWhenResponseEnds) the upstream finishes its response.
+ *
+ * Failure policy is per direction: a read failure means that side's peer is dead, so it takes
+ * the other direction down with it (CLIENT_FAILED/UPSTREAM_FAILED). A write failure only means
+ * the destination stopped accepting data - the source side can still have readable data queued
+ * (observed on Linux/Android even after the peer RSTs the connection) - so the opposite
+ * direction is left alone to drain on its own; the failure is recorded but nothing is cancelled.
+ * The first recorded failure wins the result, then IDLE if the watchdog fired, then
+ * RESPONSE_ENDED, otherwise BOTH_EOF.
+ *
+ * [run] throws only on cancellation (e.g. an outer revoke) or a non-I/O bug.
  * The caller owns and closes both channels.
  */
 class Tunnel(
@@ -24,37 +43,76 @@ class Tunnel(
     private val onUp: (Int) -> Unit = {},
     private val onDown: (Int) -> Unit = {},
 ) {
-    suspend fun run(closeWhenResponseEnds: Boolean) = coroutineScope {
+    suspend fun run(closeWhenResponseEnds: Boolean): TunnelResult = coroutineScope {
         val lastActivity = AtomicLong(clock())
-        val up = launch {
-            pump(loop, client, upstream, ByteBuffer.allocate(BUFFER_SIZE)) { n ->
+        val failure = AtomicReference<TunnelResult?>()
+        val idled = AtomicBoolean(false)
+        val responseEnded = AtomicBoolean(false)
+
+        // Declared lazily and started together below so each side can cancel the other by
+        // referencing a Job that is guaranteed to be assigned before either one actually runs.
+        lateinit var up: Job
+        lateinit var down: Job
+
+        up = launch(start = CoroutineStart.LAZY) {
+            when (val result = pump(loop, client, upstream, ByteBuffer.allocate(BUFFER_SIZE)) { n ->
                 lastActivity.set(clock())
                 onUp(n)
-            }
-        }
-        val down = launch {
-            pump(loop, upstream, client, ByteBuffer.allocate(BUFFER_SIZE)) { n ->
-                lastActivity.set(clock())
-                onDown(n)
-            }
-            if (closeWhenResponseEnds) up.cancel()
-        }
-        val idle = launch {
-            val tick = (idleTimeoutMs / 4).coerceIn(10, 1000)
-            while (isActive) {
-                delay(tick)
-                if (clock() - lastActivity.get() >= idleTimeoutMs) {
-                    up.cancel()
+            }) {
+                is PumpResult.ReadFailed -> {
+                    failure.compareAndSet(null, TunnelResult(TunnelEnd.CLIENT_FAILED, result.error))
                     down.cancel()
                 }
+                is PumpResult.WriteFailed ->
+                    failure.compareAndSet(null, TunnelResult(TunnelEnd.UPSTREAM_FAILED, result.error))
+                PumpResult.Eof -> {}
             }
         }
+        down = launch(start = CoroutineStart.LAZY) {
+            when (val result = pump(loop, upstream, client, ByteBuffer.allocate(BUFFER_SIZE)) { n ->
+                lastActivity.set(clock())
+                onDown(n)
+            }) {
+                PumpResult.Eof -> if (closeWhenResponseEnds) {
+                    responseEnded.set(true)
+                    up.cancel()
+                }
+                is PumpResult.ReadFailed -> {
+                    failure.compareAndSet(null, TunnelResult(TunnelEnd.UPSTREAM_FAILED, result.error))
+                    up.cancel()
+                }
+                is PumpResult.WriteFailed ->
+                    failure.compareAndSet(null, TunnelResult(TunnelEnd.CLIENT_FAILED, result.error))
+            }
+        }
+        val idle = launch {
+            while (true) {
+                val remaining = lastActivity.get() + idleTimeoutMs - clock()
+                if (remaining <= 0) {
+                    idled.set(true)
+                    up.cancel()
+                    down.cancel()
+                    break
+                }
+                delay(remaining)
+            }
+        }
+
+        up.start()
+        down.start()
+
         up.join()
         down.join()
         idle.cancel()
+
+        failure.get() ?: when {
+            idled.get() -> TunnelResult(TunnelEnd.IDLE)
+            responseEnded.get() -> TunnelResult(TunnelEnd.RESPONSE_ENDED)
+            else -> TunnelResult(TunnelEnd.BOTH_EOF)
+        }
     }
 
     companion object {
-        const val BUFFER_SIZE = 32 * 1024
+        const val BUFFER_SIZE = 16 * 1024
     }
 }

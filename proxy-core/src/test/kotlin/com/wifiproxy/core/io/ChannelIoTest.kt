@@ -100,7 +100,7 @@ class ChannelIoTest {
         val job = async(Dispatchers.Default) { pump(loop, srcPeer, dstPeer, ByteBuffer.allocate(1024)) { counted += it } }
         src.write(bytes("hello"))
         src.shutdownOutput()
-        withTimeout(2000) { job.await() }
+        assertEquals(PumpResult.Eof, withTimeout(2000) { job.await() })
         assertEquals("hello", dst.readAllBlocking().toString(Charsets.ISO_8859_1))
         assertEquals(5, counted)
         listOf(src, srcPeer, dstPeer, dst).forEach { it.close() }
