@@ -3,21 +3,25 @@ package com.wifiproxy.core.egress
 import com.wifiproxy.core.io.NioLoop
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.IOException
 import java.net.Inet4Address
 import java.net.Inet6Address
 import java.net.InetAddress
 import java.net.InetSocketAddress
+import java.net.SocketTimeoutException
 import java.nio.channels.SelectionKey
 import java.nio.channels.SocketChannel
-import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Happy-eyeballs-style dialer: attempts start [staggerMs] apart in [order], the first success wins
- * and the rest are cancelled. Throws IOException if every attempt fails, TimeoutCancellationException
+ * and the rest are cancelled. Throws IOException if every attempt fails, SocketTimeoutException
  * after [timeoutMs].
  */
 class Dialer(
@@ -25,23 +29,46 @@ class Dialer(
     private val timeoutMs: Long = 10_000,
     private val connect: suspend (InetAddress, Int) -> SocketChannel,
 ) {
-    suspend fun dial(addresses: List<InetAddress>, port: Int): SocketChannel =
-        withTimeout(timeoutMs) { race(order(addresses), port) }
-
-    private suspend fun race(addresses: List<InetAddress>, port: Int): SocketChannel = coroutineScope {
+    suspend fun dial(addresses: List<InetAddress>, port: Int): SocketChannel {
         require(addresses.isNotEmpty()) { "no addresses to dial" }
         val winner = CompletableDeferred<SocketChannel>()
-        val failures = AtomicInteger()
+        val winnerChannel = AtomicReference<SocketChannel?>()
+        try {
+            return withTimeoutOrNull(timeoutMs) { race(order(addresses), port, winner, winnerChannel) }
+                ?: throw SocketTimeoutException("connect timed out after ${timeoutMs}ms")
+        } catch (t: Throwable) {
+            // An attempt can hand the winner a connected channel after withTimeoutOrNull has
+            // already given up on (or race() otherwise failed) the result; never leak it.
+            winnerChannel.get()?.let { ch -> runCatching { ch.close() } }
+            throw t
+        }
+    }
+
+    private suspend fun race(
+        addresses: List<InetAddress>,
+        port: Int,
+        winner: CompletableDeferred<SocketChannel>,
+        winnerChannel: AtomicReference<SocketChannel?>,
+    ): SocketChannel = coroutineScope {
+        val causes = ConcurrentLinkedQueue<Throwable>()
         val attempts = addresses.mapIndexed { i, address ->
             launch {
                 delay(i * staggerMs)
                 val ch = try {
                     connect(address, port)
-                } catch (e: IOException) {
-                    if (failures.incrementAndGet() == addresses.size) winner.completeExceptionally(e)
+                } catch (e: Exception) {
+                    currentCoroutineContext().ensureActive()
+                    causes.add(e)
+                    if (causes.size == addresses.size) {
+                        winner.completeExceptionally(aggregateFailures(causes.toList(), addresses.size))
+                    }
                     return@launch
                 }
-                if (!winner.complete(ch)) ch.close()
+                if (winner.complete(ch)) {
+                    winnerChannel.set(ch)
+                } else {
+                    ch.close()
+                }
             }
         }
         try {
@@ -70,6 +97,15 @@ class Dialer(
     }
 }
 
+/** Builds the exception `dial()` throws once every attempt has failed, keeping every cause. */
+private fun aggregateFailures(causes: List<Throwable>, attemptCount: Int): Throwable {
+    val first = causes.first()
+    if (causes.all { it is EgressUnavailableException }) return first
+    val aggregate = IOException("all $attemptCount attempts failed", first)
+    causes.drop(1).forEach(aggregate::addSuppressed)
+    return aggregate
+}
+
 /** Non-blocking connect of an already-bound channel; closes the channel on any failure. */
 suspend fun connectChannel(loop: NioLoop, ch: SocketChannel, target: InetSocketAddress): SocketChannel {
     try {
@@ -80,7 +116,7 @@ suspend fun connectChannel(loop: NioLoop, ch: SocketChannel, target: InetSocketA
         ch.socket().tcpNoDelay = true
         return ch
     } catch (t: Throwable) {
-        ch.close()
+        runCatching { ch.close() }
         throw t
     }
 }

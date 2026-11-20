@@ -2,6 +2,7 @@ package com.wifiproxy.core.egress
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.io.IOException
 import java.net.InetAddress
 import java.nio.channels.SocketChannel
 
@@ -18,9 +19,18 @@ interface Egress {
 
     suspend fun resolve(host: String): List<InetAddress>
 
-    /** A new, unconnected channel already bound to the egress network. */
-    fun newChannel(): SocketChannel
+    /**
+     * A new, unconnected channel bound to the egress network: an implementation must never
+     * return a channel that isn't bound to it ("bound or refuse"). If binding fails, it must
+     * close the channel it opened before throwing. Throws [EgressUnavailableException] when the
+     * egress network no longer exists, and [IOException] for any other binding failure. May
+     * block briefly while binding, so never call this from the NioLoop thread.
+     */
+    suspend fun newChannel(): SocketChannel
 }
+
+/** Thrown by [Egress.newChannel] (or a dial attempt) when the egress network no longer exists. */
+class EgressUnavailableException(message: String) : IOException(message)
 
 /** Uses the JVM's default network. For tests and desktop runs only. */
 class DirectEgress(
@@ -30,5 +40,5 @@ class DirectEgress(
     override suspend fun resolve(host: String): List<InetAddress> =
         withContext(Dispatchers.IO) { InetAddress.getAllByName(host).toList() }
 
-    override fun newChannel(): SocketChannel = SocketChannel.open()
+    override suspend fun newChannel(): SocketChannel = SocketChannel.open()
 }
