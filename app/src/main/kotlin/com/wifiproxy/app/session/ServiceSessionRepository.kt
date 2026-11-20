@@ -16,6 +16,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -77,13 +78,19 @@ class ServiceSessionRepository(
         .flatMapLatest { it?.log ?: flowOf(emptyList()) }
         .stateIn(repositoryScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
+    // (R6) Stops the 1 Hz poll entirely while IDLE: flatMapLatest on phase so a session screen left
+    // open on an idle session doesn't keep this process (and ServiceSessionRepository's own
+    // WhileSubscribed collectors) waking up once a second for nothing to show.
+    private fun tickerForPhase(phase: SessionPhase): Flow<Unit> =
+        if (phase == SessionPhase.IDLE) flowOf(Unit) else ticker
+
     private fun sessionFlowFor(controller: UsbSessionController) =
         combine(
             controller.state,
             controller.degradedReason,
             controller.cellularAvailable,
             controller.lastError,
-            ticker,
+            controller.state.flatMapLatest(::tickerForPhase),
         ) { phase, reason, cellular, lastError, _ ->
             buildUi(phase, reason, cellular, lastError, controller.registry?.slots().orEmpty())
         }

@@ -19,7 +19,9 @@ import java.net.InetAddress
 import java.net.NetworkInterface
 import java.nio.channels.SocketChannel
 import java.util.concurrent.ExecutorService
-import java.util.concurrent.Executors
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 
 /**
  * What `UsbSessionController` needs from the cellular egress: the [Egress] contract `ProxyServer`
@@ -89,12 +91,6 @@ class CellularEgress(
      */
     override var onLinkChange: (() -> Unit)? = null
 
-    // Recreated in start() and shut down in stop() (M1) rather than living for the process: a
-    // leaked single-thread executor per CellularEgress instance (the service builds a fresh one on
-    // every start) would otherwise never be reclaimed.
-    @Volatile
-    private var dnsExecutor: ExecutorService? = null
-
     private val resolver = DnsResolutionEngine<Network>(
         query = ::queryDnsResolver,
         parseLiteral = { host -> if (InetAddresses.isNumericAddress(host)) InetAddresses.parseNumericAddress(host) else null },
@@ -109,7 +105,6 @@ class CellularEgress(
     /** Starts tracking the cellular network. Call [stop] before calling this again. */
     override fun start() {
         check(callback == null) { "CellularEgress already started" }
-        dnsExecutor = Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "CellularEgress-dns") }
         val request = NetworkRequest.Builder()
             .addTransportType(NetworkCapabilities.TRANSPORT_CELLULAR)
             .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
@@ -149,12 +144,25 @@ class CellularEgress(
                 onLinkChange?.invoke()
             }
         }
-        // Register first, then publish the field (I3): if requestNetwork throws, callback stays
-        // null, so a retried start() sees a clean slate instead of permanently failing its own
-        // "already started" check, and stop() never has to unregister a callback that was never
-        // actually registered.
-        connectivityManager.requestNetwork(request, newCallback)
+        // Publish the field *before* registering (R1 - fixes a regression): ConnectivityService
+        // can invoke a NetworkCallback's onAvailable synchronously, on its own thread, from inside
+        // requestNetwork() itself, before requestNetwork() has even returned to us. onAvailable
+        // fires at most once per network, so if callback were published only after requestNetwork
+        // returned, the identity guard at the top of onAvailable (`callback !== this`) would see
+        // the field still null/stale and silently drop that first - and only - callback, leaving
+        // the session stuck in DEGRADED forever. Publishing first means that guard already sees
+        // `newCallback` installed by the time any such reentrant call can land.
+        //
+        // If requestNetwork throws instead, undo the publish so a retried start() sees a clean
+        // slate (callback == null) rather than permanently failing its own "already started"
+        // check; stop() is never involved here since nothing was ever registered.
         callback = newCallback
+        try {
+            connectivityManager.requestNetwork(request, newCallback)
+        } catch (e: RuntimeException) {
+            callback = null
+            throw e
+        }
     }
 
     /** Stops tracking the cellular network. Safe to call when not started, and tolerates
@@ -172,8 +180,6 @@ class CellularEgress(
                 // undo.
             }
         }
-        dnsExecutor?.shutdown()
-        dnsExecutor = null
         _network.value = null
         _available.value = false
         _isValidated.value = false
@@ -244,17 +250,12 @@ class CellularEgress(
     }
 
     private fun queryDnsResolver(network: Network, host: String, onResult: (DnsOutcome) -> Unit): () -> Unit {
-        val executor = dnsExecutor ?: run {
-            // stop() raced the query past CellularEgress's own lifetime; fail it rather than NPE.
-            onResult(DnsOutcome.Failure(EgressUnavailableException("egress stopped")))
-            return {}
-        }
         val signal = CancellationSignal()
         DnsResolver.getInstance().query(
             network,
             host,
             DnsResolver.FLAG_EMPTY,
-            executor,
+            dnsExecutor,
             signal,
             object : DnsResolver.Callback<List<InetAddress>> {
                 override fun onAnswer(answer: List<InetAddress>, rcode: Int) {
@@ -267,5 +268,23 @@ class CellularEgress(
             },
         )
         return { signal.cancel() }
+    }
+
+    companion object {
+        // (R5) One executor for the whole process, never shut down: DnsResolver can still invoke
+        // a query's result callback here after the CellularEgress instance that issued it has
+        // already stop()'d (the answer was in flight when stop() ran) - the old per-start/per-stop
+        // executor lifecycle shut this down in stop(), so that delivery threw
+        // RejectedExecutionException on whatever thread DnsResolver happened to call back on,
+        // which can be Main. Core size 0 with allowCoreThreadTimeOut still lets the single worker
+        // thread exit when idle, exactly like the old per-instance executor did; only the pool
+        // object itself now outlives any one CellularEgress/session.
+        private val dnsExecutor: ExecutorService = ThreadPoolExecutor(
+            0,
+            1,
+            30,
+            TimeUnit.SECONDS,
+            LinkedBlockingQueue(),
+        ) { runnable -> Thread(runnable, "CellularEgress-dns") }.apply { allowCoreThreadTimeOut(true) }
     }
 }

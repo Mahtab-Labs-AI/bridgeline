@@ -8,7 +8,9 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.net.ConnectivityManager
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
@@ -60,20 +62,40 @@ class ProxySessionService : Service() {
         // makes sure it's not silently swallowed either.
         Log.e(TAG, "Uncaught exception in ProxySessionService's scope", e)
     }
-    private val serviceScope = CoroutineScope(
-        SupervisorJob() + Dispatchers.Default.limitedParallelism(1) + exceptionHandler,
-    )
+    // (R4) Held in a field rather than written inline at each use: Dispatchers.Default.
+    // limitedParallelism(n) returns a *new* limited view every time it's called, each with its own
+    // independent queue, so two separate calls don't serialize against each other at all. Every
+    // coroutine that must run strictly serialized against every other one - serviceScope's and
+    // onDestroy's best-effort shutdown alike - has to be launched on this exact same instance.
+    private val serial = Dispatchers.Default.limitedParallelism(1)
+
+    private val serviceScope = CoroutineScope(SupervisorJob() + serial + exceptionHandler)
 
     private var controller: UsbSessionController? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var wakeLockJob: Job? = null
     private var notificationJob: Job? = null
 
+    /** Every call into [UsbSessionController.onIdle] is re-posted through this (R3): that callback
+     *  can run on the serial worker thread (during a normal `doStop`/rolled-back `doStart`) or on
+     *  the background shutdown thread ([onDestroy]'s [shutdownBlocking] path) - never reliably on
+     *  Main - but everything it touches here ([currentStartId], [controller], [notificationJob],
+     *  the notification APIs) is Main-confined. */
+    private val mainHandler = Handler(Looper.getMainLooper())
+
     /** The most recent `startId` seen by [onStartCommand], always what [stopSelf] is called with
      *  (never the bare, ID-less overload): if a new Start arrives after the one that triggered a
      *  stop but before the service actually dies, `stopSelf(staleId)` is a no-op and the service
-     *  survives for the newer command, per the `stopSelf(int)` contract. */
+     *  survives for the newer command, per the `stopSelf(int)` contract. Only ever read or written
+     *  from Main (R3): [onStartCommand] always runs there, and so does every read of it now that
+     *  [UsbSessionController.onIdle] is re-posted onto [mainHandler] before touching it. */
     private var currentStartId: Int = 0
+
+    /** Set on Main (M-b) when a Start intent arrives while the session is STOPPING: calling
+     *  [UsbSessionController.start] in that phase is a documented no-op, so the request would
+     *  otherwise simply be dropped. The onIdle hand-off below checks this once the session actually
+     *  reaches IDLE and, if set, starts a fresh session instead of letting the service stop. */
+    private var pendingStart: Boolean = false
 
     /** Set the instant [onDestroy] begins, so [updateNotification] can refuse to resurrect the
      *  notification for a tick that was already in flight when teardown started. */
@@ -88,6 +110,8 @@ class ProxySessionService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         currentStartId = startId
         if (intent?.action == ACTION_STOP) {
+            // An explicit Stop always wins over an earlier pending restart (M-b).
+            pendingStart = false
             val c = controller
             if (c == null || c.state.value == SessionPhase.IDLE) {
                 // Nothing to stop; don't wait on a phase transition that will never come.
@@ -99,36 +123,77 @@ class ProxySessionService : Service() {
         }
 
         val c = controller ?: buildController().also { controller = it }
-        if (c.state.value == SessionPhase.IDLE) {
-            // Re-enter foreground state before every start, not just the first: a previous
-            // session reaching IDLE called stopForeground(STOP_FOREGROUND_REMOVE) (see
-            // removeNotification), so a later start on this same (still-alive) service instance
-            // needs its own startForeground() again, exactly like a fresh instance's onCreate.
-            startForeground(NOTIFICATION_ID, buildNotification(SessionPhase.STARTING, null, 0, 0))
-            c.start()
+        // Called unconditionally, not only when state == IDLE (R3): Android requires a
+        // startForeground() call for *every* startForegroundService()-triggered onStartCommand,
+        // within its own deadline, regardless of whether the service happens to already be
+        // running. The call is idempotent (re-posts the same ongoing notification), so this is
+        // free on the already-running paths and re-enters foreground state on every one that isn't
+        // - a previous session reaching IDLE called stopForeground(STOP_FOREGROUND_REMOVE) (see
+        // removeNotification), so a later start on this same (still-alive) service instance needs
+        // its own startForeground() again, exactly like a fresh instance's onCreate.
+        startForeground(NOTIFICATION_ID, buildNotification(SessionPhase.STARTING, null, 0, 0))
+        when (c.state.value) {
+            SessionPhase.IDLE -> {
+                // (R3c) Restarted next to c.start(), not left to whatever buildController wired up
+                // on first build: a session that is starting again after reaching IDLE needs its
+                // own fresh notificationJob too, or its notification never updates again.
+                startNotificationUpdates(c)
+                c.start()
+            }
+            SessionPhase.STOPPING -> {
+                // c.start() is a documented no-op while STOPPING; recorded instead so the onIdle
+                // hand-off starts a fresh session once this one actually finishes tearing down
+                // (M-b).
+                pendingStart = true
+            }
+            else -> Unit // Already STARTING/RUNNING/DEGRADED; the startForeground above is enough.
         }
         return START_NOT_STICKY
     }
 
     private fun buildController(): UsbSessionController {
-        val connectivityManager = getSystemService(ConnectivityManager::class.java)
+        // (R6) applicationContext, not `this`: CellularEgress/its ConnectivityManager outlive any
+        // one onStartCommand and are reachable from SessionHolder long after this Service instance
+        // would otherwise be eligible for GC, so building it from the Service context (implicitly
+        // keeping the Service alive) risks retaining a destroyed service.
+        val connectivityManager = applicationContext.getSystemService(ConnectivityManager::class.java)
         val egress = CellularEgress(connectivityManager)
         val newController = UsbSessionController(egress = egress, scope = serviceScope)
         // (C1) Set before this controller's start() is ever called: see the kdoc on
         // UsbSessionController.onIdle for why this must be a direct callback, not something this
-        // service subscribes to by collecting controller.state. Runs synchronously as part of
-        // teardown(), so the 5s re-post loop is guaranteed stopped - and the notification removed
-        // - before stopSelf ever gets a chance to tear the service down (no notification may
-        // outlive reaching IDLE, on any path: clean stop, a failed start, or a rebuild that gives
-        // up).
+        // service subscribes to by collecting controller.state.
+        //
+        // (R3) onIdle can run on the serial worker (a normal doStop/rolled-back doStart) or on the
+        // onDestroy shutdown thread (shutdownBlocking) - never reliably Main - so everything it
+        // touches (currentStartId, controller, notificationJob, the notification/foreground APIs)
+        // is re-posted onto mainHandler rather than touched here directly. The guard re-checks
+        // `controller?.state?.value == SessionPhase.IDLE` once that post actually runs, not just
+        // at the moment onIdle fired, so a start that re-entered (moved the phase away from IDLE)
+        // in the meantime can't have its fresh startForeground/notification undone by a now-stale
+        // teardown (R3b) - and serviceStopping guards the symmetric case where onDestroy has
+        // already begun its own teardown by the time this post runs.
         newController.onIdle = {
-            notificationJob?.cancel()
-            serviceScope.launch(Dispatchers.Main.immediate) { removeNotification() }
-            stopSelf(currentStartId)
+            mainHandler.post {
+                if (!serviceStopping && controller?.state?.value == SessionPhase.IDLE) {
+                    notificationJob?.cancel()
+                    if (pendingStart) {
+                        // (M-b) A Start arrived while this session was STOPPING and was recorded
+                        // instead of silently dropped (c.start() is a no-op in that phase); now
+                        // that the session has actually reached IDLE, honour it as a fresh start
+                        // rather than letting the service stop.
+                        pendingStart = false
+                        startForeground(NOTIFICATION_ID, buildNotification(SessionPhase.STARTING, null, 0, 0))
+                        startNotificationUpdates(newController)
+                        newController.start()
+                    } else {
+                        removeNotification()
+                        stopSelf(currentStartId)
+                    }
+                }
+            }
         }
         SessionHolder.bind(newController)
         startWakeLockManagement(newController)
-        startNotificationUpdates(newController)
         return newController
     }
 
@@ -148,10 +213,27 @@ class ProxySessionService : Service() {
         val c = controller
         // (I1) onCreate/onDestroy always run on main; never block it. If the controller never
         // reached IDLE through the normal stop() path (the process is being torn down mid-
-        // session), do the equivalent shutdown synchronously but on a background thread.
+        // session), do the equivalent shutdown off Main.
+        //
+        // (R4) Launched on `serial` - the exact field serviceScope's own coroutines run on, not a
+        // fresh Dispatchers.Default.limitedParallelism(1) (a distinct view wouldn't serialize
+        // against whatever is still in flight there) - with its own Job rather than a child of
+        // serviceScope's SupervisorJob, so the serviceScope.cancel() below can't cancel this
+        // shutdown before it even starts. Launched *before* that cancel() so it queues behind any
+        // coroutine already running on `serial` instead of racing it; a job already queued behind
+        // it on `serial` at cancellation time is simply never run, since serviceScope's own Job
+        // (not `serial` itself) is what gets cancelled. Still never blocks Main: `serial` is
+        // backed by Dispatchers.Default, so shutdownBlocking() runs on one of its worker threads.
         if (c != null && c.state.value != SessionPhase.IDLE) {
-            Thread({ c.shutdownBlocking() }, "ProxySessionService-shutdown").start()
+            CoroutineScope(serial + Job()).launch { c.shutdownBlocking() }
         }
+        // (R6) After scheduling the shutdown above, not before: a destroyed service must not stay
+        // reachable through a controller/egress this onIdle closure keeps alive, and nothing past
+        // this point needs onIdle to still fire (the shutdown above doesn't go through the normal
+        // stop()/teardown() path that invokes it; shutdownBlocking calls teardown() directly, so
+        // onIdle *would* still fire from it, which is exactly why it must already be nulled out by
+        // the time that runs).
+        c?.onIdle = null
         serviceScope.cancel()
         super.onDestroy()
     }

@@ -183,14 +183,24 @@ class UsbSessionController(
 
             // Set the initial Running/Degraded phase directly from the current value, rather than
             // through applyAvailability's RUNNING/DEGRADED-only transitions below: at this point
-            // the phase is still STARTING, which neither of those transitions matches.
+            // the phase is still (expected to be) STARTING, which neither of those transitions
+            // matches.
+            //
+            // CAS rather than a plain write (R2): a concurrent stop() can move the phase to
+            // STOPPING in the gap between the checkNotInterruptedByStop() above and this line (no
+            // suspension point separates them, but egress.available.value is a plain property read
+            // on a StateFlow backed by another thread, so nothing prevents a real stop() landing
+            // here). A plain `_state.value = target` would silently clobber that STOPPING back to
+            // RUNNING/DEGRADED; doStop would then see a phase that isn't what it set, return early
+            // without tearing anything down, and the stop would be lost for good. CAS instead
+            // leaves STOPPING alone and routes this exactly like any other interrupted start.
             val available = egress.available.value
+            val target = if (available) SessionPhase.RUNNING else SessionPhase.DEGRADED
+            if (!_state.compareAndSet(SessionPhase.STARTING, target)) throw StartInterruptedByStopException()
             if (available) {
-                _state.value = SessionPhase.RUNNING
                 appendLog("USB session running")
             } else {
                 _degradedReason.value = "No mobile data"
-                _state.value = SessionPhase.DEGRADED
                 appendLog("Degraded: no mobile data")
             }
             _lastError.value = null
@@ -261,20 +271,25 @@ class UsbSessionController(
     }
 
     /** Only switches Running <-> Degraded; a no-op in every other phase (including the replayed
-     *  value a freshly-collected [StateFlow] always delivers immediately on subscribe). */
+     *  value a freshly-collected [StateFlow] always delivers immediately on subscribe). CAS rather
+     *  than a plain write (R2): guards against a concurrent [stop] having already moved the phase
+     *  on (e.g. to STOPPING) between the `when`'s `current` read and the write below - a plain
+     *  write would otherwise clobber that transition and lose the stop. */
     private fun applyAvailability(available: Boolean) {
         val current = _state.value
         when {
             current == SessionPhase.RUNNING && !available -> {
-                _degradedReason.value = "No mobile data"
-                _state.value = SessionPhase.DEGRADED
-                appendLog("Degraded: no mobile data")
+                if (_state.compareAndSet(SessionPhase.RUNNING, SessionPhase.DEGRADED)) {
+                    _degradedReason.value = "No mobile data"
+                    appendLog("Degraded: no mobile data")
+                }
             }
 
             current == SessionPhase.DEGRADED && available -> {
-                _degradedReason.value = null
-                _state.value = SessionPhase.RUNNING
-                appendLog("Recovered: USB session running")
+                if (_state.compareAndSet(SessionPhase.DEGRADED, SessionPhase.RUNNING)) {
+                    _degradedReason.value = null
+                    appendLog("Recovered: USB session running")
+                }
             }
         }
     }
@@ -308,10 +323,14 @@ class UsbSessionController(
     }
 
     private suspend fun doStop() {
-        // A concurrent doStart() may already have rolled itself back to IDLE after noticing this
-        // stop() (see checkNotInterruptedByStop/rollbackStart) - in which case there is nothing
-        // left for this to do.
-        if (_state.value != SessionPhase.STOPPING) return
+        // Only IDLE means there is nothing left to do here: a concurrent doStart() may already
+        // have rolled itself back to IDLE after noticing this stop() (see
+        // checkNotInterruptedByStop/rollbackStart), in which case the server/egress it started are
+        // already torn down. Returning only on IDLE - rather than the old `!= STOPPING` check (R2)
+        // - means this never again skips a real teardown just because the phase isn't exactly
+        // STOPPING any more; the old check was exactly how "doStart writes RUNNING, doStop finds
+        // the phase isn't STOPPING and returns" lost a stop.
+        if (_state.value == SessionPhase.IDLE) return
         try {
             runCatching { activeServer?.stop() }
             runCatching { egress.stop() }
@@ -389,8 +408,11 @@ class UsbSessionController(
         appendLog(message)
         val phase = _state.value
         if (phase == SessionPhase.RUNNING || phase == SessionPhase.DEGRADED) {
-            _degradedReason.value = "Recovery failed: ${e::class.simpleName}"
-            _state.value = SessionPhase.DEGRADED
+            // CAS rather than a plain write (R2): a concurrent stop() may have already moved the
+            // phase away from `phase` by the time this runs.
+            if (_state.compareAndSet(phase, SessionPhase.DEGRADED)) {
+                _degradedReason.value = "Recovery failed: ${e::class.simpleName}"
+            }
         }
     }
 

@@ -7,7 +7,6 @@ import java.io.IOException
 import java.net.InetAddress
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
-import java.util.concurrent.ConcurrentHashMap
 
 /** One answer delivered by a [DnsQuery]: a (possibly multi-address) success, or a failure. */
 sealed interface DnsOutcome {
@@ -53,10 +52,20 @@ class DnsResolutionEngine<N : Any>(
     private data class CacheKey<N>(val network: N, val host: String)
     private class CacheEntry(val addresses: List<InetAddress>, val expiresAt: Long)
 
-    private val cache = ConcurrentHashMap<CacheKey<N>, CacheEntry>()
+    // (M-a) A LinkedHashMap in access order, so the comment on [recordCacheEntry] is actually true:
+    // a ConcurrentHashMap has no notion of access or insertion order at all, so the previous
+    // "sweep expired, then drop the overflow" fallback evicted in whatever order the map's internal
+    // hash bucket iteration happened to produce - not oldest-first, despite the comment. LinkedHashMap
+    // isn't thread-safe on its own, so every access below goes through [cacheLock]; `accessOrder =
+    // true` plus the [removeEldestEntry] override turns a plain `put`/`get` into true LRU eviction.
+    private val cacheLock = Any()
+    private val cache = object : LinkedHashMap<CacheKey<N>, CacheEntry>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<CacheKey<N>, CacheEntry>): Boolean =
+            size > maxCacheEntries
+    }
 
     /** Test-only visibility into the cache's current size, to assert [maxCacheEntries] is honoured. */
-    internal val cacheSizeForTesting: Int get() = cache.size
+    internal val cacheSizeForTesting: Int get() = synchronized(cacheLock) { cache.size }
 
     /**
      * Resolves [host] on [network].
@@ -71,9 +80,11 @@ class DnsResolutionEngine<N : Any>(
         if (network == null) throw EgressUnavailableException("no cellular network")
 
         val key = CacheKey(network, host)
-        cache[key]?.let { entry ->
-            if (entry.expiresAt > clock()) return entry.addresses
-            cache.remove(key, entry)
+        synchronized(cacheLock) {
+            cache[key]?.let { entry ->
+                if (entry.expiresAt > clock()) return entry.addresses
+                cache.remove(key)
+            }
         }
 
         val addresses = queryAndAwait(network, host)
@@ -81,23 +92,13 @@ class DnsResolutionEngine<N : Any>(
         return addresses
     }
 
-    /** Bounds the cache to [maxCacheEntries] (M2): sweeps expired entries first, then - if every
-     *  live entry is still within its TTL - drops the oldest-inserted entries down to the cap.
-     *  `ConcurrentHashMap` has no access-order eviction of its own, so this is a size cap with an
-     *  expiry-aware eviction order rather than a true LRU, which is enough to keep an unbounded
-     *  number of distinct hostnames from pinning memory forever. */
+    /** Bounds the cache to [maxCacheEntries] (M2, M-a): [cache] is a `LinkedHashMap` in access
+     *  order with [LinkedHashMap.removeEldestEntry] overridden above to cap at [maxCacheEntries],
+     *  so inserting past the cap evicts the true least-recently-used entry - oldest by last
+     *  read-or-write, exactly as the eviction is documented to behave - rather than an arbitrary
+     *  hash-bucket order. */
     private fun recordCacheEntry(key: CacheKey<N>, entry: CacheEntry) {
-        cache[key] = entry
-        if (cache.size <= maxCacheEntries) return
-        val now = clock()
-        val iterator = cache.entries.iterator()
-        while (iterator.hasNext() && cache.size > maxCacheEntries) {
-            if (iterator.next().value.expiresAt <= now) iterator.remove()
-        }
-        if (cache.size > maxCacheEntries) {
-            val overflow = cache.size - maxCacheEntries
-            cache.keys.asSequence().take(overflow).toList().forEach(cache::remove)
-        }
+        synchronized(cacheLock) { cache[key] = entry }
     }
 
     private suspend fun queryAndAwait(network: N, host: String): List<InetAddress> {

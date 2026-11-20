@@ -54,6 +54,10 @@ private fun parseIpv6Literal(host: String): InetAddress? {
         // An embedded IPv4 tail ("::ffff:192.0.2.1") is legal IPv6 syntax but out of scope for this
         // parser; reject it as "not a literal we parse" rather than mis-parsing it.
         if (group.contains('.') || group.isEmpty() || group.length > 4) return null
+        // toIntOrNull(16) itself accepts a leading '+' or '-' (e.g. "+1", "-1" both parse), neither
+        // of which is valid hextet syntax (M-c) - reject them explicitly rather than let a group
+        // like "-1" silently parse as a valid, merely-negative-looking group.
+        if (group[0] == '+' || group[0] == '-') return null
         val value = group.toIntOrNull(16) ?: return null
         if (value !in 0..0xFFFF) return null
         bytes[index * 2] = (value shr 8).toByte()

@@ -7,6 +7,7 @@ import com.wifiproxy.core.net.DestinationFilter
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.ExperimentalForInheritanceCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -459,8 +460,9 @@ class UsbSessionControllerTest {
     @Test
     fun `stop arriving mid-start rolls back and leaves no server running (deterministic)`() = runTest {
         lateinit var c: UsbSessionController
+        val egress = FakeSessionEgress()
         val server = FakeUsbProxyServer(onStart = { c.stop() })
-        c = controller(server = server, scope = backgroundScope)
+        c = controller(egress = egress, server = server, scope = backgroundScope)
 
         c.start()
         runCurrent()
@@ -468,6 +470,64 @@ class UsbSessionControllerTest {
         assertEquals(SessionPhase.IDLE, c.state.value)
         assertEquals(1, server.startCalls)
         assertEquals(1, server.stopCalls)
+        assertEquals(1, egress.stopCalls)
+    }
+
+    // (R2) Hits the exact race the bug report describes: a stop() landing after doStart's last
+    // `checkNotInterruptedByStop()` guard has already passed, but before the final phase write that
+    // used to be a plain `_state.value = RUNNING/DEGRADED` (clobbering a concurrent STOPPING and
+    // losing the stop). Here `egress.available.value` - read by doStart only once, immediately
+    // before that write - is the hook: reading it calls stop() synchronously, landing exactly in
+    // that gap. Asserts the fix (a compareAndSet there) correctly throws StartInterruptedByStop,
+    // rolls back, and reaches IDLE with both the server and the egress stopped, instead of
+    // finishing the start as RUNNING with the stop silently lost.
+    // Implementing StateFlow directly (to hook its `value` getter) requires this opt-in: kotlinx
+    // coroutines reserves the right to add members to Flow/StateFlow/SharedFlow in the future,
+    // which would be a breaking change for anyone implementing them outside the library. Accepted
+    // here deliberately, for a test-only fake.
+    @OptIn(ExperimentalForInheritanceCoroutinesApi::class)
+    @Test
+    fun `stop landing right before the final RUNNING-DEGRADED write is not clobbered`() = runTest {
+        lateinit var c: UsbSessionController
+        val server = FakeUsbProxyServer()
+        val egress = object : SessionEgress {
+            private val backing = MutableStateFlow(true)
+            override val available: StateFlow<Boolean> = object : StateFlow<Boolean> by backing.asStateFlow() {
+                override val value: Boolean
+                    get() {
+                        c.stop()
+                        return backing.value
+                    }
+            }
+            override var onLinkChange: (() -> Unit)? = null
+            override val networkGeneration: StateFlow<Long> = MutableStateFlow(0L).asStateFlow()
+            override val isAvailable: Boolean get() = backing.value
+            override val isValidated: Boolean get() = backing.value
+            var stopCalls = 0
+                private set
+
+            override fun start() = Unit
+            override fun stop() {
+                stopCalls++
+            }
+
+            override fun hostAddresses() = emptyList<Cidr>()
+            override suspend fun resolve(host: String) = emptyList<InetAddress>()
+            override suspend fun newChannel() = throw UnsupportedOperationException("not used in this test")
+        }
+        c = UsbSessionController(
+            egress = egress,
+            serverFactory = UsbProxyServerFactory { _, _, _, _, _ -> server },
+            scope = backgroundScope,
+        )
+
+        c.start()
+        runCurrent()
+
+        assertEquals(SessionPhase.IDLE, c.state.value)
+        assertEquals(1, server.startCalls)
+        assertEquals(1, server.stopCalls)
+        assertEquals(1, egress.stopCalls)
     }
 
     @Test
