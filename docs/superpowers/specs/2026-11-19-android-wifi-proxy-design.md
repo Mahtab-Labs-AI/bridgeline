@@ -101,7 +101,7 @@ Desired state ("session should be running") and credentials persist in DataStore
 
 4. Admission: `ClientRegistry.isAdmitted(srcIp)` else `403`; per-slot tunnel cap else `503`.
 5. DNS via `cellNetwork.getAllByName()` (or `DnsResolver` bound to the network), with a TTL-respecting cache.
-6. Destination filter after resolution: reject loopback, RFC 1918, link-local, CGNAT `100.64.0.0/10`, the P2P subnet, and IPv6 equivalents (`::1`, `fc00::/7`, `fe80::/10`) → `403`.
+6. Destination filter after resolution: reject loopback, RFC 1918, link-local, CGNAT `100.64.0.0/10`, `192.0.0.0/24` (includes Android's CLAT address `192.0.0.4`), the P2P subnet, **the host's own interface addresses** (cellular/Wi-Fi global IPv6 etc., as /32 and /128 — connecting to any local address reaches the host regardless of socket binding; the Android layer supplies them and refreshes them on network change), and IPv6 equivalents (`::/96`, `fc00::/7`, `fe80::/10`) → `403`. IPv4-mapped IPv6 addresses are unwrapped before checking. NAT64 (`64:ff9b::/96`) is deliberately **not** blocked — it carries all IPv4-only sites on IPv6-only carriers; decoding the embedded IPv4 is a possible follow-up.
 7. Open `SocketChannel`; `cellNetwork.bindSocket(channel.socket())` **before** `connect`. Happy-eyeballs: IPv6 first, IPv4 after 250 ms. No cellular network → immediate `503`.
 8. Bidirectional pump with pooled 64 KB direct buffers, `TCP_NODELAY`, kernel-default socket buffers, backpressure. Byte counts feed per-slot counters.
 
