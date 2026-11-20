@@ -83,4 +83,9 @@ interface SessionRepository {
 
     /** Returns false (and rejects the change) if [HostSettings.maxClients] would drop below the active slot count. */
     fun updateSettings(settings: HostSettings): Boolean
+
+    /** Re-runs the setup checks. A no-op for the fake, which has no real permissions/exemptions
+     *  to re-check; [ServiceSessionRepository] rebuilds [checks] from the live Android state.
+     *  Call on every Setup-tab view and app resume (design spec §8: "re-checked on every app open"). */
+    fun refreshChecks() {}
 }

@@ -117,7 +117,7 @@ class ServiceSessionRepository(
         return true
     }
 
-    fun refreshChecks() {
+    override fun refreshChecks() {
         _checks.value = buildChecks()
     }
 

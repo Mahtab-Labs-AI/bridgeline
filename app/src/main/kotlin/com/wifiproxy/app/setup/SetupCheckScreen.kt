@@ -25,16 +25,21 @@ import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.wifiproxy.app.session.CheckStatus
 import com.wifiproxy.app.session.SessionRepository
 import com.wifiproxy.app.session.SetupCheck
@@ -47,6 +52,21 @@ fun SetupCheckScreen(repository: SessionRepository, modifier: Modifier = Modifie
     val snackbarHostState = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
+
+    // Re-checked on every app open/resume (design spec §8), including returning from a Fix-it
+    // intent (e.g. the battery-optimisation system dialog), which resumes this same composable
+    // rather than recreating it.
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val currentRepository by rememberUpdatedState(repository)
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                currentRepository.refreshChecks()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
 
     Box(modifier = modifier.fillMaxSize()) {
         Column(
