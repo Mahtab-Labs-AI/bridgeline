@@ -11,6 +11,7 @@ import java.nio.channels.SelectableChannel
 import java.nio.channels.SelectionKey
 import java.nio.channels.Selector
 import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
@@ -19,9 +20,8 @@ private typealias Waiters = HashMap<Int, CancellableContinuation<Unit>>
 /**
  * A single selector thread that lets coroutines suspend until a non-blocking channel is ready.
  *
- * Continuations resume directly on the loop thread, so callers must await from a real dispatcher
- * (never [kotlinx.coroutines.Dispatchers.Unconfined]) and must not block in the code that runs
- * right after [await] resumes, or every other pending waiter stalls behind it.
+ * resume() is invoked on the loop thread; never await from Dispatchers.Unconfined or another
+ * immediate dispatcher, or caller code runs on, and can stall, the loop thread.
  *
  * Callers must cancel any coroutine waiting on a channel before closing that channel.
  */
@@ -33,6 +33,11 @@ class NioLoop : Closeable {
 
     @Volatile
     private var open = true
+    private var quietRun = 0 // touched only by the loop thread
+
+    /** Count of keys sweepIdleKeys() has cancelled; exposed so tests can observe a sweep happened. */
+    internal val sweptKeys = AtomicLong()
+
     private val thread = Thread(::run, "nio-loop").apply {
         isDaemon = true
         start()
@@ -80,9 +85,18 @@ class NioLoop : Closeable {
                     dispatch(key)
                 }
                 // A zero-interest fd stuck in HUP/ERR can make select() return 0 immediately,
-                // forever, on some platforms (e.g. Android's poll-based selector). If nothing
-                // selected and nothing new was registered either, sweep for that condition.
-                if (n == 0 && applied == 0) sweepIdleKeys()
+                // forever, on some platforms (e.g. Android's poll-based selector). An isolated
+                // quiet pass also happens under load from an orphan wakeup, so require a short
+                // run of consecutive quiet passes before sweeping; the real spin still produces
+                // an unbounded run of them and gets caught within microseconds.
+                if (n == 0 && applied == 0) {
+                    if (++quietRun >= 4) {
+                        quietRun = 0
+                        sweepIdleKeys()
+                    }
+                } else {
+                    quietRun = 0
+                }
             }
         } catch (e: ClosedSelectorException) {
             // fall through to cleanup
@@ -103,16 +117,10 @@ class NioLoop : Closeable {
             applied++
             if (!r.cont.isActive) continue
             try {
-                var key = r.channel.keyFor(selector)
-                if (key != null && !key.isValid) {
-                    // The old key was cancelled (e.g. by sweepIdleKeys) but the selector hasn't
-                    // forgotten it yet. selectNow() flushes cancelled keys; it's safe to call here
-                    // on the loop thread, and anything it selects is processed by the normal
-                    // selected-key iteration in run() right after this method returns.
-                    runCatching { selector.selectNow() }
-                    key = null
-                }
-                val resolvedKey = key ?: r.channel.register(selector, 0, Waiters())
+                // A cancelled key is deregistered by the next select() before this method runs,
+                // so keyFor() here is either null or still valid; register() throws if the
+                // channel itself was closed concurrently, which the catch below handles.
+                val resolvedKey = r.channel.keyFor(selector) ?: r.channel.register(selector, 0, Waiters())
                 @Suppress("UNCHECKED_CAST")
                 val waiters = resolvedKey.attachment() as Waiters
                 val existing = waiters[r.op]
@@ -170,6 +178,7 @@ class NioLoop : Closeable {
                     val waiters = key.attachment() as? Waiters
                     if (waiters == null || waiters.values.none { it.isActive }) {
                         key.cancel()
+                        sweptKeys.incrementAndGet()
                     }
                 }
             }

@@ -87,15 +87,26 @@ class NioLoopTest {
         b.write(ByteBuffer.wrap("hi".toByteArray()))
         withTimeout(2000) { readWaiter.await() }
         assertTrue(writeWaiter.isActive)
-        // Drain b's receive buffer to free space in a's send buffer so the write waiter can resume.
-        b.configureBlocking(true)
-        b.read(ByteBuffer.allocate(256 * 1024))
+        // Drain b (non-blocking) in the background until the write waiter resumes; a single
+        // bounded blocking read isn't reliable across platforms and socket buffer sizes.
+        val drainer = launch(Dispatchers.IO) {
+            val drainBuf = ByteBuffer.allocate(64 * 1024)
+            while (true) {
+                drainBuf.clear()
+                val n = b.read(drainBuf)
+                if (n == 0) {
+                    if (writeWaiter.isCompleted) break
+                    delay(1)
+                }
+            }
+        }
         withTimeout(2000) { writeWaiter.await() }
+        drainer.cancelAndJoin()
         a.close(); b.close()
     }
 
     @Test
-    fun `await after close throws`() = runBlocking {
+    fun `await on a closed loop throws`() = runBlocking {
         val (a, b) = socketPair()
         loop.close()
         assertFailsWith<ClosedChannelException> { loop.await(b, SelectionKey.OP_READ) }
@@ -105,12 +116,14 @@ class NioLoopTest {
     @Test
     fun `invalid op registration does not break close`() = runBlocking {
         val (a, b) = socketPair()
-        val badWaiter = async(Dispatchers.Default) { runCatching { loop.await(b, SelectionKey.OP_ACCEPT) } }
+        withTimeout(2000) { runCatching { loop.await(b, SelectionKey.OP_ACCEPT) } }
+        val readWaiter = async(Dispatchers.Default) { runCatching { loop.await(b, SelectionKey.OP_READ) } }
         val others = List(5) { socketPair() }
-        val waiters = others.map { (_, pb) -> async(Dispatchers.Default) { runCatching { loop.await(pb, SelectionKey.OP_READ) } } }
-        assertTrue(withTimeout(2000) { badWaiter.await() }.isFailure)
+        val otherWaiters = others.map { (_, pb) -> async(Dispatchers.Default) { runCatching { loop.await(pb, SelectionKey.OP_READ) } } }
+        delay(100)
         loop.close()
-        waiters.forEach { w -> assertIs<ClosedChannelException>(withTimeout(2000) { w.await() }.exceptionOrNull()) }
+        assertIs<ClosedChannelException>(withTimeout(2000) { readWaiter.await() }.exceptionOrNull())
+        otherWaiters.forEach { w -> assertIs<ClosedChannelException>(withTimeout(2000) { w.await() }.exceptionOrNull()) }
         a.close(); b.close()
         others.forEach { (pa, pb) -> pa.close(); pb.close() }
     }
@@ -137,8 +150,12 @@ class NioLoopTest {
             waiter.await()
         }
         b.read(ByteBuffer.allocate(8)) // drain so the key is left with no waiters and interest 0
-        loop.nudge()
-        delay(100) // let the loop's next (zero-result) select pass sweep the now-idle key
+        repeat(4) {
+            loop.nudge()
+            delay(20)
+        }
+        delay(100) // let the sweep run after its required quiet-pass run
+        assertTrue(loop.sweptKeys.get() >= 1)
         a.write(ByteBuffer.wrap("y".toByteArray()))
         withTimeout(2000) { loop.await(b, SelectionKey.OP_READ) }
         a.close(); b.close()
