@@ -483,6 +483,34 @@ class ProxyServerTest {
     }
 
     @Test
+    fun `pre-admission responses stay within the pending-heads cap`() {
+        start(maxPendingHeads = 2)
+
+        val first = Socket(loopback, server.localPort)
+        closeables += first
+        first.soTimeout = 5000
+        first.getOutputStream().write("CONNECT example.com:443 HTTP/1.1\r\n\r\n".toByteArray())
+        val firstHead = readHeadBlocking(first.getInputStream())
+        assertTrue(firstHead.startsWith("HTTP/1.1 403"), firstHead)
+
+        val second = Socket(loopback, server.localPort)
+        closeables += second
+        second.soTimeout = 5000
+        second.getOutputStream().write("CONNECT example.com:443 HTTP/1.1\r\n\r\n".toByteArray())
+        val secondHead = readHeadBlocking(second.getInputStream())
+        assertTrue(secondHead.startsWith("HTTP/1.1 403"), secondHead)
+
+        // Both connections are unadmitted (no slot) and deliberately left open without closing:
+        // their pending-head slot must still be held while their 403 response is drained, so a
+        // 3rd connection right behind them must still be rejected by the total cap.
+        val third = Socket(loopback, server.localPort)
+        closeables += third
+        third.soTimeout = 1000
+        val r = try { third.getInputStream().read() } catch (e: SocketException) { -1 }
+        assertEquals(-1, r, "the 3rd connection should be rejected while the first two are still draining")
+    }
+
+    @Test
     fun `oversized head without a blank line gets 400`() {
         // No SocketException tolerance here: the server now drains the unread request bytes
         // before closing, so the close is always a clean FIN and the full response always

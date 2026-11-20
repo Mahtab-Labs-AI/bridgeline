@@ -42,6 +42,7 @@ import java.nio.channels.SelectionKey
 import java.nio.channels.ServerSocketChannel
 import java.nio.channels.SocketChannel
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 /** `acceptLoop` failed to `accept()` a connection but the server socket itself is still usable. */
@@ -59,6 +60,21 @@ class ProxyServer(
     private val onError: (Throwable) -> Unit = {},
 ) {
     private class ProxyFailure(val response: HttpResponse) : Exception()
+
+    /** Releases one admitted connection's share of the per-peer and total pending-head caps,
+     *  exactly once no matter how many times (or from where) release() is called. Held for the
+     *  whole time a connection is unadmitted - including while its response is being drained
+     *  before close - so a slotless peer can't dodge the caps by sending a quick head and then
+     *  just sitting on the (rejected) response. */
+    private class PendingHead(private val r: Run, private val peer: InetAddress) {
+        private val released = AtomicBoolean(false)
+
+        fun release() {
+            if (!released.compareAndSet(false, true)) return
+            r.pendingHeads.computeIfPresent(peer) { _, count -> if (count <= 1) null else count - 1 }
+            r.pendingHeadsTotal.decrementAndGet()
+        }
+    }
 
     /** Everything that belongs to a single start()/stop() lifetime. A fresh instance per start()
      *  so a handler left over from a stopped run can only ever touch its own run's counters and
@@ -229,39 +245,37 @@ class ProxyServer(
         r.nio.closeChannel(client)
     }
 
-    private fun releasePendingHead(r: Run, peer: InetAddress) {
-        r.pendingHeads.computeIfPresent(peer) { _, count -> if (count <= 1) null else count - 1 }
-        r.pendingHeadsTotal.decrementAndGet()
-    }
-
     private suspend fun handle(r: Run, client: SocketChannel, peer: InetAddress) {
-        // Released exactly once, on every path: readHead success, throw, timeout, cancel, and
-        // the peer-outside-subnet early return below.
-        var headPending = true
+        // Held for the whole time this connection is unadmitted - released early in proxy() only
+        // once admission actually succeeds; every other path (including a drained rejection
+        // response) releases it here, in the outer finally, exactly once via the CAS in release().
+        val pendingHead = PendingHead(r, peer)
         try {
             if (!config.peerSubnet.contains(peer)) return
             val head = withTimeoutOrNull(config.headTimeoutMs) { readHead(r.nio, client) }
-            releasePendingHead(r, peer)
-            headPending = false
             val h = head ?: return
             when (val request = RequestParser.parse(h.text)) {
                 is ProxyRequest.Malformed -> respond(r.nio, client, HttpResponse.BAD_REQUEST)
                 is ProxyRequest.Local -> respond(r.nio, client, r.local.serve(request, peer))
                 is ProxyRequest.Connect ->
-                    proxy(r, client, peer, request.host, request.port, h.leftover, forward = null)
+                    proxy(r, client, peer, pendingHead, request.host, request.port, h.leftover, forward = null)
                 is ProxyRequest.Forward ->
-                    proxy(r, client, peer, request.host, request.port, h.leftover, forward = request)
+                    proxy(r, client, peer, pendingHead, request.host, request.port, h.leftover, forward = request)
             }
         } catch (e: CancellationException) {
             throw e
         } catch (e: HeadTooLargeException) {
-            runCatching { respond(r.nio, client, HttpResponse.BAD_REQUEST) }
+            try {
+                respond(r.nio, client, HttpResponse.BAD_REQUEST)
+            } catch (e: IOException) {
+                // Routine peer reset/abort while sending the 400: expected, not reported.
+            }
         } catch (e: IOException) {
             // Routine peer reset/abort: expected, not reported.
         } catch (e: Exception) {
             safeOnError(e)
         } finally {
-            if (headPending) releasePendingHead(r, peer)
+            pendingHead.release()
             r.inFlight.decrementAndGet()
             // A direct client.close() can defer the fd release (and the RST of an abortive close)
             // until the loop's selector wakes up and processes the cancelled key; closeChannel
@@ -275,12 +289,16 @@ class ProxyServer(
         r: Run,
         client: SocketChannel,
         peer: InetAddress,
+        pendingHead: PendingHead,
         host: String,
         port: Int,
         leftover: ByteArray,
         forward: ProxyRequest.Forward?,
     ) {
         val slot = registry.admittedSlot(peer) ?: return respond(r.nio, client, HttpResponse.FORBIDDEN)
+        // The peer is genuinely admitted now; it's no longer part of the pre-admission DoS surface
+        // the pending-head caps exist to bound, even though its response (or tunnel) isn't done yet.
+        pendingHead.release()
         if (forward != null && egress.isValidated) {
             Probes.match(forward)?.let { return respond(r.nio, client, it) }
         }
@@ -400,7 +418,7 @@ class ProxyServer(
         const val ACCEPT_BACKOFF_INITIAL_MS = 50L
         const val ACCEPT_BACKOFF_MAX_MS = 1000L
         const val ACCEPT_FAILURE_REPORT_INTERVAL_MS = 60_000L
-        const val DRAIN_TIMEOUT_MS = 1000L
+        const val DRAIN_TIMEOUT_MS = 250L
         const val DRAIN_MAX_BYTES = 64 * 1024
         const val DRAIN_BUFFER_SIZE = 4096
     }
