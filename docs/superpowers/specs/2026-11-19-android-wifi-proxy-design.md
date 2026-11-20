@@ -80,6 +80,7 @@ Desired state ("session should be running") and credentials persist in DataStore
 - Every proxy request: source IP must be bound to an active slot, else `403`.
 - Lowering `maxClients` below active slot count prompts the user to choose which slot(s) to revoke.
 - Revoke removes one slot and closes its tunnels; password change drops everyone.
+- **IP bindings are reset** (`ClientRegistry.clearBindings()`) whenever the group is torn down or recreated (`Degraded(LinkDown)`) or the password changes, because DHCP may hand a former client's address to a different device. Clients re-fetch their PAC on reconnect and rebind. When the P2P layer reports that a specific client left, `unbind(ip)` clears just that address.
 - A device that knows the Wi-Fi password but holds no slot can join Wi-Fi but every proxy request gets `403`.
 - Per-slot tunnel cap: 256 concurrent. No per-slot bandwidth shaping in v1; bandwidth is shared by ordinary TCP fairness across tunnels.
 
