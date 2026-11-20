@@ -26,6 +26,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import com.wifiproxy.app.session.LogEntry
 import com.wifiproxy.app.session.SessionRepository
+import com.wifiproxy.app.ui.ScreenTitle
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -39,8 +40,7 @@ fun DiagnosticsScreen(repository: SessionRepository, modifier: Modifier = Modifi
     val context = LocalContext.current
 
     Column(modifier = modifier.fillMaxSize().padding(16.dp)) {
-        Text(text = "Diagnostics", style = MaterialTheme.typography.titleMedium)
-        Spacer(modifier = Modifier.height(12.dp))
+        ScreenTitle(text = "Diagnostics")
 
         Button(
             onClick = {

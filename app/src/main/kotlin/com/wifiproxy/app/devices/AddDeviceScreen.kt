@@ -38,6 +38,7 @@ import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -57,6 +58,7 @@ import com.wifiproxy.app.session.DeviceInvite
 import com.wifiproxy.app.session.SessionRepository
 import com.wifiproxy.app.session.SlotUi
 import com.wifiproxy.app.ui.QrCode
+import com.wifiproxy.app.ui.ScreenTitle
 
 private data class ActiveInvite(val invite: DeviceInvite, val platform: ClientPlatform, val name: String)
 
@@ -71,11 +73,7 @@ fun AddDeviceScreen(repository: SessionRepository, modifier: Modifier = Modifier
     val full = session.slots.size >= session.maxClients
 
     Column(modifier = modifier.fillMaxSize().padding(16.dp)) {
-        Text(
-            text = "Devices ${session.slots.size}/${session.maxClients}",
-            style = MaterialTheme.typography.titleMedium,
-        )
-        Spacer(modifier = Modifier.height(12.dp))
+        ScreenTitle(text = "Devices", trailing = "${session.slots.size}/${session.maxClients}")
 
         Column(
             modifier = Modifier
@@ -129,7 +127,10 @@ fun AddDeviceScreen(repository: SessionRepository, modifier: Modifier = Modifier
     }
 
     activeInvite?.let { active ->
-        ModalBottomSheet(onDismissRequest = { activeInvite = null }) {
+        ModalBottomSheet(
+            onDismissRequest = { activeInvite = null },
+            sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+        ) {
             InviteSheetContent(active = active)
         }
     }

@@ -47,6 +47,7 @@ import com.wifiproxy.app.session.ClientPlatform
 import com.wifiproxy.app.session.SessionPhase
 import com.wifiproxy.app.session.SessionRepository
 import com.wifiproxy.app.session.SlotUi
+import com.wifiproxy.app.ui.ScreenTitle
 import com.wifiproxy.app.ui.color
 import com.wifiproxy.app.ui.formatBytes
 import com.wifiproxy.app.ui.label
@@ -63,6 +64,8 @@ fun HomeScreen(repository: SessionRepository, modifier: Modifier = Modifier) {
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
+        ScreenTitle(text = "Wi-Fi Proxy")
+
         StatusCard(phase = session.phase, degradedReason = session.degradedReason, ssid = session.ssid)
 
         StartStopButton(

@@ -1,5 +1,6 @@
 package com.wifiproxy.app.settings
 
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -26,6 +27,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -40,9 +42,11 @@ import com.wifiproxy.app.session.HostSettings
 import com.wifiproxy.app.session.PasswordStrength
 import com.wifiproxy.app.session.SessionRepository
 import com.wifiproxy.app.session.passwordStrength
+import com.wifiproxy.app.ui.ScreenTitle
 
 @Composable
 fun SettingsScreen(repository: SessionRepository, modifier: Modifier = Modifier) {
+    val savedSettings by repository.settings.collectAsState()
     val initial = remember { repository.settings.value }
     var suffix by remember { mutableStateOf(initial.ssidSuffix) }
     var password by remember { mutableStateOf(initial.password) }
@@ -83,6 +87,8 @@ fun SettingsScreen(repository: SessionRepository, modifier: Modifier = Modifier)
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(20.dp),
     ) {
+        ScreenTitle(text = "Settings")
+
         Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Text(text = "Network name", style = MaterialTheme.typography.titleMedium)
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -118,11 +124,13 @@ fun SettingsScreen(repository: SessionRepository, modifier: Modifier = Modifier)
                 modifier = Modifier.fillMaxWidth(),
             )
             PasswordStrengthMeter(password)
-            Text(
-                text = "Changing the password disconnects every connected device.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.error,
-            )
+            AnimatedVisibility(visible = password != savedSettings.password) {
+                Text(
+                    text = "Changing the password disconnects every connected device.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
         }
 
         Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
