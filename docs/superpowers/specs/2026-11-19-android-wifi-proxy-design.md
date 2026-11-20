@@ -182,7 +182,7 @@ In-app disclosure: "Web and most apps work. Calls, games and some apps won't." P
 
 ### Client onboarding
 
-- **iPhone:** scan Wi-Fi QR → open `<token>.mobileconfig` link → install profile in Settings (contains Wi-Fi payload with `ProxyType=Auto`, `ProxyPACURL`). Manual alternative: Wi-Fi (i) → Configure Proxy → Automatic → PAC URL.
+- **iPhone:** scan Wi-Fi QR → open `<token>.mobileconfig` link **in Safari** (only Safari hands profiles to Settings; a third-party default browser may not) → install profile in Settings (contains Wi-Fi payload with `ProxyType=Auto`, `ProxyPACURL`). Manual alternative: Wi-Fi (i) → Configure Proxy → Automatic → PAC URL.
 - **Android:** scan Wi-Fi QR → network → Edit → Advanced → Proxy → Proxy Auto-Config → PAC URL.
 
 ## 9. Expected client coverage
