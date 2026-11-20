@@ -76,4 +76,39 @@ class LocalContentTest {
             ProxyConfig(bindAddress = InetAddress.getByName("::"), peerSubnet = Cidr.parse("192.168.49.0/24"))
         }
     }
+
+    @Test
+    fun `config requires an IPv4 bind address`() {
+        assertFailsWith<IllegalArgumentException> {
+            ProxyConfig(bindAddress = InetAddress.getByName("fe80::1"), peerSubnet = Cidr.parse("192.168.49.0/24"))
+        }
+    }
+
+    @Test
+    fun `config rejects non-positive timeouts`() {
+        val bindAddress = InetAddress.getByName("192.168.49.1")
+        val peerSubnet = Cidr.parse("192.168.49.0/24")
+        assertFailsWith<IllegalArgumentException> {
+            ProxyConfig(bindAddress = bindAddress, peerSubnet = peerSubnet, idleTimeoutMs = 0)
+        }
+        assertFailsWith<IllegalArgumentException> {
+            ProxyConfig(bindAddress = bindAddress, peerSubnet = peerSubnet, pushIdleTimeoutMs = 0)
+        }
+        assertFailsWith<IllegalArgumentException> {
+            ProxyConfig(bindAddress = bindAddress, peerSubnet = peerSubnet, headTimeoutMs = 0)
+        }
+        assertFailsWith<IllegalArgumentException> {
+            ProxyConfig(bindAddress = bindAddress, peerSubnet = peerSubnet, connectTimeoutMs = 0)
+        }
+    }
+
+    @Test
+    fun `config toString never prints the wifi password`() {
+        val config = ProxyConfig(
+            bindAddress = InetAddress.getByName("192.168.49.1"),
+            peerSubnet = Cidr.parse("192.168.49.0/24"),
+            wifi = WifiCredentials("s", "password1"),
+        )
+        assertFalse("password1" in config.toString())
+    }
 }

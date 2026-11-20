@@ -1,6 +1,7 @@
 package com.wifiproxy.core
 
 import com.wifiproxy.core.net.Cidr
+import java.net.Inet4Address
 import java.net.InetAddress
 
 data class WifiCredentials(val ssid: String, val password: String) {
@@ -23,6 +24,11 @@ data class ProxyConfig(
 ) {
     init {
         require(!bindAddress.isAnyLocalAddress) { "refusing wildcard bind address $bindAddress" }
+        require(bindAddress is Inet4Address) { "bind address must be IPv4: $bindAddress" }
         require(port in 0..65535) { "port out of range: $port" }
+        require(idleTimeoutMs > 0) { "idleTimeoutMs must be positive" }
+        require(pushIdleTimeoutMs > 0) { "pushIdleTimeoutMs must be positive" }
+        require(headTimeoutMs > 0) { "headTimeoutMs must be positive" }
+        require(connectTimeoutMs > 0) { "connectTimeoutMs must be positive" }
     }
 }
