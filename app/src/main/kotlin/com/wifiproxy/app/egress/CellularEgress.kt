@@ -10,14 +10,12 @@ import android.os.CancellationSignal
 import com.wifiproxy.core.egress.Egress
 import com.wifiproxy.core.egress.EgressUnavailableException
 import com.wifiproxy.core.net.Cidr
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.withContext
 import java.io.IOException
-import java.net.Inet4Address
 import java.net.InetAddress
+import java.net.NetworkInterface
 import java.nio.channels.SocketChannel
 import java.util.concurrent.Executors
 
@@ -106,20 +104,25 @@ class CellularEgress(
 
     override suspend fun resolve(host: String): List<InetAddress> = resolver.resolve(_network.value, host)
 
+    // No withContext/dispatcher hop here, deliberately: open()+bindSocket() are quick local calls
+    // (ProxyServer already invokes this from Dispatchers.Default, not the NioLoop thread), and a
+    // suspending dispatcher switch gives cancellation a window to fire at the withContext resume
+    // point *after* the channel is open and bound but *before* it's returned to the caller — which
+    // would leak an already cellular-bound, live channel that nothing ever closes. Keeping this
+    // body synchronous (just `suspend` in the signature, as the Egress interface requires) means
+    // there is no suspension point between opening the channel and returning or closing it.
     override suspend fun newChannel(): SocketChannel {
         val network = _network.value ?: throw EgressUnavailableException("no cellular network")
-        return withContext(Dispatchers.IO) {
-            val channel = SocketChannel.open()
-            try {
-                network.bindSocket(channel.socket())
-                channel
-            } catch (e: Exception) {
-                channel.close()
-                if (_network.value == null) {
-                    throw EgressUnavailableException("cellular network lost while binding").apply { initCause(e) }
-                }
-                throw e as? IOException ?: IOException("failed to bind egress channel", e)
+        val channel = SocketChannel.open()
+        try {
+            network.bindSocket(channel.socket())
+            return channel
+        } catch (e: Exception) {
+            channel.close()
+            if (_network.value == null) {
+                throw EgressUnavailableException("cellular network lost while binding").apply { initCause(e) }
             }
+            throw e as? IOException ?: IOException("failed to bind egress channel", e)
         }
     }
 
@@ -128,23 +131,39 @@ class CellularEgress(
      * stacked CLAT, Wi-Fi STA, …), each as a /32 (IPv4) or /128 (IPv6) [Cidr]. Passed to
      * `DestinationFilter.default(...)` so the proxy never dials back into the host itself.
      *
-     * Uses `LinkProperties.getLinkAddresses()`: `getAllLinkAddresses()` (named in the design
-     * spec) is not present in the compileSdk 36 public SDK; the base link's addresses already
-     * include stacked-interface (CLAT) addresses on current Android versions.
+     * Unions two sources, since either alone misses something:
+     * - `LinkProperties` per [ConnectivityManager.getAllNetworks], via `getLinkAddresses()`
+     *   (`getAllLinkAddresses()`, named in the design spec, is not present in the compileSdk 36
+     *   public SDK);
+     * - [NetworkInterface.getNetworkInterfaces] for every *up* interface, which also catches the
+     *   stacked CLAT `v4-rmnet*` interface and anything the system doesn't expose as a `Network`.
+     *
+     * [hostCidrsFrom] does the actual dedupe/conversion; this method is just the (untestable on
+     * the JVM) Android-API collection step.
      */
     @Suppress("DEPRECATION") // getAllNetworks() is deprecated in favour of callbacks, but there is
     // no non-deprecated way to enumerate every currently known network on demand, which is
     // exactly what the spec asks for here; this is the call the design/plan name explicitly.
     fun hostAddresses(): List<Cidr> {
-        val addresses = mutableListOf<Cidr>()
+        val addresses = mutableListOf<InetAddress>()
         for (net in connectivityManager.allNetworks) {
             val linkProperties = connectivityManager.getLinkProperties(net) ?: continue
             for (linkAddress in linkProperties.linkAddresses) {
-                val prefix = if (linkAddress.address is Inet4Address) 32 else 128
-                addresses.add(Cidr(linkAddress.address, prefix))
+                addresses.add(linkAddress.address)
             }
         }
-        return addresses
+        // getNetworkInterfaces() is declared to throw SocketException on an I/O error reading the
+        // system's interface list; isUp() carries the same declaration per-interface. Either
+        // failing shouldn't discard what we already collected from ConnectivityManager above.
+        runCatching { NetworkInterface.getNetworkInterfaces() }.getOrNull()?.let { interfaces ->
+            for (iface in interfaces) {
+                if (!runCatching { iface.isUp }.getOrDefault(false)) continue
+                for (address in iface.inetAddresses) {
+                    addresses.add(address)
+                }
+            }
+        }
+        return hostCidrsFrom(addresses)
     }
 
     private fun queryDnsResolver(network: Network, host: String, onResult: (DnsOutcome) -> Unit): () -> Unit {
