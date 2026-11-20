@@ -78,7 +78,8 @@ Desired state ("session should be running") and credentials persist in DataStore
 - "Add device" creates a slot if `activeSlots < maxClients`, and shows its PAC URL `http://<goIp>:<port>/<token>.pac` (or `<token>.mobileconfig` for iPhone).
 - **Identity is the token, not the IP.** Each fetch of a slot's PAC binds that slot to the fetching IP, replacing any previous IP. Clients re-fetch PAC on reconnect, so a new DHCP lease or randomized MAC moves the slot instead of consuming a new one.
 - Every proxy request: source IP must be bound to an active slot, else `403`.
-- Lowering `maxClients` below active slot count prompts the user to choose which slot(s) to revoke.
+- Lowering `maxClients` below the active slot count is refused by `ClientRegistry.setMaxClients`; the UI first asks the user which slot(s) to revoke, then retries.
+- Slot records (id, name, token, createdAt) are persisted by the Android layer via `ClientRegistry.snapshot()` and passed back on restart; IP bindings are not persisted (clients re-fetch the PAC on reconnect). Tokens are redacted from every `toString()`.
 - Revoke removes one slot and closes its tunnels; password change drops everyone.
 - **IP bindings are reset** (`ClientRegistry.clearBindings()`) whenever the group is torn down or recreated (`Degraded(LinkDown)`) or the password changes, because DHCP may hand a former client's address to a different device. Clients re-fetch their PAC on reconnect and rebind. When the P2P layer reports that a specific client left, `unbind(ip)` clears just that address.
 - A device that knows the Wi-Fi password but holds no slot can join Wi-Fi but every proxy request gets `403`.
@@ -104,7 +105,9 @@ Desired state ("session should be running") and credentials persist in DataStore
 5. DNS via `cellNetwork.getAllByName()` (or `DnsResolver` bound to the network), with a TTL-respecting cache.
 6. Destination filter after resolution: reject loopback, RFC 1918, link-local, CGNAT `100.64.0.0/10`, `192.0.0.0/24` (includes Android's CLAT address `192.0.0.4`), the P2P subnet, **the host's own interface addresses** (cellular/Wi-Fi global IPv6 etc., as /32 and /128 — connecting to any local address reaches the host regardless of socket binding; the Android layer supplies them and refreshes them on network change), and IPv6 equivalents (`::/96`, `fc00::/7`, `fe80::/10`) → `403`. IPv4-mapped IPv6 addresses are unwrapped before checking. NAT64 (`64:ff9b::/96`) is deliberately **not** blocked — it carries all IPv4-only sites on IPv6-only carriers; decoding the embedded IPv4 is a possible follow-up.
 7. Open `SocketChannel`; `cellNetwork.bindSocket(channel.socket())` **before** `connect`. Happy-eyeballs: IPv6 first, IPv4 after 250 ms. No cellular network → immediate `503`.
-8. Bidirectional pump with pooled 64 KB direct buffers, `TCP_NODELAY`, kernel-default socket buffers, backpressure. Byte counts feed per-slot counters.
+8. Bidirectional pump with one 16 KB heap buffer per direction (no pool; revisit if profiling shows GC pressure), `TCP_NODELAY`, kernel-default socket buffers, backpressure. Byte counts feed per-slot counters (reported per write). Plain-HTTP forwards carry exactly one request per upstream connection (`Connection: close`); the tunnel closes when the response ends.
+9. **Per-direction failure policy.** A *read* failure means that side's peer is dead → the other direction is cancelled. A *write* failure only means the destination stopped accepting data → the other direction is left to drain (Linux/Android keep queued data readable after an RST). The tunnel returns a `TunnelResult(end, error, responseComplete)`; `responseComplete` is true once everything upstream sent reached the client followed by FIN.
+10. **Abort rule.** The client connection is aborted (`SO_LINGER(0)` → RST) only when the response to it was cut: `!responseComplete && (UPSTREAM_FAILED || forward && IDLE)`, or a forward cancelled by revoke/stop. Otherwise it is closed normally, so a connection-close-delimited response never looks complete when it wasn't, and a complete one is never destroyed.
 
 ### Listener binding
 
@@ -130,7 +133,8 @@ Idle tunnel timeout 5 min; 30 min for Apple push (destination port 5223 or `17.0
 | Wi-Fi off | `WIFI_P2P_STATE_CHANGED_ACTION` | `Degraded(WifiOff)`; notification action opens `Settings.Panel.ACTION_WIFI` (apps cannot enable Wi-Fi on API 29+) |
 | Airplane mode | `SystemMonitor` | Link + egress down; auto-recover on exit |
 | Process killed | `START_STICKY` + persisted desired state | Restore session; clients auto-rejoin (fixed credentials) |
-| Silent stall | `HealthWatchdog` (30 s) | Restart the failing component |
+| Silent stall | `HealthWatchdog` (30 s): `ProxyServer.isAccepting`, group exists, egress reachable | Restart the failing component |
+| Host interface addresses change | `LinkProperties` callback | `ProxyServer.updateFilter(DestinationFilter.default(p2pSubnet, hostAddresses))` |
 
 ### Needs the user → `Failed(needsUser)` with a specific message
 
@@ -141,7 +145,11 @@ Idle tunnel timeout 5 min; 30 min for Apple push (destination port 5223 or `17.0
 
 ### Proxy errors
 
-`403` unknown source IP or blocked destination · `503` no egress or tunnel cap · `502` DNS failure / connect refused · `504` connect timeout · `400` malformed request (close connection). Each tunnel is isolated; one failure never affects others.
+`403` unknown source IP or blocked destination · `503` no egress (`isAvailable == false` or `EgressUnavailableException` mid-dial) or tunnel cap · `502` DNS failure / connect refused · `504` connect timeout (`SocketTimeoutException`) · `400` malformed request or head > 16 KB. Error responses are followed by a short lingering drain (≤ 250 ms / 64 KB) so the client actually receives them. Each tunnel is isolated; one failure never affects others. Routine peer resets are not reported as errors; `onError` is reserved for non-I/O bugs and accept-loop failures.
+
+### Overload protection (pre-admission)
+
+Before a connection is admitted it counts against three caps; over any cap it is reset immediately (`SO_LINGER(0)`): `maxConnections` (832 in flight), `maxPendingHeads` (64 unadmitted in total), `maxPendingHeadsPerPeer` (16 per IP). A connection holds its pending-head slot until admission, including any drained 403/400/PAC response, so a slotless Wi-Fi peer cannot exhaust fds/heap or crowd admitted clients out. The accept loop survives `accept()` failures (e.g. EMFILE) with backoff, reports them rate-limited, and exposes `ProxyServer.isAccepting` for `HealthWatchdog`. All server state is per run, so `stop()`/`start()` never inherits counters.
 
 ### Preflight (before every start)
 
