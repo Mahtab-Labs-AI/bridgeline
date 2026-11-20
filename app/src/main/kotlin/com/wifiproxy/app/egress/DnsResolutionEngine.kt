@@ -32,21 +32,31 @@ fun interface DnsQuery<N : Any> {
 /**
  * Resolves hostnames one network at a time: an IP-literal short-circuit, a 5 s timeout that
  * surfaces as [SocketTimeoutException] (never a coroutine `TimeoutCancellationException`), and a
- * TTL cache keyed by (network, host).
+ * TTL cache keyed by (network, host), bounded to [maxCacheEntries] entries (I6, M2).
  *
  * `DnsResolver`'s answer callback doesn't expose the record TTL, so every entry is cached for a
  * fixed [ttlMillis] (60 s by default) rather than honouring the real one.
+ *
+ * [parseLiteral] decides what counts as an IP literal (and is handed [host] without ever touching
+ * [network] or the cache): it defaults to [strictParseIpLiteral], a pure JVM-only parser, so plain
+ * unit tests never depend on Android. [com.wifiproxy.app.egress.CellularEgress] overrides it in
+ * production with `android.net.InetAddresses.isNumericAddress`/`parseNumericAddress` (I6).
  */
 class DnsResolutionEngine<N : Any>(
     private val query: DnsQuery<N>,
     private val clock: () -> Long = System::currentTimeMillis,
     private val timeoutMillis: Long = DEFAULT_TIMEOUT_MILLIS,
     private val ttlMillis: Long = DEFAULT_TTL_MILLIS,
+    private val maxCacheEntries: Int = DEFAULT_MAX_CACHE_ENTRIES,
+    private val parseLiteral: (String) -> InetAddress? = ::strictParseIpLiteral,
 ) {
     private data class CacheKey<N>(val network: N, val host: String)
     private class CacheEntry(val addresses: List<InetAddress>, val expiresAt: Long)
 
     private val cache = ConcurrentHashMap<CacheKey<N>, CacheEntry>()
+
+    /** Test-only visibility into the cache's current size, to assert [maxCacheEntries] is honoured. */
+    internal val cacheSizeForTesting: Int get() = cache.size
 
     /**
      * Resolves [host] on [network].
@@ -57,7 +67,7 @@ class DnsResolutionEngine<N : Any>(
      * touch [network] or the cache.
      */
     suspend fun resolve(network: N?, host: String): List<InetAddress> {
-        parseIpLiteral(host)?.let { return listOf(it) }
+        parseLiteral(host)?.let { return listOf(it) }
         if (network == null) throw EgressUnavailableException("no cellular network")
 
         val key = CacheKey(network, host)
@@ -67,8 +77,27 @@ class DnsResolutionEngine<N : Any>(
         }
 
         val addresses = queryAndAwait(network, host)
-        cache[key] = CacheEntry(addresses, clock() + ttlMillis)
+        recordCacheEntry(key, CacheEntry(addresses, clock() + ttlMillis))
         return addresses
+    }
+
+    /** Bounds the cache to [maxCacheEntries] (M2): sweeps expired entries first, then - if every
+     *  live entry is still within its TTL - drops the oldest-inserted entries down to the cap.
+     *  `ConcurrentHashMap` has no access-order eviction of its own, so this is a size cap with an
+     *  expiry-aware eviction order rather than a true LRU, which is enough to keep an unbounded
+     *  number of distinct hostnames from pinning memory forever. */
+    private fun recordCacheEntry(key: CacheKey<N>, entry: CacheEntry) {
+        cache[key] = entry
+        if (cache.size <= maxCacheEntries) return
+        val now = clock()
+        val iterator = cache.entries.iterator()
+        while (iterator.hasNext() && cache.size > maxCacheEntries) {
+            if (iterator.next().value.expiresAt <= now) iterator.remove()
+        }
+        if (cache.size > maxCacheEntries) {
+            val overflow = cache.size - maxCacheEntries
+            cache.keys.asSequence().take(overflow).toList().forEach(cache::remove)
+        }
     }
 
     private suspend fun queryAndAwait(network: N, host: String): List<InetAddress> {
@@ -99,5 +128,6 @@ class DnsResolutionEngine<N : Any>(
     companion object {
         const val DEFAULT_TIMEOUT_MILLIS = 5_000L
         const val DEFAULT_TTL_MILLIS = 60_000L
+        const val DEFAULT_MAX_CACHE_ENTRIES = 512
     }
 }

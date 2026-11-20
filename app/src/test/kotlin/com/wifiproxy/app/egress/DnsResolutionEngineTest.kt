@@ -153,4 +153,31 @@ class DnsResolutionEngineTest {
 
         assertEquals(2, fakeQuery.queryCalls)
     }
+
+    // --- I6: malformed-but-literal-shaped input must go through the query path, never getByName --
+
+    @Test
+    fun `malformed literal-shaped hosts are queried, not short-circuited`() = runTest {
+        for (host in listOf("999.1.1.1", "010.1.1.1", "foo:bar")) {
+            val answer = listOf(InetAddress.getByName("93.184.216.34"))
+            val fakeQuery = FakeDnsQuery(onQuery = { _, _ -> DnsOutcome.Answer(answer) })
+            val engine = DnsResolutionEngine(query = fakeQuery)
+
+            val result = engine.resolve(FakeNetwork(1), host)
+
+            assertEquals(answer, result, "unexpected result for host=$host")
+            assertEquals(1, fakeQuery.queryCalls, "host=$host should have gone to the query path")
+        }
+    }
+
+    @Test
+    fun `cache is bounded to maxCacheEntries`() = runTest {
+        val fakeQuery = FakeDnsQuery(onQuery = { _, host -> DnsOutcome.Answer(listOf(InetAddress.getByName("93.184.216.34"))) })
+        val engine = DnsResolutionEngine(query = fakeQuery, maxCacheEntries = 8)
+        val network = FakeNetwork(1)
+
+        repeat(20) { i -> engine.resolve(network, "host-$i.example.com") }
+
+        assertTrue(engine.cacheSizeForTesting <= 8)
+    }
 }

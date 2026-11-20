@@ -2,6 +2,7 @@ package com.wifiproxy.app.egress
 
 import android.net.ConnectivityManager
 import android.net.DnsResolver
+import android.net.InetAddresses
 import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
@@ -17,6 +18,7 @@ import java.io.IOException
 import java.net.InetAddress
 import java.net.NetworkInterface
 import java.nio.channels.SocketChannel
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
 /**
@@ -32,6 +34,12 @@ interface SessionEgress : Egress {
     /** Fires (on an arbitrary thread) whenever the tracked network's link addresses may have
      *  changed; the controller refreshes the proxy's destination filter in response. */
     var onLinkChange: (() -> Unit)?
+
+    /** Increments once per *distinct* network handed to the controller by `onAvailable` (I5): the
+     *  controller collects this (skipping the first value it observes) to know when it must stop
+     *  and restart the proxy server against the new network rather than leave tunnels bound to a
+     *  dead one. */
+    val networkGeneration: StateFlow<Long>
 
     fun start()
     fun stop()
@@ -71,36 +79,57 @@ class CellularEgress(
     override val isValidated: Boolean
         get() = _isValidated.value
 
+    private val _networkGeneration = MutableStateFlow(0L)
+
+    override val networkGeneration: StateFlow<Long> = _networkGeneration.asStateFlow()
+
     /**
      * Fires (on the connectivity callback thread) whenever the tracked network's
      * [LinkProperties] change. Callers should treat this as a hint to recompute [hostAddresses].
      */
     override var onLinkChange: (() -> Unit)? = null
 
-    // Lives for the process; DnsResolver queries are infrequent enough that a single thread is
-    // plenty, and there is no restart cost worth tearing this down across start()/stop() cycles.
-    private val dnsExecutor = Executors.newSingleThreadExecutor { runnable ->
-        Thread(runnable, "CellularEgress-dns")
-    }
+    // Recreated in start() and shut down in stop() (M1) rather than living for the process: a
+    // leaked single-thread executor per CellularEgress instance (the service builds a fresh one on
+    // every start) would otherwise never be reclaimed.
+    @Volatile
+    private var dnsExecutor: ExecutorService? = null
 
-    private val resolver = DnsResolutionEngine<Network>(query = ::queryDnsResolver)
+    private val resolver = DnsResolutionEngine<Network>(
+        query = ::queryDnsResolver,
+        parseLiteral = { host -> if (InetAddresses.isNumericAddress(host)) InetAddresses.parseNumericAddress(host) else null },
+    )
 
+    // @Volatile so a late callback queued just before stop()'s unregister (and delivered just
+    // after) always sees the field update promptly (I3): every override below checks `callback
+    // !== this` first and returns immediately if it's no longer the installed callback.
+    @Volatile
     private var callback: ConnectivityManager.NetworkCallback? = null
 
     /** Starts tracking the cellular network. Call [stop] before calling this again. */
     override fun start() {
         check(callback == null) { "CellularEgress already started" }
+        dnsExecutor = Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "CellularEgress-dns") }
         val request = NetworkRequest.Builder()
             .addTransportType(NetworkCapabilities.TRANSPORT_CELLULAR)
             .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
             .build()
         val newCallback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
+                if (callback !== this) return
+                val previous = _network.value
                 _network.value = network
                 _available.value = true
+                if (previous != network) {
+                    // I5: a distinct network means any earlier validation no longer applies, and
+                    // the controller must rebuild the proxy server against the new network.
+                    _isValidated.value = false
+                    _networkGeneration.value += 1
+                }
             }
 
             override fun onLost(network: Network) {
+                if (callback !== this) return
                 if (_network.value == network) {
                     _network.value = null
                     _available.value = false
@@ -109,23 +138,42 @@ class CellularEgress(
             }
 
             override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
+                if (callback !== this) return
                 if (_network.value == network) {
                     _isValidated.value = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
                 }
             }
 
             override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
+                if (callback !== this) return
                 onLinkChange?.invoke()
             }
         }
-        callback = newCallback
+        // Register first, then publish the field (I3): if requestNetwork throws, callback stays
+        // null, so a retried start() sees a clean slate instead of permanently failing its own
+        // "already started" check, and stop() never has to unregister a callback that was never
+        // actually registered.
         connectivityManager.requestNetwork(request, newCallback)
+        callback = newCallback
     }
 
-    /** Stops tracking the cellular network. Safe to call when not started. */
+    /** Stops tracking the cellular network. Safe to call when not started, and tolerates
+     *  `unregisterNetworkCallback` throwing [IllegalArgumentException] for a callback the system
+     *  never actually registered (I3). */
     override fun stop() {
-        callback?.let { connectivityManager.unregisterNetworkCallback(it) }
+        val current = callback
         callback = null
+        if (current != null) {
+            try {
+                connectivityManager.unregisterNetworkCallback(current)
+            } catch (_: IllegalArgumentException) {
+                // Never registered (requestNetwork threw before `callback` was published) or
+                // already unregistered by an earlier stop() - either way, there is nothing left to
+                // undo.
+            }
+        }
+        dnsExecutor?.shutdown()
+        dnsExecutor = null
         _network.value = null
         _available.value = false
         _isValidated.value = false
@@ -196,12 +244,17 @@ class CellularEgress(
     }
 
     private fun queryDnsResolver(network: Network, host: String, onResult: (DnsOutcome) -> Unit): () -> Unit {
+        val executor = dnsExecutor ?: run {
+            // stop() raced the query past CellularEgress's own lifetime; fail it rather than NPE.
+            onResult(DnsOutcome.Failure(EgressUnavailableException("egress stopped")))
+            return {}
+        }
         val signal = CancellationSignal()
         DnsResolver.getInstance().query(
             network,
             host,
             DnsResolver.FLAG_EMPTY,
-            dnsExecutor,
+            executor,
             signal,
             object : DnsResolver.Callback<List<InetAddress>> {
                 override fun onAnswer(answer: List<InetAddress>, rcode: Int) {
