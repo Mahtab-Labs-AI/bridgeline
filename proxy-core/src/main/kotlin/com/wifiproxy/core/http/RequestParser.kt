@@ -19,9 +19,14 @@ sealed interface ProxyRequest {
                 .map { it.trim().lowercase() }
                 .filter { it.isNotEmpty() }
                 .toSet()
-            val kept = headers.filter { (name, _) -> name.lowercase().let { it !in HOP_BY_HOP && it !in listed } }
+            // Never treat framing headers as Connection-listed
+            val effectiveListed = listed - setOf("host", "content-length", "transfer-encoding")
+            val kept = headers.filter { (name, _) ->
+                val lower = name.lowercase()
+                lower !in HOP_BY_HOP && lower !in effectiveListed && !lower.equals("host", ignoreCase = true)
+            }
             val sb = StringBuilder().append(method).append(' ').append(target).append(' ').append(version).append("\r\n")
-            if (kept.none { it.first.equals("Host", ignoreCase = true) }) sb.append("Host: ").append(hostHeader()).append("\r\n")
+            sb.append("Host: ").append(hostHeader()).append("\r\n")
             kept.forEach { (name, value) -> sb.append(name).append(": ").append(value).append("\r\n") }
             sb.append("Connection: close\r\n\r\n")
             return sb.toString().toByteArray(Charsets.ISO_8859_1)
@@ -48,17 +53,45 @@ object RequestParser {
     /** [head] is the request head without the terminating blank line. */
     fun parse(head: String): ProxyRequest {
         val lines = head.split("\r\n")
+
+        // Strict character validation: reject any line containing '\r', '\n', or '\u0000'
+        for (line in lines) {
+            if ('\r' in line || '\n' in line || '\u0000' in line) {
+                return ProxyRequest.Malformed("bad characters")
+            }
+        }
+
         val parts = lines.first().split(' ')
         if (parts.size != 3) return ProxyRequest.Malformed("bad request line")
         val (method, target, version) = parts
-        if (method.isEmpty() || !version.startsWith("HTTP/1.")) return ProxyRequest.Malformed("unsupported version")
+
+        if (method.isEmpty()) return ProxyRequest.Malformed("bad request line")
+
+        // Accept only HTTP/1.1 or HTTP/1.0
+        if (version != "HTTP/1.1" && version != "HTTP/1.0") {
+            return ProxyRequest.Malformed("unsupported version")
+        }
 
         val headers = ArrayList<Pair<String, String>>()
         for (line in lines.drop(1)) {
-            if (line.isEmpty()) continue
+            // Reject internal blank lines
+            if (line.isEmpty()) return ProxyRequest.Malformed("bad header")
+
+            // Reject obs-fold (line starting with space or tab)
+            if (line.startsWith(' ') || line.startsWith('\t')) {
+                return ProxyRequest.Malformed("bad header")
+            }
+
             val colon = line.indexOf(':')
             if (colon <= 0) return ProxyRequest.Malformed("bad header")
-            headers += line.substring(0, colon).trim() to line.substring(colon + 1).trim()
+
+            val rawName = line.substring(0, colon)
+            // Reject if raw name is empty or contains whitespace
+            if (rawName.isEmpty() || rawName.any { it.isWhitespace() }) {
+                return ProxyRequest.Malformed("bad header")
+            }
+
+            headers += rawName.trim() to line.substring(colon + 1).trim()
         }
 
         return when {
@@ -98,6 +131,10 @@ object RequestParser {
             val close = text.indexOf(']')
             if (close < 0) return null
             host = text.substring(1, close)
+            // Reject zone IDs (%)
+            if ('%' in host) return null
+            // Reject non-IPv6 addresses (must contain ':')
+            if (':' !in host) return null
             val after = text.substring(close + 1)
             portText = when {
                 after.isEmpty() -> null

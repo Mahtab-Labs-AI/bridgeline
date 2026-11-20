@@ -92,4 +92,30 @@ class RequestParserTest {
         )
         assertTrue(!HttpResponse(204, "No Content").toBytes().text().contains("Content-Length"))
     }
+
+    @Test
+    fun `upstream head replaces a mismatched or duplicate host`() {
+        val r = parse("GET http://a.com/ HTTP/1.1\r\nHost: b.com\r\nHost: c.com") as Forward
+        assertEquals("GET / HTTP/1.1\r\nHost: a.com\r\nConnection: close\r\n\r\n", r.upstreamHead().text())
+    }
+
+    @Test
+    fun `connection cannot strip framing headers`() {
+        val r = parse("POST http://a.com/ HTTP/1.1\r\nConnection: content-length, transfer-encoding\r\nContent-Length: 3") as Forward
+        assertTrue(r.upstreamHead().text().contains("Content-Length: 3"))
+    }
+
+    @Test
+    fun `strict character and version validation`() {
+        listOf(
+            "GET http://a/ HTTP/1.1\nX: y",  // bare LF
+            "GET http://a/ HTTP/1.1\r\nX: a\u0000b",  // NUL in header value
+            "GET http://a/ HTTP/1.10",  // HTTP/1.10 not allowed
+            "GET http://a/ HTTP/1.1\r\n Folded: x",  // obs-fold (line starts with space)
+            "GET http://a/ HTTP/1.1\r\nBad Name: x",  // header name contains space (before colon)
+            "GET http://a/ HTTP/1.1\r\n\r\nX: y",  // internal blank line
+            "CONNECT [fe80::1%wlan0]:443 HTTP/1.1",  // zone ID
+            "CONNECT [example.com]:443 HTTP/1.1",  // non-IPv6 in brackets
+        ).forEach { assertIs<Malformed>(parse(it), it) }
+    }
 }
