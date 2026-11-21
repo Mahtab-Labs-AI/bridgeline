@@ -93,9 +93,10 @@ private class FakeSessionEgress(available: Boolean = true) : SessionEgress {
 /** A controllable [SessionServer]: [isAccepting] can be forced false to drive the watchdog,
  *  [startThrows]/[stopThrows] drive the C1/I2 rollback paths, and [onStart] is a synchronous hook
  *  invoked from inside [start] - used to deterministically interleave a concurrent [stop] call
- *  exactly while a (virtual-time) start is "in flight" (C2). */
+ *  exactly while a (virtual-time) start is "in flight" (C2). [onRevoke] does the same for [revoke]. */
 private class FakeSessionServer(
     private val onStart: (() -> Unit)? = null,
+    private val onRevoke: (() -> Unit)? = null,
 ) : SessionServer {
     override var isAccepting: Boolean = true
         private set
@@ -128,6 +129,7 @@ private class FakeSessionServer(
 
     override fun revoke(slotId: String): Boolean {
         revokedIds.add(slotId)
+        onRevoke?.invoke()
         return true
     }
 
@@ -1005,5 +1007,61 @@ class SessionControllerTest {
         assertEquals(1, egress.stopCalls)
         assertEquals(2, server.startCalls)
         assertEquals(1, server.stopCalls)
+    }
+    // --- Task 7: revoking an inactive saved device; revoke racing teardown -------------------------
+
+    private fun storedSlots(n: Int) = (1..n).map {
+        PersistedSlot(SlotRecord("id-$it", "Phone $it", "token-$it".padEnd(22, 'x'), it.toLong()), ClientPlatform.ANDROID)
+    }
+
+    @Test
+    fun `revoking an inactive saved device removes it from storage without going through a server`() = runTest {
+        val link = FakeLink()
+        val slots = MemorySlots(storedSlots(4))
+        val servers = mutableListOf<Pair<ProxyConfig, FakeSessionServer>>()
+        val c = controller(scope = backgroundScope, link = link, slots = slots, config = WIFI_ONLY, servers = servers)
+        c.start(); runCurrent(); link.up(); runCurrent()
+        assertEquals(listOf("id-1", "id-2", "id-3"), c.registry!!.slots().map { it.id })
+
+        assertTrue(c.revoke("id-4"))
+        assertEquals(listOf("id-1", "id-2", "id-3"), slots.saved.map { it.record.id })
+        assertTrue(servers.all { it.second.revokedIds.isEmpty() })
+
+        // It stays gone across a restart: three saved devices, three seats, none inactive.
+        c.stop(); runCurrent(); c.start(); runCurrent()
+        assertEquals(listOf("id-1", "id-2", "id-3"), c.registry!!.slots().map { it.id })
+    }
+
+    // The revoke runs on the caller's thread while a stop's teardown runs on the scope; teardown
+    // clears the inactive list. The persist that follows the server revoke must still write the
+    // inactive devices captured at the top of revoke(), never drop them.
+    @Test
+    fun `a revoke racing teardown never drops the inactive saved devices`() = runTest {
+        val link = FakeLink()
+        val slots = MemorySlots(storedSlots(4))
+        lateinit var c: SessionController
+        var stopDuringRevoke = false
+        c = SessionController(
+            egress = FakeSessionEgress(),
+            link = link,
+            slots = slots,
+            config = { WIFI_ONLY },
+            serverFactory = SessionServerFactory { _, _, _, _, _ ->
+                FakeSessionServer(onRevoke = {
+                    if (stopDuringRevoke) {
+                        c.stop()
+                        testScheduler.runCurrent()
+                    }
+                })
+            },
+            scope = backgroundScope,
+            now = { 0L },
+        )
+        c.start(); runCurrent(); link.up(); runCurrent()
+
+        stopDuringRevoke = true
+        assertTrue(c.revoke("id-1"))
+        assertEquals(SessionPhase.IDLE, c.state.value)
+        assertTrue(slots.saved.any { it.record.id == "id-4" })
     }
 }

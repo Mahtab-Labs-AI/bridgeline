@@ -194,6 +194,11 @@ class SessionController(
     /** Held by [doStart], [doStop] and [shutdown] for their whole run; see the class KDoc. */
     private val lifecycle = Mutex()
 
+    /** Guards reading [activeRegistry], [inactiveSlots] and [platforms] together ([captureSeats])
+     *  against [teardown] clearing them: [addDevice] and [revoke] run on the caller's thread, so a
+     *  teardown on [scope] can land between their own reads and their [persist]. */
+    private val seatsLock = Any()
+
     /** The registry backing the live session, or null while not running. [ServiceSessionRepository]
      *  polls [ClientRegistry.slots] on this for live per-device counters. */
     val registry: ClientRegistry? get() = activeRegistry
@@ -569,10 +574,12 @@ class SessionController(
         wifiServer = null
         lastWifiServer = null
         usbServer = null
-        activeRegistry = null
+        synchronized(seatsLock) {
+            activeRegistry = null
+            platforms.clear()
+            inactiveSlots = emptyList()
+        }
         sessionConfig = null
-        platforms.clear()
-        inactiveSlots = emptyList()
         _degradedReason.value = null
         _state.value = SessionPhase.IDLE
         onIdle?.invoke()
@@ -603,11 +610,11 @@ class SessionController(
     fun addDevice(name: String, platform: ClientPlatform): Slot? {
         val phase = _state.value
         if (phase != SessionPhase.RUNNING && phase != SessionPhase.DEGRADED) return null
-        val registry = activeRegistry ?: return null
+        val snap = captureSeats() ?: return null
         if (link.state.value !is LinkState.Up) return null
-        val slot = registry.addSlot(name) ?: return null
+        val slot = snap.registry.addSlot(name) ?: return null
         platforms[slot.id] = platform
-        persist(registry)
+        persist(snap.registry, snap.inactive, snap.platforms + (slot.id to platform))
         appendLog("Device added")
         return slot
     }
@@ -621,9 +628,25 @@ class SessionController(
     /** Goes through [SessionServer.revoke] (in production, `ProxyServer.revoke`), never the
      *  registry directly, so the slot's live tunnels are cancelled too. A Wi-Fi slot goes through
      *  the Wi-Fi server - the running one, else the last stopped one, else the USB one; with none
-     *  at all, through a never-started server, which has no tunnels and just removes the slot. */
+     *  at all, through a never-started server, which has no tunnels and just removes the slot.
+     *
+     *  A saved device that is inactive this session (no free seat, so never in the registry and
+     *  without tunnels) is simply dropped from the inactive list and from storage.
+     *
+     *  Racing teardown: the registry, the inactive list and the platforms are captured together
+     *  at the top ([captureSeats]) and that capture is what gets persisted, so a teardown landing
+     *  mid-revoke can't make the persist drop the inactive devices or forget their platforms. */
     fun revoke(slotId: String): Boolean {
-        val registry = activeRegistry ?: return false
+        val snap = captureSeats() ?: return false
+        val registry = snap.registry
+        if (snap.inactive.any { it.record.id == slotId }) {
+            val remaining = snap.inactive.filterNot { it.record.id == slotId }
+            synchronized(seatsLock) { if (activeRegistry === registry) inactiveSlots = remaining }
+            platforms.remove(slotId)
+            persist(registry, remaining, snap.platforms - slotId)
+            appendLog("Inactive device removed")
+            return true
+        }
         if (registry.slots().any { it.id == slotId && it.pinned }) return usbServer?.revoke(slotId) ?: false
         // The never-started server's filter is never consulted, so it gets the static default
         // rather than buildFilter(), which does IPC on this (caller's) thread.
@@ -637,15 +660,27 @@ class SessionController(
         val revoked = server.revoke(slotId)
         if (revoked) {
             platforms.remove(slotId)
-            persist(registry)
+            persist(registry, snap.inactive, snap.platforms - slotId)
         }
         return revoked
     }
 
-    private fun persist(registry: ClientRegistry) {
+    /** What [persist] writes alongside the registry, read together under [seatsLock]. */
+    private class SeatsSnapshot(
+        val registry: ClientRegistry,
+        val inactive: List<PersistedSlot>,
+        val platforms: Map<String, ClientPlatform>,
+    )
+
+    /** Null while no session is running (or [teardown] already cleared it). */
+    private fun captureSeats(): SeatsSnapshot? = synchronized(seatsLock) {
+        activeRegistry?.let { SeatsSnapshot(it, inactiveSlots, platforms.toMap()) }
+    }
+
+    private fun persist(registry: ClientRegistry, inactive: List<PersistedSlot>, platforms: Map<String, ClientPlatform>) {
         try {
             val active = registry.snapshot().map { PersistedSlot(it, platforms[it.id] ?: ClientPlatform.ANDROID) }
-            slots.save(active + inactiveSlots)
+            slots.save(active + inactive)
         } catch (e: Exception) {
             appendLog("Couldn't save devices: ${e::class.simpleName}")
         }

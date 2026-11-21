@@ -8,6 +8,8 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.net.ConnectivityManager
+import android.net.wifi.WifiManager
+import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
@@ -17,12 +19,13 @@ import androidx.core.app.NotificationCompat
 import com.wifiproxy.app.MainActivity
 import com.wifiproxy.app.egress.CellularEgress
 import com.wifiproxy.app.session.SessionPhase
+import com.wifiproxy.app.settings.AppPreferences
+import com.wifiproxy.app.settings.HostConfigSource
 import com.wifiproxy.app.ui.formatBytes
-import com.wifiproxy.app.wifi.LinkConfig
-import com.wifiproxy.app.wifi.LinkManager
+import com.wifiproxy.app.wifi.AndroidP2pApi
 import com.wifiproxy.app.wifi.LinkState
-import com.wifiproxy.app.wifi.PersistedSlot
-import com.wifiproxy.app.wifi.SlotPersistence
+import com.wifiproxy.app.wifi.P2pGroupLink
+import com.wifiproxy.app.wifi.SlotStore
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -30,9 +33,6 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.isActive
@@ -40,6 +40,11 @@ import kotlinx.coroutines.launch
 
 private const val CHANNEL_ID = "usb_sharing"
 private const val NOTIFICATION_ID = 1
+
+/** The "Sharing stopped. Tap to resume." notice ([postStoppedNotification]); a separate ID from
+ *  the foreground one so [removeNotification] (which every path to IDLE and onDestroy runs) never
+ *  cancels it. */
+private const val STOPPED_NOTIFICATION_ID = 2
 private const val TAG = "ProxySessionService"
 
 /** Safety cap so a leaked wake lock can't drain the battery forever; [startWakeLockManagement]
@@ -80,15 +85,25 @@ class ProxySessionService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + serial + exceptionHandler)
 
     private var controller: SessionController? = null
+
+    /** Created on Main in [buildController]; closed on `serial` after [onDestroy]'s shutdown (see
+     *  there), never before, since that shutdown's `link.stop()` still needs it to remove the group. */
+    private var p2pApi: AndroidP2pApi? = null
+
+    // Lazy: applicationContext only exists once the service is attached (before onCreate).
+    private val prefs by lazy { AppPreferences(applicationContext) }
+    private val hostConfig by lazy { HostConfigSource.forContext(applicationContext) }
+
     private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
     private var wakeLockJob: Job? = null
     private var notificationJob: Job? = null
 
     /** Every call into [SessionController.onIdle] is re-posted through this (R3): that callback
-     *  can run on the serial worker thread (during a normal `doStop`/rolled-back `doStart`) or on
-     *  the background shutdown thread ([onDestroy]'s [shutdownBlocking] path) - never reliably on
-     *  Main - but everything it touches here ([currentStartId], [controller], [notificationJob],
-     *  the notification APIs) is Main-confined. */
+     *  can run on the serial worker thread (during a normal `doStop`/rolled-back `doStart`, or
+     *  [onDestroy]'s scheduled [SessionController.shutdown]) - never reliably on Main - but
+     *  everything it touches here ([currentStartId], [controller], [notificationJob], the
+     *  notification APIs) is Main-confined. */
     private val mainHandler = Handler(Looper.getMainLooper())
 
     /** The most recent `startId` seen by [onStartCommand], always what [stopSelf] is called with
@@ -112,7 +127,10 @@ class ProxySessionService : Service() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
-        startForeground(NOTIFICATION_ID, buildNotification(SessionPhase.STARTING, null, 0, 0))
+        // A refusal here (a sticky restart in the background, API 31+) is handled by
+        // onStartCommand, which always follows: its Start path calls enterForeground again and,
+        // refused again, stops the service; its Stop and declined-restart paths stop it anyway.
+        enterForeground(buildNotification(SessionPhase.STARTING, null, 0, 0))
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -120,6 +138,7 @@ class ProxySessionService : Service() {
         if (intent?.action == ACTION_STOP) {
             // An explicit Stop always wins over an earlier pending restart (M-b).
             pendingStart = false
+            prefs.sessionDesired = false
             val c = controller
             if (c == null || c.state.value == SessionPhase.IDLE) {
                 // Nothing to stop; don't wait on a phase transition that will never come.
@@ -129,6 +148,14 @@ class ProxySessionService : Service() {
             }
             return START_NOT_STICKY
         }
+
+        // (Spec §3) A null intent is a START_STICKY restart after process death: resume sharing
+        // only if the user still wanted it when the process died.
+        if (intent == null && !prefs.sessionDesired) {
+            stopSelf(startId)
+            return START_NOT_STICKY
+        }
+        prefs.sessionDesired = true
 
         val c = controller ?: buildController().also { controller = it }
         // Called unconditionally, not only when state == IDLE (R3): Android requires a
@@ -148,7 +175,10 @@ class ProxySessionService : Service() {
         } else {
             currentNotification(phase, c.degradedReason.value)
         }
-        startForeground(NOTIFICATION_ID, notification)
+        if (!enterForeground(notification)) {
+            onForegroundRefused()
+            return START_NOT_STICKY
+        }
         when (phase) {
             SessionPhase.IDLE -> {
                 // (R3c) Restarted next to c.start(), not left to whatever buildController wired up
@@ -167,7 +197,43 @@ class ProxySessionService : Service() {
             }
             else -> Unit // Already STARTING/RUNNING/DEGRADED; the startForeground above is enough.
         }
-        return START_NOT_STICKY
+        return START_STICKY
+    }
+
+    /** `startForeground` for [NOTIFICATION_ID]. False when the system refuses it: on API 31+ a
+     *  service restarted in the background (START_STICKY) can't enter the foreground unless it is
+     *  exempt (the battery-optimisation setup check makes this rare). That refusal,
+     *  `ForegroundServiceStartNotAllowedException`, is an [IllegalStateException]; catching the
+     *  latter also works on API 29-30, where the former doesn't exist. */
+    private fun enterForeground(notification: Notification): Boolean = try {
+        startForeground(NOTIFICATION_ID, notification)
+        getSystemService(NotificationManager::class.java).cancel(STOPPED_NOTIFICATION_ID)
+        true
+    } catch (e: IllegalStateException) {
+        Log.w(TAG, "Foreground start refused: ${e::class.simpleName}")
+        false
+    }
+
+    /** Runs on Main. Sharing can't run without the foreground, so stop and tell the user how to
+     *  resume. Any session still running is shut down by [onDestroy], like on any other stop. */
+    private fun onForegroundRefused() {
+        pendingStart = false
+        prefs.sessionDesired = false
+        notificationJob?.cancel()
+        removeNotification()
+        postStoppedNotification()
+        stopSelf(currentStartId)
+    }
+
+    private fun postStoppedNotification() {
+        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.stat_sys_upload)
+            .setContentTitle("Sharing stopped")
+            .setContentText("Sharing stopped. Tap to resume.")
+            .setContentIntent(openAppIntent())
+            .setAutoCancel(true)
+            .build()
+        getSystemService(NotificationManager::class.java).notify(STOPPED_NOTIFICATION_ID, notification)
     }
 
     private fun buildController(): SessionController {
@@ -177,21 +243,23 @@ class ProxySessionService : Service() {
         // keeping the Service alive) risks retaining a destroyed service.
         val connectivityManager = applicationContext.getSystemService(ConnectivityManager::class.java)
         val egress = CellularEgress(connectivityManager)
-        // Interim (Plan 2b Task 6): USB-only with one client, exactly as before. Task 7 wires in
-        // P2pGroupLink, SlotStore and the host settings.
+        // On Main (onStartCommand): AndroidP2pApi registers its broadcast receiver and opens its
+        // WifiP2pManager channel on the main looper. applicationContext too (R6).
+        val api = AndroidP2pApi(applicationContext).also { p2pApi = it }
         val newController = SessionController(
             egress = egress,
-            link = InterimNoLink,
-            slots = InterimNoSlots,
-            config = { SessionConfig(usbEnabled = true, wifi = null, wifiPort = 8080, maxClients = 1) },
+            link = P2pGroupLink(api, serviceScope, Build.MODEL),
+            slots = SlotStore(HostConfigSource.secureStore(applicationContext)),
+            // Read once per start, on `serial` (it decrypts the credentials), never on Main.
+            config = hostConfig::sessionConfig,
             scope = serviceScope,
         )
         // (C1) Set before this controller's start() is ever called: see the kdoc on
         // SessionController.onIdle for why this must be a direct callback, not something this
         // service subscribes to by collecting controller.state.
         //
-        // (R3) onIdle can run on the serial worker (a normal doStop/rolled-back doStart) or on the
-        // onDestroy shutdown thread (shutdownBlocking) - never reliably Main - so everything it
+        // (R3) onIdle can run on the serial worker (a normal doStop/rolled-back doStart, or
+        // onDestroy's scheduled shutdown()) - never reliably Main - so everything it
         // touches (currentStartId, controller, notificationJob, the notification/foreground APIs)
         // is re-posted onto mainHandler rather than touched here directly. The guard re-checks
         // `controller?.state?.value == SessionPhase.IDLE` once that post actually runs, not just
@@ -209,10 +277,17 @@ class ProxySessionService : Service() {
                         // that the session has actually reached IDLE, honour it as a fresh start
                         // rather than letting the service stop.
                         pendingStart = false
-                        startForeground(NOTIFICATION_ID, buildNotification(SessionPhase.STARTING, null, 0, 0))
-                        newController.start()
-                        startNotificationUpdates(newController)
+                        if (enterForeground(buildNotification(SessionPhase.STARTING, null, 0, 0))) {
+                            newController.start()
+                            startNotificationUpdates(newController)
+                        } else {
+                            onForegroundRefused()
+                        }
                     } else {
+                        // (Spec §3) Any path to IDLE while the service is alive - a Stop, a failed
+                        // start - means sharing is no longer wanted: don't resume it after a
+                        // process death.
+                        prefs.sessionDesired = false
                         removeNotification()
                         stopSelf(currentStartId)
                     }
@@ -230,7 +305,7 @@ class ProxySessionService : Service() {
         serviceStopping = true
         wakeLockJob?.cancel()
         notificationJob?.cancel()
-        releaseWakeLock()
+        releaseLocks()
         // Belt and braces alongside onIdle's removal: guarantees no notification survives
         // onDestroy even on a path that never ran onIdle (e.g. the process dying mid-session, or
         // the service being torn down for some other reason entirely).
@@ -250,16 +325,28 @@ class ProxySessionService : Service() {
         // coroutine already running on `serial` instead of racing it; a job already queued behind
         // it on `serial` at cancellation time is simply never run, since serviceScope's own Job
         // (not `serial` itself) is what gets cancelled. Still never blocks Main: `serial` is
-        // backed by Dispatchers.Default, so shutdownBlocking() runs on one of its worker threads.
+        // backed by Dispatchers.Default, so shutdown() runs on one of its worker threads.
+        //
+        // The P2P API is closed in that same coroutine, after the shutdown: the shutdown's
+        // link.stop() (or a doStop it waits behind) still needs its channel to remove the group.
+        val api = p2pApi
+        p2pApi = null
         if (c != null && c.state.value != SessionPhase.IDLE) {
-            CoroutineScope(serial + Job()).launch { c.shutdown() }
+            CoroutineScope(serial + Job()).launch {
+                try {
+                    c.shutdown()
+                } finally {
+                    api?.close()
+                }
+            }
+        } else if (api != null) {
+            CoroutineScope(serial + Job()).launch { api.close() }
         }
         // (R6) After scheduling the shutdown above, not before: a destroyed service must not stay
         // reachable through a controller/egress this onIdle closure keeps alive, and nothing past
-        // this point needs onIdle to still fire (the shutdown above doesn't go through the normal
-        // stop()/teardown() path that invokes it; shutdownBlocking calls teardown() directly, so
-        // onIdle *would* still fire from it, which is exactly why it must already be nulled out by
-        // the time that runs).
+        // this point needs onIdle to still fire. shutdown() calls teardown() directly, so onIdle
+        // *would* still fire from it, which is exactly why it must already be nulled out by the
+        // time that runs.
         c?.onIdle = null
         serviceScope.cancel()
         super.onDestroy()
@@ -267,18 +354,21 @@ class ProxySessionService : Service() {
 
     /** (I4) Confines every wake-lock call to `Dispatchers.Main`, and keeps it held (re-acquiring
      *  every [WAKE_LOCK_RENEW_INTERVAL_MS], well inside [WAKE_LOCK_TIMEOUT_MS]) for as long as the
-     *  phase is RUNNING or DEGRADED, instead of only renewing it on a phase change. */
+     *  phase is RUNNING or DEGRADED, instead of only renewing it on a phase change. A low-latency
+     *  [WifiManager.WifiLock] is held alongside it, so the Wi-Fi radio doesn't doze under the
+     *  group while sharing. */
     private fun startWakeLockManagement(c: SessionController) {
         wakeLockJob?.cancel()
         wakeLockJob = serviceScope.launch(Dispatchers.Main) {
             c.state.collectLatest { phase ->
                 if (phase == SessionPhase.RUNNING || phase == SessionPhase.DEGRADED) {
+                    acquireWifiLock()
                     while (isActive) {
                         acquireOrRenewWakeLock()
                         delay(WAKE_LOCK_RENEW_INTERVAL_MS)
                     }
                 } else {
-                    releaseWakeLock()
+                    releaseLocks()
                 }
             }
         }
@@ -297,9 +387,21 @@ class ProxySessionService : Service() {
         }
     }
 
-    private fun releaseWakeLock() {
+    private fun acquireWifiLock() {
+        if (wifiLock?.isHeld == true) return
+        val wifiManager = applicationContext.getSystemService(WifiManager::class.java) ?: return
+        wifiLock = wifiManager.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "$packageName:sharing").apply {
+            setReferenceCounted(false)
+            acquire()
+        }
+    }
+
+    /** Releases the wake lock and the Wi-Fi lock together. */
+    private fun releaseLocks() {
         wakeLock?.let { if (it.isHeld) it.release() }
         wakeLock = null
+        wifiLock?.let { if (it.isHeld) it.release() }
+        wifiLock = null
     }
 
     /** (M4) Updates the notification on every phase/reason change, and - while RUNNING/DEGRADED -
@@ -344,10 +446,13 @@ class ProxySessionService : Service() {
         manager.notify(NOTIFICATION_ID, currentNotification(phase, reason))
     }
 
-    /** [buildNotification] with the live session's byte counters. */
+    /** [buildNotification] with the live session's byte counters, and the SSID while the Wi-Fi
+     *  Direct group is Up. */
     private fun currentNotification(phase: SessionPhase, reason: String?): Notification {
-        val slots = controller?.registry?.slots().orEmpty()
-        return buildNotification(phase, reason, slots.sumOf { it.bytesUp }, slots.sumOf { it.bytesDown })
+        val c = controller
+        val slots = c?.registry?.slots().orEmpty()
+        val ssid = (c?.linkState?.value as? LinkState.Up)?.credentials?.ssid
+        return buildNotification(phase, reason, slots.sumOf { it.bytesUp }, slots.sumOf { it.bytesDown }, ssid)
     }
 
     /** Removes the foreground notification on every path to IDLE (a clean stop, a failed start,
@@ -359,19 +464,22 @@ class ProxySessionService : Service() {
         getSystemService(NotificationManager::class.java).cancel(NOTIFICATION_ID)
     }
 
-    private fun buildNotification(phase: SessionPhase, reason: String?, bytesUp: Long, bytesDown: Long): Notification {
+    private fun buildNotification(
+        phase: SessionPhase,
+        reason: String?,
+        bytesUp: Long,
+        bytesDown: Long,
+        ssid: String? = null,
+    ): Notification {
         val contentText = when (phase) {
             SessionPhase.STARTING -> "Starting…"
             SessionPhase.STOPPING -> "Stopping…"
             SessionPhase.DEGRADED -> reason ?: "Degraded"
-            else -> "↑ ${formatBytes(bytesUp)}   ↓ ${formatBytes(bytesDown)}"
+            else -> {
+                val counters = "↑ ${formatBytes(bytesUp)}   ↓ ${formatBytes(bytesDown)}"
+                if (ssid != null) "$ssid · $counters" else counters
+            }
         }
-        val openAppIntent = PendingIntent.getActivity(
-            this,
-            0,
-            Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_IMMUTABLE,
-        )
         val stopAction = NotificationCompat.Action(
             0,
             "Stop",
@@ -384,14 +492,21 @@ class ProxySessionService : Service() {
         )
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_sys_upload)
-            .setContentTitle("Sharing over USB")
+            .setContentTitle("Sharing mobile data")
             .setContentText(contentText)
-            .setContentIntent(openAppIntent)
+            .setContentIntent(openAppIntent())
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .addAction(stopAction)
             .build()
     }
+
+    private fun openAppIntent(): PendingIntent = PendingIntent.getActivity(
+        this,
+        0,
+        Intent(this, MainActivity::class.java),
+        PendingIntent.FLAG_IMMUTABLE,
+    )
 
     private fun createNotificationChannel() {
         val manager = getSystemService(NotificationManager::class.java)
@@ -408,19 +523,4 @@ class ProxySessionService : Service() {
         fun stopIntent(context: Context): Intent =
             Intent(context, ProxySessionService::class.java).setAction(ACTION_STOP)
     }
-}
-
-/** Interim (Plan 2b Task 6, replaced in Task 7): a link that never starts, for the USB-only
- *  config above. */
-private object InterimNoLink : LinkManager {
-    override val state: StateFlow<LinkState> = MutableStateFlow<LinkState>(LinkState.Idle).asStateFlow()
-    override fun start(config: LinkConfig) = Unit
-    override suspend fun stop() = Unit
-    override fun checkHealth() = Unit
-}
-
-/** Interim (Plan 2b Task 6, replaced in Task 7): USB-only sessions have no Wi-Fi slots to keep. */
-private object InterimNoSlots : SlotPersistence {
-    override fun load(): List<PersistedSlot> = emptyList()
-    override fun save(slots: List<PersistedSlot>) = Unit
 }
