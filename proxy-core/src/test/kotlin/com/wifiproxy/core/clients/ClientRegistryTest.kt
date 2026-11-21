@@ -249,6 +249,126 @@ class ClientRegistryTest {
     }
 
     @Test
+    fun `admitOrCreate admits a new ip with an auto slot`() {
+        val r = registry()
+        val slot = r.admitOrCreate(ip("192.168.49.23"))!!
+        assertTrue(slot.auto)
+        assertFalse(slot.pinned)
+        assertEquals("Device 23", slot.name)
+        assertEquals(ip("192.168.49.23"), slot.boundIp)
+        assertTrue(ClientRegistry.TOKEN_PATTERN.matches(slot.token))
+        assertEquals(slot.id, r.admittedSlot(ip("192.168.49.23"))?.id)
+    }
+
+    @Test
+    fun `admitOrCreate names a non-IPv4 device plainly`() {
+        assertEquals("Device", registry().admitOrCreate(ip("fe80::1"))!!.name)
+    }
+
+    @Test
+    fun `admitOrCreate returns the slot already bound to the ip`() {
+        val r = registry()
+        val coded = r.addSlot("phone")!!
+        r.onPacFetch(coded.token, ip("192.168.49.10"))
+        assertEquals(coded.id, r.admitOrCreate(ip("192.168.49.10"))?.id)
+        val auto = r.admitOrCreate(ip("192.168.49.20"))!!
+        assertEquals(auto.id, r.admitOrCreate(ip("192.168.49.20"))?.id)
+        assertEquals(2, r.slots().size)
+    }
+
+    @Test
+    fun `admitOrCreate respects maxClients`() {
+        val r = registry(max = 2)
+        assertNotNull(r.admitOrCreate(ip("192.168.49.10")))
+        assertNotNull(r.admitOrCreate(ip("192.168.49.11")))
+        assertNull(r.admitOrCreate(ip("192.168.49.12")))
+        assertNull(r.admittedSlot(ip("192.168.49.12")))
+        assertEquals(2, r.slots().size)
+    }
+
+    @Test
+    fun `admitOrCreate counts a pinned slot toward maxClients`() {
+        val r = registry(max = 2)
+        r.addPinnedSlot("Laptop (USB)", ip("127.0.0.1"))!!
+        assertNotNull(r.admitOrCreate(ip("192.168.49.10")))
+        assertNull(r.admitOrCreate(ip("192.168.49.11")))
+        assertEquals(1, r.slots().count { it.pinned })
+    }
+
+    @Test
+    fun `admitOrCreate counts unbound coded slots toward maxClients`() {
+        val r = registry(max = 1)
+        r.addSlot("phone")!!
+        assertNull(r.admitOrCreate(ip("192.168.49.10")))
+    }
+
+    @Test
+    fun `clearBindings removes auto slots and frees their seats`() {
+        val r = registry(max = 2)
+        val coded = r.addSlot("phone")!!
+        r.admitOrCreate(ip("192.168.49.10"))!!
+        r.clearBindings()
+        assertEquals(listOf(coded.id), r.slots().map { it.id })
+        assertNull(r.admittedSlot(ip("192.168.49.10")))
+        assertNotNull(r.admitOrCreate(ip("192.168.49.11")))
+    }
+
+    @Test
+    fun `unbind removes the auto slot for that ip only`() {
+        val r = registry()
+        val a = r.admitOrCreate(ip("192.168.49.10"))!!
+        val b = r.admitOrCreate(ip("192.168.49.20"))!!
+        r.unbind(ip("192.168.49.10"))
+        assertEquals(listOf(b.id), r.slots().map { it.id })
+        assertNull(r.admittedSlot(ip("192.168.49.10")))
+        assertTrue(r.slots().none { it.id == a.id })
+    }
+
+    @Test
+    fun `a pac fetch from an auto slot's ip replaces the auto slot`() {
+        val r = registry(max = 2)
+        val coded = r.addSlot("phone")!!
+        r.admitOrCreate(ip("192.168.49.10"))!!
+        assertEquals(coded.id, r.onPacFetch(coded.token, ip("192.168.49.10"))?.id)
+        assertEquals(listOf(coded.id), r.slots().map { it.id })
+        assertEquals(coded.id, r.admittedSlot(ip("192.168.49.10"))?.id)
+    }
+
+    @Test
+    fun `an auto slot's own token never rebinds it`() {
+        val r = registry()
+        val auto = r.admitOrCreate(ip("192.168.49.10"))!!
+        assertNull(r.onPacFetch(auto.token, ip("192.168.49.20")))
+        assertEquals(auto.id, r.admittedSlot(ip("192.168.49.10"))?.id)
+        assertNull(r.admittedSlot(ip("192.168.49.20")))
+    }
+
+    @Test
+    fun `addPinnedSlot replaces an auto slot on its ip`() {
+        // Full, but the seat the auto slot holds is the one the pinned slot takes over.
+        val r = registry(max = 1)
+        r.admitOrCreate(ip("127.0.0.1"))!!
+        val pinned = r.addPinnedSlot("Laptop (USB)", ip("127.0.0.1"))!!
+        assertEquals(listOf(pinned.id), r.slots().map { it.id })
+        assertEquals(pinned.id, r.admittedSlot(ip("127.0.0.1"))?.id)
+    }
+
+    @Test
+    fun `snapshot excludes auto slots`() {
+        val r = registry()
+        val a = r.addSlot("a")!!
+        r.admitOrCreate(ip("192.168.49.10"))!!
+        assertEquals(listOf(a.id), r.snapshot().map { it.id })
+    }
+
+    @Test
+    fun `auto slot toString never contains the token`() {
+        val auto = registry().admitOrCreate(ip("192.168.49.10"))!!
+        assertFalse(auto.toString().contains(auto.token), auto.toString())
+        assertTrue(auto.toString().contains("auto=true"), auto.toString())
+    }
+
+    @Test
     fun `toString never contains the token`() {
         val r = registry()
         val slot = r.addSlot("a")!!

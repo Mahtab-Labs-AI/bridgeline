@@ -1,5 +1,6 @@
 package com.wifiproxy.core.clients
 
+import java.net.Inet4Address
 import java.net.InetAddress
 import java.security.MessageDigest
 import java.security.SecureRandom
@@ -19,9 +20,11 @@ data class Slot(
     val bytesDown: Long,
     val activeTunnels: Int,
     val pinned: Boolean = false,
+    /** Created by [ClientRegistry.admitOrCreate] for an uninvited peer (open admission). */
+    val auto: Boolean = false,
 ) {
     override fun toString(): String =
-        "Slot(id=$id, name=$name, token=<redacted>, boundIp=$boundIp, createdAtMs=$createdAtMs, lastSeenMs=$lastSeenMs, bytesUp=$bytesUp, bytesDown=$bytesDown, activeTunnels=$activeTunnels, pinned=$pinned)"
+        "Slot(id=$id, name=$name, token=<redacted>, boundIp=$boundIp, createdAtMs=$createdAtMs, lastSeenMs=$lastSeenMs, bytesUp=$bytesUp, bytesDown=$bytesDown, activeTunnels=$activeTunnels, pinned=$pinned, auto=$auto)"
 }
 
 /** The persistent part of a slot. The Android layer stores these and passes them back as `initial`. */
@@ -45,6 +48,8 @@ class SecureTokenSource(private val random: SecureRandom = SecureRandom()) : Tok
 /**
  * Client slots: each slot is identified by its token, not its IP. Fetching the slot's PAC
  * (or mobileconfig) binds the slot to the fetching IP; only bound IPs may use the proxy.
+ * Under open admission a listener may also create *auto* slots, identified by their IP alone
+ * (see [admitOrCreate]).
  */
 class ClientRegistry(
     maxClients: Int = 1,
@@ -53,7 +58,7 @@ class ClientRegistry(
     private val clock: () -> Long = System::currentTimeMillis,
     initial: List<SlotRecord> = emptyList(),
 ) {
-    private class Entry(val record: SlotRecord, val pinned: Boolean = false) {
+    private class Entry(val record: SlotRecord, val pinned: Boolean = false, val auto: Boolean = false) {
         var boundIp: InetAddress? = null
         var lastSeenMs: Long? = null
         var activeTunnels = 0
@@ -62,7 +67,7 @@ class ClientRegistry(
 
         fun toSlot() = Slot(
             record.id, record.name, record.token, boundIp, record.createdAtMs,
-            lastSeenMs, bytesUp.get(), bytesDown.get(), activeTunnels, pinned,
+            lastSeenMs, bytesUp.get(), bytesDown.get(), activeTunnels, pinned, auto,
         )
     }
 
@@ -96,9 +101,11 @@ class ClientRegistry(
      * token for format consistency, but the token is never used for admission.
      */
     fun addPinnedSlot(name: String, ip: InetAddress): Slot? = synchronized(lock) {
-        if (entries.size >= maxClients) return null
         if (entries.values.any { it.pinned && it.boundIp == ip }) return null
-        entries.values.forEach { if (!it.pinned && it.boundIp == ip) it.boundIp = null }
+        // An auto slot on this IP is that same device, so its seat is the one being taken over.
+        val autoHere = entries.values.count { it.auto && it.boundIp == ip }
+        if (entries.size - autoHere >= maxClients) return null
+        detach(ip, keep = null)
         val token = tokens.next()
         require(TOKEN_PATTERN.matches(token)) { "generated token has an invalid format" }
         val record = SlotRecord(UUID.randomUUID().toString(), name, token, clock())
@@ -126,8 +133,9 @@ class ClientRegistry(
         val presented = token.toByteArray()
         val entry = entries.values.firstOrNull { MessageDigest.isEqual(it.record.token.toByteArray(), presented) }
             ?: return null
-        if (entry.pinned) return null
-        entries.values.forEach { if (it !== entry && !it.pinned && it.boundIp == ip) it.boundIp = null }
+        // An auto slot's identity is its IP; its token only exists for format consistency.
+        if (entry.pinned || entry.auto) return null
+        detach(ip, keep = entry)
         entry.boundIp = ip
         entry.lastSeenMs = clock()
         entry.toSlot()
@@ -137,6 +145,43 @@ class ClientRegistry(
         val entry = entries.values.firstOrNull { it.boundIp == ip } ?: return null
         entry.lastSeenMs = clock()
         entry.toSlot()
+    }
+
+    /**
+     * Open admission: the slot bound to [ip] if there is one; otherwise, while a seat is free, a
+     * new *auto* slot bound to [ip]; otherwise null (full). An auto slot counts toward
+     * [maxClients] like any other, so a pinned slot added first keeps its seat. It is never
+     * persisted ([snapshot]), never rebound by [onPacFetch], and removed outright - not just
+     * unbound - by [clearBindings], by [unbind] for its IP, and whenever another slot takes its
+     * IP, because its identity *is* the IP. Like a pinned slot, it carries a valid token that is
+     * never used for admission.
+     */
+    fun admitOrCreate(ip: InetAddress): Slot? = synchronized(lock) {
+        entries.values.firstOrNull { it.boundIp == ip }?.let {
+            it.lastSeenMs = clock()
+            return it.toSlot()
+        }
+        if (entries.size >= maxClients) return null
+        val token = tokens.next()
+        require(TOKEN_PATTERN.matches(token)) { "generated token has an invalid format" }
+        val name = if (ip is Inet4Address) "Device ${ip.address[3].toInt() and 0xff}" else "Device"
+        val record = SlotRecord(UUID.randomUUID().toString(), name, token, clock())
+        Entry(record, auto = true).also {
+            it.boundIp = ip
+            it.lastSeenMs = clock()
+            entries[record.id] = it
+        }.toSlot()
+    }
+
+    /** Frees [ip] from every non-pinned slot but [keep]: an auto slot is removed, a coded one
+     *  unbound. Caller holds [lock]. */
+    private fun detach(ip: InetAddress, keep: Entry?) {
+        val it = entries.values.iterator()
+        while (it.hasNext()) {
+            val e = it.next()
+            if (e === keep || e.pinned || e.boundIp != ip) continue
+            if (e.auto) it.remove() else e.boundIp = null
+        }
     }
 
     fun tryAcquireTunnel(id: String): Boolean = synchronized(lock) {
@@ -161,21 +206,25 @@ class ClientRegistry(
 
     /**
      * Call when the Wi-Fi Direct group is torn down or recreated, or the password changes.
-     * DHCP addresses may be reassigned, and clients re-fetch their PAC on reconnect.
+     * DHCP addresses may be reassigned, and clients re-fetch their PAC on reconnect. Auto slots
+     * are removed (their identity is the IP); pinned slots are never touched.
      */
     fun clearBindings() = synchronized(lock) {
+        entries.values.removeAll { it.auto }
         entries.values.forEach { if (!it.pinned) it.boundIp = null }
     }
 
-    /** Clear boundIp on the entry bound to that IP, if any. Pinned slots are never touched. */
-    fun unbind(ip: InetAddress) = synchronized(lock) {
-        entries.values.forEach { if (!it.pinned && it.boundIp == ip) it.boundIp = null }
-    }
+    /** Clear boundIp on the entry bound to that IP, if any, or remove it if it is an auto slot.
+     *  Pinned slots are never touched. */
+    fun unbind(ip: InetAddress) = synchronized(lock) { detach(ip, keep = null) }
 
     fun slots(): List<Slot> = synchronized(lock) { entries.values.map { it.toSlot() } }
 
-    /** Pinned slots are never persisted: they're recreated from app settings, not restored. */
-    fun snapshot(): List<SlotRecord> = synchronized(lock) { entries.values.filterNot { it.pinned }.map { it.record } }
+    /** Pinned and auto slots are never persisted: pinned ones are recreated from app settings,
+     *  auto ones by the device's next request. */
+    fun snapshot(): List<SlotRecord> = synchronized(lock) {
+        entries.values.filterNot { it.pinned || it.auto }.map { it.record }
+    }
 
     companion object {
         const val MAX_CLIENTS_LIMIT = 3
