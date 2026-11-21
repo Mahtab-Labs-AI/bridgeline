@@ -186,6 +186,11 @@ class SessionController(
      *  [scope] ([doStart]/[teardown]) and the caller's thread ([addDevice]/[revoke]). */
     private val platforms: MutableMap<String, ClientPlatform> = ConcurrentHashMap()
 
+    /** Saved devices that didn't fit this session's registry (no free seat). Never in the
+     *  registry, but always written back by [persist], so they survive until a later session
+     *  has room for them. */
+    @Volatile private var inactiveSlots: List<PersistedSlot> = emptyList()
+
     /** Held by [doStart], [doStop] and [shutdown] for their whole run; see the class KDoc. */
     private val lifecycle = Mutex()
 
@@ -249,8 +254,15 @@ class SessionController(
                 egress.start()
                 checkNotInterruptedByStop()
 
+                // While USB sharing is on, the laptop always keeps its seat: saved Wi-Fi devices
+                // only get the rest. Those that don't fit stay saved (see persist) but inactive
+                // for this session, so a restore never deletes a stored device.
                 val maxClients = cfg.maxClients.coerceIn(1, ClientRegistry.MAX_CLIENTS_LIMIT)
-                val restored = slots.load().take(maxClients)
+                val seats = maxClients - (if (cfg.usbEnabled) 1 else 0)
+                val persisted = slots.load()
+                val restored = persisted.take(seats)
+                inactiveSlots = persisted.drop(seats)
+                if (inactiveSlots.isNotEmpty()) appendLog("${inactiveSlots.size} saved device(s) inactive: no free slot")
                 platforms.clear()
                 restored.forEach { platforms[it.record.id] = it.platform }
                 val registry = ClientRegistry(maxClients = maxClients, initial = restored.map { it.record })
@@ -436,12 +448,14 @@ class SessionController(
         }
     }
 
-    /** Runs on [scope], from the link-state collector (and the watchdog's rebuild). */
+    /** Runs on [scope], from the link-state collector. Bindings reset on every state that isn't
+     *  Up (spec §4: every group teardown), whether or not a Wi-Fi listener was running. */
     private fun onLinkState(state: LinkState) {
         if (state is LinkState.Up) {
             if (wifiServerFor != state) startWifiServer(state, clearBindings = true)
         } else {
-            stopWifiServer()
+            stopWifiServer(clearBindings = false)
+            activeRegistry?.clearBindings()
         }
     }
 
@@ -558,6 +572,7 @@ class SessionController(
         activeRegistry = null
         sessionConfig = null
         platforms.clear()
+        inactiveSlots = emptyList()
         _degradedReason.value = null
         _state.value = SessionPhase.IDLE
         onIdle?.invoke()
@@ -629,7 +644,8 @@ class SessionController(
 
     private fun persist(registry: ClientRegistry) {
         try {
-            slots.save(registry.snapshot().map { PersistedSlot(it, platforms[it.id] ?: ClientPlatform.ANDROID) })
+            val active = registry.snapshot().map { PersistedSlot(it, platforms[it.id] ?: ClientPlatform.ANDROID) }
+            slots.save(active + inactiveSlots)
         } catch (e: Exception) {
             appendLog("Couldn't save devices: ${e::class.simpleName}")
         }

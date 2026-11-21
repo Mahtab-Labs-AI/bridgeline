@@ -12,8 +12,10 @@ import com.wifiproxy.app.wifi.REASON_LOST
 import com.wifiproxy.app.wifi.SlotPersistence
 import com.wifiproxy.core.ProxyConfig
 import com.wifiproxy.core.WifiCredentials
+import com.wifiproxy.core.clients.SlotRecord
 import com.wifiproxy.core.net.Cidr
 import com.wifiproxy.core.net.DestinationFilter
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -145,6 +147,11 @@ private class FakeLink : LinkManager {
     val starts = mutableListOf<LinkConfig>()
     var stops = 0
     var healthChecks = 0
+
+    /** Opt-in: when set, [stop] really suspends until it completes, like the real link's stop()
+     *  waiting for its group removal. Null (the default) keeps [stop] non-suspending. */
+    var stopGate: CompletableDeferred<Unit>? = null
+
     override fun start(config: LinkConfig) {
         starts += config
         state.value = LinkState.Down(REASON_CREATING)
@@ -152,6 +159,7 @@ private class FakeLink : LinkManager {
 
     override suspend fun stop() {
         stops++
+        stopGate?.await()
         state.value = LinkState.Idle
     }
 
@@ -906,10 +914,96 @@ class SessionControllerTest {
         val servers = mutableListOf<Pair<ProxyConfig, FakeSessionServer>>()
         val c = controller(scope = backgroundScope, link = link, config = WIFI_ONLY, servers = servers)
         c.start(); runCurrent(); link.up(); runCurrent()
+        val slot = c.addDevice("Pixel", ClientPlatform.ANDROID)!!
+        val phoneIp = InetAddress.getByName("192.168.49.5")
+        c.registry!!.onPacFetch(slot.token, phoneIp)
         servers.single().second.killAcceptLoop()
         advanceTimeBy(30_000); runCurrent()
         assertEquals(1, link.healthChecks)
         assertEquals(2, servers.size)
+        assertEquals(1, servers[0].second.stopCalls)
         assertEquals(SessionPhase.RUNNING, c.state.value)
+        // Same group, so the device keeps its binding across the listener rebuild.
+        assertEquals(phoneIp, c.registry!!.slots().single { it.id == slot.id }.boundIp)
+    }
+
+    // --- Fix round 1 ------------------------------------------------------------------------------
+
+    @Test
+    fun `with usb on the laptop keeps its seat and saved devices without a seat are never dropped`() = runTest {
+        val link = FakeLink()
+        val stored = (1..3).map {
+            PersistedSlot(SlotRecord("id-$it", "Phone $it", "token-$it".padEnd(22, 'x'), it.toLong()), ClientPlatform.ANDROID)
+        }
+        val slots = MemorySlots(stored)
+        val servers = mutableListOf<Pair<ProxyConfig, FakeSessionServer>>()
+        var config = BOTH
+        val c = SessionController(
+            egress = FakeSessionEgress(),
+            link = link,
+            slots = slots,
+            config = { config },
+            serverFactory = SessionServerFactory { cfg, _, _, _, _ -> FakeSessionServer().also { servers += cfg to it } },
+            scope = backgroundScope,
+            now = { 0L },
+        )
+        c.start(); runCurrent(); link.up(); runCurrent()
+
+        assertEquals(1, c.registry!!.slots().count { it.pinned })
+        val usb = servers.single { it.first.bindAddress.isLoopbackAddress }.second
+        assertEquals(1, usb.startCalls)
+        assertTrue(usb.isAccepting)
+        assertEquals(listOf("id-1", "id-2"), c.registry!!.slots().filterNot { it.pinned }.map { it.id })
+        assertTrue(c.log.value.any { it.message == "1 saved device(s) inactive: no free slot" })
+
+        assertNull(c.addDevice("No room", ClientPlatform.ANDROID))
+        assertTrue(c.revoke("id-2"))
+        assertTrue(slots.saved.any { it.record.id == "id-3" })
+
+        // FakeSessionServer.revoke can't remove id-2 from the registry (ClientRegistry.revoke is
+        // internal), so all three are still saved; the point is that id-3 was never dropped.
+        c.stop(); runCurrent()
+        config = WIFI_ONLY
+        c.start(); runCurrent()
+        assertEquals(listOf("id-1", "id-2", "id-3"), c.registry!!.slots().map { it.id })
+    }
+
+    // A stop() landing mid-start makes the rollback suspend in link.stop() (gated here, as the real
+    // link's stop() suspends). The queued doStop must not run teardown meanwhile: the lifecycle
+    // Mutex holds it until the rollback is done, by which point onIdle has restarted the session.
+    @Test
+    fun `a queued doStop waits for a rollback suspended in link stop`() = runTest {
+        lateinit var c: SessionController
+        var firstStart = true
+        val gate = CompletableDeferred<Unit>()
+        val link = FakeLink().apply { stopGate = gate }
+        val egress = FakeSessionEgress()
+        val server = FakeSessionServer(onStart = {
+            if (firstStart) {
+                firstStart = false
+                c.stop()
+            }
+        })
+        c = controller(egress = egress, server = server, scope = backgroundScope, link = link)
+        var idleCalls = 0
+        c.onIdle = {
+            idleCalls++
+            if (idleCalls == 1) c.start()
+        }
+
+        c.start(); runCurrent()
+        // The rollback is suspended in link.stop(); the queued doStop has not torn anything down.
+        assertEquals(SessionPhase.STOPPING, c.state.value)
+        assertEquals(1, link.stops)
+        assertEquals(0, egress.stopCalls)
+        assertEquals(0, idleCalls)
+
+        gate.complete(Unit); runCurrent()
+        assertEquals(1, idleCalls)
+        assertEquals(SessionPhase.RUNNING, c.state.value)
+        assertEquals(1, link.stops)
+        assertEquals(1, egress.stopCalls)
+        assertEquals(2, server.startCalls)
+        assertEquals(1, server.stopCalls)
     }
 }
