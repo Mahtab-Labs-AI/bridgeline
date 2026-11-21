@@ -30,10 +30,17 @@ class SeatRulesTest {
     }
 
     @Test
-    fun `a save that changes the credentials counts no saved devices`() {
-        // Changing the Wi-Fi name or password deletes every saved device (plan decision 5).
-        assertTrue(SeatRules.fitsAfterSave(savedWifiSlots = 2, credentialsChanged = true, usbEnabled = true, maxClients = 1))
-        assertFalse(SeatRules.fitsAfterSave(savedWifiSlots = 2, credentialsChanged = false, usbEnabled = true, maxClients = 2))
-        assertTrue(SeatRules.fitsAfterSave(savedWifiSlots = 2, credentialsChanged = false, usbEnabled = false, maxClients = 2))
+    fun `a save that changes the password counts no saved devices`() {
+        // Changing the Wi-Fi password deletes every saved device (plan decision 5).
+        assertTrue(SeatRules.fitsAfterSave(savedWifiSlots = 2, passwordChanged = true, usbEnabled = true, maxClients = 1))
+        assertFalse(SeatRules.fitsAfterSave(savedWifiSlots = 2, passwordChanged = false, usbEnabled = true, maxClients = 2))
+        assertTrue(SeatRules.fitsAfterSave(savedWifiSlots = 2, passwordChanged = false, usbEnabled = false, maxClients = 2))
+    }
+
+    @Test
+    fun `a name-only change keeps the saved devices, so they all still count`() {
+        // A rename isn't a password change: passwordChanged = false, and the D7 rule counts every device.
+        assertFalse(SeatRules.fitsAfterSave(savedWifiSlots = 1, passwordChanged = false, usbEnabled = true, maxClients = 1))
+        assertTrue(SeatRules.fitsAfterSave(savedWifiSlots = 1, passwordChanged = false, usbEnabled = true, maxClients = 2))
     }
 }

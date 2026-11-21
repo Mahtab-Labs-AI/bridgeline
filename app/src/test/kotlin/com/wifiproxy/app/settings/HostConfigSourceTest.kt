@@ -9,6 +9,7 @@ import javax.crypto.KeyGenerator
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -50,7 +51,7 @@ class HostConfigSourceTest {
 
     @Test
     fun `saving credentials enables wifi and reports the change once`() {
-        assertEquals(SaveResult.SAVED_CREDENTIALS_CHANGED, source.save(valid))
+        assertEquals(SaveResult.SAVED_PASSWORD_CHANGED, source.save(valid))
         val wifi = source.sessionConfig().wifi!!
         assertTrue(Regex("DIRECT-[a-z0-9]{2}-HostPhone").matches(wifi.credentials.ssid))
         assertEquals("correct horse battery", wifi.credentials.password)
@@ -72,7 +73,7 @@ class HostConfigSourceTest {
     @Test
     fun `blank name and password clears the credentials`() {
         source.save(valid)
-        assertEquals(SaveResult.SAVED_CREDENTIALS_CHANGED, source.save(valid.copy(ssidSuffix = "", password = "")))
+        assertEquals(SaveResult.SAVED_PASSWORD_CHANGED, source.save(valid.copy(ssidSuffix = "", password = "")))
         assertNull(source.sessionConfig().wifi)
     }
 
@@ -97,7 +98,7 @@ class HostConfigSourceTest {
         countingBox.opens = 0
         countingBox.seals = 0
         val outcome = counted.update(valid.copy(password = "another passphrase"))
-        assertEquals(SaveResult.SAVED_CREDENTIALS_CHANGED, outcome.result)
+        assertEquals(SaveResult.SAVED_PASSWORD_CHANGED, outcome.result)
         assertEquals(1, countingBox.opens)
         assertEquals(1, countingBox.seals)
         // Same SSID code is kept, so clients auto-rejoin under the same SSID.
@@ -119,9 +120,38 @@ class HostConfigSourceTest {
     fun `clearing whitespace-only credentials reports blank fields and no ssid`() {
         source.save(valid)
         val outcome = source.update(valid.copy(ssidSuffix = " ", password = " "))
-        assertEquals(SaveResult.SAVED_CREDENTIALS_CHANGED, outcome.result)
+        assertEquals(SaveResult.SAVED_PASSWORD_CHANGED, outcome.result)
         assertEquals("", outcome.snapshot!!.settings.password)
         assertNull(outcome.snapshot.ssid)
         assertFalse(outcome.snapshot.settings.ssidSuffix.isNotEmpty())
+    }
+
+    // --- Final fix round: a rename is not a password change ---------------------------------------
+
+    @Test
+    fun `a name-only change reports the SSID change, keeps the code, and is not a password change`() {
+        val first = source.update(valid).snapshot!!
+        val seen = mutableListOf<Boolean>()
+        val outcome = source.update(valid.copy(ssidSuffix = "OtherName")) { passwordChanged -> seen += passwordChanged; true }
+        assertEquals(SaveResult.SAVED_SSID_CHANGED, outcome.result)
+        assertEquals(listOf(false), seen)
+        assertEquals(first.ssid!!.removeSuffix("HostPhone") + "OtherName", outcome.snapshot!!.ssid)
+        assertEquals("correct horse battery", outcome.snapshot.settings.password)
+    }
+
+    @Test
+    fun `changing name and password together is a password change`() {
+        source.save(valid)
+        assertEquals(SaveResult.SAVED_PASSWORD_CHANGED, source.save(valid.copy(ssidSuffix = "OtherName", password = "brand new secret")))
+    }
+
+    @Test
+    fun `the port rule rejects out-of-range ports and the USB port`() {
+        assertNull(HostConfigSource.portError(8080))
+        assertNull(HostConfigSource.portError(1024))
+        assertNull(HostConfigSource.portError(65535))
+        assertNotNull(HostConfigSource.portError(8081))
+        assertNotNull(HostConfigSource.portError(1023))
+        assertNotNull(HostConfigSource.portError(65536))
     }
 }

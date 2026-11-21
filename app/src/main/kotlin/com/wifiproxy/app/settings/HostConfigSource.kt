@@ -27,7 +27,13 @@ interface HostPrefs {
     var prefer5Ghz: Boolean
 }
 
-enum class SaveResult { SAVED, SAVED_CREDENTIALS_CHANGED, INVALID }
+/**
+ * [SAVED_SSID_CHANGED]: only the network name changed - a running session must restart for the
+ * new SSID, but saved devices keep their slots. [SAVED_PASSWORD_CHANGED]: the password changed
+ * (including setting the first one, or clearing the credentials) - every saved Wi-Fi slot must be
+ * deleted (plan decision 5). A save changing both reports [SAVED_PASSWORD_CHANGED].
+ */
+enum class SaveResult { SAVED, SAVED_SSID_CHANGED, SAVED_PASSWORD_CHANGED, INVALID }
 
 /** [HostSettings] plus the stored credentials' full SSID (`DIRECT-xy-<suffix>`, null when none
  *  are set), read with a single decrypt. */
@@ -80,12 +86,13 @@ class HostConfigSource(
      * [save], also returning the new [HostSnapshot] so a caller needn't decrypt again. At most one
      * decrypt (the previous credentials) and one encrypt (only when they change).
      *
-     * [allow] is asked once the settings are valid, with whether this save changes the
-     * credentials; returning false refuses the save as [SaveResult.INVALID], changing nothing.
+     * [allow] is asked once the settings are valid, with whether this save changes the password
+     * (and so deletes the saved devices); returning false refuses the save as
+     * [SaveResult.INVALID], changing nothing.
      */
-    fun update(settings: HostSettings, allow: (credentialsChanged: Boolean) -> Boolean = { true }): SaveOutcome {
+    fun update(settings: HostSettings, allow: (passwordChanged: Boolean) -> Boolean = { true }): SaveOutcome {
         val invalid = SaveOutcome(SaveResult.INVALID, null)
-        if (settings.port !in WIFI_PORT_RANGE || settings.port == USB_PORT) return invalid
+        if (portError(settings.port) != null) return invalid
         if (settings.maxClients !in MAX_CLIENTS_RANGE) return invalid
         val clear = settings.ssidSuffix.isBlank() && settings.password.isBlank()
         if (!clear &&
@@ -95,12 +102,11 @@ class HostConfigSource(
         }
 
         val before = credentials.get()
-        val changed = if (clear) {
-            before != null
-        } else {
-            before?.suffix != settings.ssidSuffix || before.password != settings.password
-        }
-        if (!allow(changed)) return invalid
+        // Clearing set credentials removes the password too; setting the first ones sets one.
+        val passwordChanged = if (clear) before != null else before?.password != settings.password
+        val ssidChanged = !clear && before != null && before.suffix != settings.ssidSuffix
+        val changed = passwordChanged || ssidChanged
+        if (!allow(passwordChanged)) return invalid
 
         prefs.maxClients = settings.maxClients
         prefs.wifiPort = settings.port
@@ -113,11 +119,22 @@ class HostConfigSource(
             }
             else -> credentials.set(settings.ssidSuffix, settings.password, ssidCode = before?.ssidCode)
         }
-        val result = if (changed) SaveResult.SAVED_CREDENTIALS_CHANGED else SaveResult.SAVED
+        val result = when {
+            passwordChanged -> SaveResult.SAVED_PASSWORD_CHANGED
+            ssidChanged -> SaveResult.SAVED_SSID_CHANGED
+            else -> SaveResult.SAVED
+        }
         return SaveOutcome(result, snapshotOf(after))
     }
 
     companion object {
+        /** Why [port] can't be the Wi-Fi listener's port, or null when it can. */
+        fun portError(port: Int): String? = when {
+            port !in WIFI_PORT_RANGE -> "Use a port from ${WIFI_PORT_RANGE.first} to ${WIFI_PORT_RANGE.last}"
+            port == USB_PORT -> "$USB_PORT is the USB port; pick another"
+            else -> null
+        }
+
         fun forContext(context: Context): HostConfigSource = HostConfigSource(
             AppPreferences(context),
             CredentialStore(secureStore(context), AesGcmSecretBox { KeystoreKeys.getOrCreate(CREDENTIALS_KEY_ALIAS) }),

@@ -19,7 +19,6 @@ import com.wifiproxy.app.service.SessionHolder
 import com.wifiproxy.app.service.SessionController
 import com.wifiproxy.app.settings.AppPreferences
 import com.wifiproxy.app.settings.HostConfigSource
-import com.wifiproxy.app.settings.SaveResult
 import com.wifiproxy.app.wifi.LinkState
 import com.wifiproxy.app.wifi.SlotStore
 import com.wifiproxy.core.clients.Slot
@@ -205,29 +204,26 @@ class ServiceSessionRepository(
         SessionHolder.controller.value?.revoke(slotId)
     }
 
+    /** See [SettingsSaver]: D7 against the stored devices, a password change deletes them, and a
+     *  name or password change restarts a running session. The Stop then Start become a restart
+     *  through the service's pending-start path (M-b). */
+    private val saver = SettingsSaver(
+        hostConfig = hostConfig,
+        slotStore = slotStore,
+        usbEnabled = { prefs.usbSharingEnabled },
+        sessionActive = ::sessionActive,
+        restart = {
+            stop()
+            start()
+        },
+    )
+
     /**
-     * (D7) Refused when the saved Wi-Fi devices (active and inactive alike) plus the USB laptop's
-     * seat wouldn't fit the new `maxClients`, counted from storage whether or not a session is
-     * running - except that a save which changes the Wi-Fi name or password counts none, since it
-     * deletes every saved device (plan decision 5). That save also restarts a running session
-     * with the new credentials: the Stop then Start become a restart through the service's
-     * pending-start path (M-b).
-     *
-     * At most one decrypt and one encrypt (Keystore round trips on Main): [HostConfigSource.update]
-     * returns the new state instead of it being read back.
+     * Applies [settings] through [saver]. At most one decrypt and one encrypt (Keystore round
+     * trips): [HostConfigSource.update] returns the new state instead of it being read back.
      */
     override fun updateSettings(settings: HostSettings): Boolean {
-        val outcome = hostConfig.update(settings) { credentialsChanged ->
-            SeatRules.fitsAfterSave(slotStore.load().size, credentialsChanged, prefs.usbSharingEnabled, settings.maxClients)
-        }
-        val snapshot = outcome.snapshot ?: return false
-        if (outcome.result == SaveResult.SAVED_CREDENTIALS_CHANGED) {
-            slotStore.clear()
-            if (sessionActive()) {
-                stop()
-                start()
-            }
-        }
+        val snapshot = saver.save(settings) ?: return false
         _settings.value = snapshot.settings
         configuredSsid.value = snapshot.ssid
         refreshChecks()
