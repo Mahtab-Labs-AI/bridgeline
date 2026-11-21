@@ -68,6 +68,7 @@ import com.wifiproxy.app.session.SessionRepository
 import com.wifiproxy.app.session.SlotUi
 import com.wifiproxy.app.ui.QrCode
 import com.wifiproxy.app.ui.ScreenTitle
+import com.wifiproxy.app.ui.formatActivity
 import com.wifiproxy.app.ui.formatBytes
 import com.wifiproxy.app.ui.icon
 import kotlinx.coroutines.Job
@@ -236,12 +237,12 @@ private fun OpenDevicesContent(repository: SessionRepository, modifier: Modifier
             )
         }
         wifiSlots.forEach { slot ->
-            ConnectedDeviceRow(slot = slot, onDisconnect = { slotPendingDisconnect = slot })
+            ConnectedDeviceRow(slot = slot, nowMs = session.nowMs, onDisconnect = { slotPendingDisconnect = slot })
         }
         if (full) {
             Text(
-                text = "All ${session.maxClients} slots are in use, so a new device gets no access. " +
-                    "Disconnect one, or raise the limit in Settings.",
+                text = "All ${session.maxClients} slots are in use. Idle devices free their seat " +
+                    "automatically for a new one; active devices need Disconnect, or raise the limit in Settings.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.error,
             )
@@ -330,12 +331,19 @@ private fun OpenSetupCard(invite: OpenInvite, ssid: String) {
                 style = MaterialTheme.typography.bodySmall,
             )
             CopyableCommand(label = "Profile link", command = invite.mobileConfigUrl, context = context)
+
+            HorizontalDivider()
+            Text(
+                text = "Devices idle for 3 minutes give up their seat when a new device needs it.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
     }
 }
 
 @Composable
-private fun ConnectedDeviceRow(slot: SlotUi, onDisconnect: () -> Unit) {
+private fun ConnectedDeviceRow(slot: SlotUi, nowMs: Long, onDisconnect: () -> Unit) {
     ElevatedCard(modifier = Modifier.fillMaxWidth()) {
         Row(
             modifier = Modifier.fillMaxWidth().padding(16.dp),
@@ -354,6 +362,15 @@ private fun ConnectedDeviceRow(slot: SlotUi, onDisconnect: () -> Unit) {
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+                // (D8 idle eviction) Only an auto slot's seat ever frees itself, so only auto
+                // devices show how long they've been idle.
+                if (slot.auto) {
+                    Text(
+                        text = formatActivity(nowMs, slot.lastActivityMs),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
                 Text(
                     text = "↑ ${formatBytes(slot.bytesUp)}   ↓ ${formatBytes(slot.bytesDown)}",
                     style = MaterialTheme.typography.bodySmall,

@@ -32,6 +32,9 @@ data class SlotUi(
     val activeTunnels: Int,
     /** An auto slot (open admission, D8): admitted by its IP alone, with no invite. */
     val auto: Boolean = false,
+    /** Mirrors [com.wifiproxy.core.clients.Slot.lastActivityMs]; drives the "Active now"/"Idle N
+     *  min" line shown for auto devices under open admission. */
+    val lastActivityMs: Long = 0L,
 )
 
 data class SessionUi(
@@ -58,6 +61,10 @@ data class SessionUi(
     /** (B1) A VPN applies to this app: its sockets, replies to Wi-Fi Direct devices included, go
      *  into the tunnel. */
     val vpnActive: Boolean = false,
+    /** Wall-clock time this [SessionUi] was built, so "Idle N min" (derived from
+     *  [SlotUi.lastActivityMs]) keeps advancing on the 1 Hz poll even when nothing else about the
+     *  session has changed. Always 0 for the fake, which has no idle auto slots to show. */
+    val nowMs: Long = 0L,
 )
 
 data class HostSettings(

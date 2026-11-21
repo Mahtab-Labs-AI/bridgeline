@@ -11,3 +11,10 @@ fun formatBytes(bytes: Long): String {
     val value = bytes / 1024.0.pow(exponent)
     return "%.1f %s".format(value, units[exponent - 1])
 }
+
+/** An auto device's activity under open admission: "Active now" for the first minute since
+ *  [lastActivityMs], else "Idle N min" (floored, never negative even if the clocks disagree). */
+fun formatActivity(nowMs: Long, lastActivityMs: Long): String {
+    val idleMin = ((nowMs - lastActivityMs) / 60_000L).coerceAtLeast(0L)
+    return if (idleMin < 1) "Active now" else "Idle $idleMin min"
+}

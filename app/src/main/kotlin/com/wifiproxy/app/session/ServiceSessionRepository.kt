@@ -368,6 +368,10 @@ class ServiceSessionRepository(
             // A running session keeps the mode it started with; idle shows the next start's.
             openAdmission = (if (sharing) controller?.openAdmission else null) ?: !host.requireDeviceCodes,
             vpnActive = host.vpnActive,
+            // Distinct on every 1 Hz tick (see `ticker`) so "Idle N min" keeps advancing even when
+            // nothing else about the session changed, which would otherwise leave the StateFlow's
+            // equality check suppressing the recomposition.
+            nowMs = System.currentTimeMillis(),
         )
     }
 
@@ -386,6 +390,7 @@ class ServiceSessionRepository(
         bytesDown = bytesDown,
         activeTunnels = activeTunnels,
         auto = auto,
+        lastActivityMs = lastActivityMs,
     )
 
     override fun start() {
