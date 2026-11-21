@@ -51,8 +51,9 @@ class FakeSessionRepository(
     )
     override val settings: StateFlow<HostSettings> = _settings.asStateFlow()
 
-    // The demo always shows the per-device invite flow; the switch is only remembered.
-    private val _requireDeviceCodes = MutableStateFlow(false)
+    // The demo always shows the per-device invite flow, so the switch starts on to match; it is
+    // only remembered.
+    private val _requireDeviceCodes = MutableStateFlow(true)
     override val requireDeviceCodes: StateFlow<Boolean> = _requireDeviceCodes.asStateFlow()
 
     override fun setRequireDeviceCodes(value: Boolean) {

@@ -305,7 +305,7 @@ private fun OpenSetupCard(invite: OpenInvite, ssid: String) {
 
             Text(text = "Android or laptop", style = MaterialTheme.typography.labelLarge)
             Text(
-                text = "In the Wi-Fi network's settings: Proxy → Automatic, then paste this URL.",
+                text = "In the Wi-Fi network's settings: Proxy → Proxy Auto-Config, then paste this URL.",
                 style = MaterialTheme.typography.bodySmall,
             )
             CopyableCommand(label = "Automatic proxy URL", command = invite.pacUrl, context = context)
