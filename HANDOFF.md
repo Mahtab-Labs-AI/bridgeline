@@ -18,11 +18,16 @@ An Android app that shares a phone's **cellular data** with other devices **with
 | `README.md` | Build instructions, `:proxy-core` rules, and the **"Handoff notes for Plan 2"**, which are binding contracts for the Android layer |
 | `tools/usb-client/README.md` | Laptop-side usage (Windows script, macOS/Linux manual steps) |
 
-## Branches (no remote; there is a git bundle)
-`main` contains Plans 1, 2a (USB) and 2b (Wi-Fi Direct, including open admission and on-demand idle
-seat eviction), merged from `feature/wifi-direct` and `feature/idle-seat-eviction`. There is no open
-branch. Start new work on a branch off `main`. The backup is the newest git bundle in the handoff
-folder (`android-wifi-proxy-2026-11-21b.bundle`).
+## Repository and branches
+- **GitHub:** private repo `Mahtab-Labs-AI/bridgeline` (the project's public name), remote `origin`.
+- **`main`:** the stable, tested line. It contains Plans 1, 2a (USB) and 2b (Wi-Fi Direct, including open admission and on-demand idle seat eviction). It is **protected** by the `protect-main` ruleset: changes arrive only by pull request, with no force-push and no deletion.
+- **`develop`:** the integration branch.
+- **Flow:**
+  1. Branch features off `develop`, then merge them into `develop`.
+  2. Build and test on phones from `develop`.
+  3. When it's good, open a PR from `develop` to `main` and merge it.
+- **Old feature branches** (`feature/*`) are kept for history.
+- **Offline backup:** the newest git bundle in the handoff folder (`android-wifi-proxy-2026-11-21b.bundle`).
 
 ## State
 - **`:proxy-core`** (pure Kotlin/JVM, **187 tests**): the slot registry with pinned slots and unpersisted per-IP auto slots for open admission, a strict parser, PAC/mobileconfig/probes (including the fixed `/proxy.pac` and `/proxy.mobileconfig` paths), a post-DNS destination filter, a happy-eyeballs dialer, the NIO selector loop, a per-direction tunnel failure policy, and a ProxyServer with pre-admission caps and per-run state.
