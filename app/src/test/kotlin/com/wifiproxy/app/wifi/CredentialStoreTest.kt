@@ -1,7 +1,11 @@
 package com.wifiproxy.app.wifi
 
 import com.wifiproxy.app.settings.KeyValueStore
+import java.security.GeneralSecurityException
+import java.security.ProviderException
+import java.security.UnrecoverableKeyException
 import java.util.Random
+import javax.crypto.AEADBadTagException
 import javax.crypto.KeyGenerator
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -50,6 +54,44 @@ class CredentialStoreTest {
         CredentialStore(kv, box()).set("HostPhone", "password-one")
         val otherKey = KeyGenerator.getInstance("AES").apply { init(256) }.generateKey()
         assertNull(CredentialStore(kv, AesGcmSecretBox { otherKey }).get())
+        assertTrue(kv.map.isEmpty())
+    }
+
+    /** Opens nothing: every open() throws [error]. */
+    private class ThrowingBox(private val error: Exception) : SecretBox {
+        override fun seal(plain: ByteArray) = plain
+        override fun open(sealed: ByteArray): ByteArray = throw error
+    }
+
+    @Test
+    fun `a transient keystore error reads as null but keeps the blob, and reports only the class name`() {
+        for (error in listOf(GeneralSecurityException("keystore busy at 10.0.0.1"), ProviderException("daemon restarting"))) {
+            val kv = MapStore()
+            CredentialStore(kv, box()).set("HostPhone", "password-one")
+            val blob = kv.map.values.single()
+            val reported = mutableListOf<String>()
+            assertNull(CredentialStore(kv, ThrowingBox(error), onTransientError = { reported += it }).get())
+            assertEquals(blob, kv.map.values.single())
+            assertEquals(listOf(error::class.simpleName!!), reported)
+            // Once the keystore recovers, the very same credentials are back.
+            assertEquals("password-one", CredentialStore(kv, box()).get()?.password)
+        }
+    }
+
+    @Test
+    fun `a permanently unopenable blob is wiped`() {
+        for (error in listOf(AEADBadTagException(), UnrecoverableKeyException(), IllegalArgumentException())) {
+            val kv = MapStore()
+            CredentialStore(kv, box()).set("HostPhone", "password-one")
+            assertNull(CredentialStore(kv, ThrowingBox(error)).get())
+            assertTrue(kv.map.isEmpty())
+        }
+    }
+
+    @Test
+    fun `a malformed blob is wiped`() {
+        val kv = MapStore().apply { map["wifi_credentials"] = "not base64 !!" }
+        assertNull(CredentialStore(kv, box()).get())
         assertTrue(kv.map.isEmpty())
     }
 

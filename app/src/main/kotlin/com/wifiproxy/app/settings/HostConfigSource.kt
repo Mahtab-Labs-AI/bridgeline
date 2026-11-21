@@ -1,6 +1,7 @@
 package com.wifiproxy.app.settings
 
 import android.content.Context
+import android.util.Log
 import com.wifiproxy.app.service.SessionConfig
 import com.wifiproxy.app.session.HostSettings
 import com.wifiproxy.app.wifi.AesGcmSecretBox
@@ -13,6 +14,7 @@ import com.wifiproxy.core.WifiCredentials
 
 private const val SECURE_PREFS_NAME = "wifi_proxy_secure"
 private const val CREDENTIALS_KEY_ALIAS = "wifi-credentials"
+private const val TAG = "HostConfigSource"
 
 /** The USB listener's fixed port (`adb forward tcp:8081`); the Wi-Fi port must differ. */
 private const val USB_PORT = 8081
@@ -137,7 +139,11 @@ class HostConfigSource(
 
         fun forContext(context: Context): HostConfigSource = HostConfigSource(
             AppPreferences(context),
-            CredentialStore(secureStore(context), AesGcmSecretBox { KeystoreKeys.getOrCreate(CREDENTIALS_KEY_ALIAS) }),
+            CredentialStore(
+                secureStore(context),
+                AesGcmSecretBox { KeystoreKeys.getOrCreate(CREDENTIALS_KEY_ALIAS) },
+                onTransientError = { className -> Log.w(TAG, "Couldn't read the Wi-Fi credentials, kept them: $className") },
+            ),
         )
 
         /** The app-private store behind the credentials and the saved Wi-Fi slots

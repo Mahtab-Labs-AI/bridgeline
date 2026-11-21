@@ -10,7 +10,14 @@ import javax.crypto.spec.GCMParameterSpec
 
 interface SecretBox {
     fun seal(plain: ByteArray): ByteArray
-    /** Throws [java.security.GeneralSecurityException] if [sealed] wasn't sealed with this key. */
+    /**
+     * Throws [javax.crypto.AEADBadTagException] if [sealed] wasn't sealed with this key, and
+     * [IllegalArgumentException] if it is too short to be a sealed blob at all. Getting the key can
+     * also fail: permanently ([android.security.keystore.KeyPermanentlyInvalidatedException],
+     * [java.security.UnrecoverableKeyException]) or transiently (any other
+     * [java.security.GeneralSecurityException], or a [java.security.ProviderException]).
+     * [CredentialStore.get] wipes the blob only on the permanent ones.
+     */
     fun open(sealed: ByteArray): ByteArray
 }
 
