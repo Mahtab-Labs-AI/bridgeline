@@ -20,6 +20,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -47,9 +48,11 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import android.content.ActivityNotFoundException
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -165,7 +168,7 @@ private fun DemoDevicesContent(repository: SessionRepository, modifier: Modifier
             onDismissRequest = { activeInvite = null },
             sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
         ) {
-            InviteSheetContent(active = active)
+            InviteSheetContent(active = active, manualProxy = "${session.proxyHost}:${session.port}")
         }
     }
 }
@@ -504,7 +507,7 @@ private fun CodedDevicesContent(repository: SessionRepository, modifier: Modifie
             onDismissRequest = { activeInvite = null },
             sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
         ) {
-            InviteSheetContent(active = active)
+            InviteSheetContent(active = active, manualProxy = "${session.proxyHost}:${session.port}")
         }
     }
 }
@@ -721,14 +724,10 @@ private fun AddDeviceDialog(onDismiss: () -> Unit, onConfirm: (String, ClientPla
     )
 }
 
+/** [manualProxy] is the Wi-Fi listener's `host:port`, for the manual-proxy hint. */
 @Composable
-private fun InviteSheetContent(active: ActiveInvite) {
-    val context = LocalContext.current
-    val configUrl = if (active.platform == ClientPlatform.IPHONE) {
-        active.invite.mobileConfigUrl
-    } else {
-        active.invite.pacUrl
-    }
+private fun InviteSheetContent(active: ActiveInvite, manualProxy: String) {
+    val iphone = active.platform == ClientPlatform.IPHONE
 
     Column(
         modifier = Modifier
@@ -746,33 +745,36 @@ private fun InviteSheetContent(active: ActiveInvite) {
 
         HorizontalDivider()
 
-        val qr2Label = if (active.platform == ClientPlatform.IPHONE) "2. Install profile" else "2. Auto-config"
-        Text(text = qr2Label, style = MaterialTheme.typography.titleSmall)
-        QrCode(content = configUrl)
+        // (B2) The iPhone gets both: the .pac URL for Configure Proxy → Automatic and, separately,
+        // the profile. Pasting the .mobileconfig URL into the Automatic field can never work.
+        Text(
+            text = if (iphone) "2. Automatic proxy URL (paste into Configure Proxy → Automatic)" else "2. Automatic proxy URL",
+            style = MaterialTheme.typography.titleSmall,
+        )
+        if (!iphone) QrCode(content = active.invite.pacUrl)
+        UrlActions(label = "Automatic proxy URL", url = active.invite.pacUrl)
 
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(
-                text = configUrl,
-                style = MaterialTheme.typography.bodySmall,
-                fontFamily = FontFamily.Monospace,
-                modifier = Modifier.weight(1f),
-            )
-            IconButton(onClick = {
-                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                clipboard.setPrimaryClip(ClipData.newPlainText("Proxy auto-config URL", configUrl))
-            }) {
-                Icon(Icons.Filled.ContentCopy, contentDescription = "Copy link")
-            }
+        if (iphone) {
+            Text(text = "Or install the profile (open in Safari)", style = MaterialTheme.typography.titleSmall)
+            QrCode(content = active.invite.mobileConfigUrl)
+            UrlActions(label = "Profile link", url = active.invite.mobileConfigUrl)
         }
+
+        // (B3) Admission binds on the device's own PAC fetch; a bare manual proxy is refused before it.
+        Text(
+            text = "A manual proxy ($manualProxy) only works after the device has opened its own PAC URL once.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
 
         HorizontalDivider()
 
         Text(text = "Steps", style = MaterialTheme.typography.titleSmall)
-        val steps = if (active.platform == ClientPlatform.IPHONE) {
+        val steps = if (iphone) {
             listOf(
                 "Scan the Wi-Fi QR above and join the network.",
-                "Open the second QR's link in Safari (it must be Safari).",
-                "Install the profile when Settings prompts you.",
+                "Settings → Wi-Fi → (i) next to the network → Configure Proxy → Automatic, then paste the automatic proxy URL.",
+                "Or instead open the profile link in Safari (it must be Safari) and install the profile when Settings prompts you.",
                 "Turn off mobile data on this phone.",
             )
         } else {
@@ -788,5 +790,35 @@ private fun InviteSheetContent(active: ActiveInvite) {
         }
 
         Spacer(modifier = Modifier.height(8.dp))
+    }
+}
+
+/** A URL with Copy and Share buttons. */
+@Composable
+private fun UrlActions(label: String, url: String) {
+    val context = LocalContext.current
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text(
+            text = url,
+            style = MaterialTheme.typography.bodySmall,
+            fontFamily = FontFamily.Monospace,
+            modifier = Modifier.weight(1f),
+        )
+        IconButton(onClick = {
+            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            clipboard.setPrimaryClip(ClipData.newPlainText(label, url))
+        }) {
+            Icon(Icons.Filled.ContentCopy, contentDescription = "Copy $label")
+        }
+        IconButton(onClick = {
+            val send = Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, url)
+            try {
+                context.startActivity(Intent.createChooser(send, label))
+            } catch (e: ActivityNotFoundException) {
+                // Nothing to share with; Copy still works.
+            }
+        }) {
+            Icon(Icons.Filled.Share, contentDescription = "Share $label")
+        }
     }
 }
