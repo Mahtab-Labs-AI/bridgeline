@@ -24,7 +24,7 @@ import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 
 /**
- * What `UsbSessionController` needs from the cellular egress: the [Egress] contract `ProxyServer`
+ * What `SessionController` needs from the cellular egress: the [Egress] contract `ProxyServer`
  * uses, plus the lifecycle and liveness signals a JVM test can fake without touching
  * `ConnectivityManager`. [CellularEgress] is the only real implementation.
  */

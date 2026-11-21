@@ -27,23 +27,23 @@ private const val DEFAULT_WATCHDOG_INTERVAL_MS = 30_000L
 private const val DEFAULT_PORT = 8081
 
 /**
- * What [UsbSessionController] needs from the HTTP proxy, abstracted so a JVM test can fake
+ * What [SessionController] needs from the HTTP proxy, abstracted so a JVM test can fake
  * [isAccepting] instead of standing up (and killing) a real NIO accept loop to exercise the
- * watchdog. [RealUsbProxyServer] is the only non-test implementation.
+ * watchdog. [RealSessionServer] is the only non-test implementation.
  */
-interface UsbProxyServer {
+interface SessionServer {
     val isAccepting: Boolean
     fun start()
     fun stop()
 
     /** Must go through `ProxyServer.revoke`, never `ClientRegistry.revoke` directly (the latter
-     *  wouldn't cancel the slot's live tunnels). [RealUsbProxyServer] honours this. */
+     *  wouldn't cancel the slot's live tunnels). [RealSessionServer] honours this. */
     fun revoke(slotId: String): Boolean
     fun updateFilter(filter: DestinationFilter)
 }
 
 /** Forwards every call to a real [ProxyServer]. */
-class RealUsbProxyServer(private val delegate: ProxyServer) : UsbProxyServer {
+class RealSessionServer(private val delegate: ProxyServer) : SessionServer {
     override val isAccepting: Boolean get() = delegate.isAccepting
     override fun start() = delegate.start()
     override fun stop() = delegate.stop()
@@ -51,23 +51,23 @@ class RealUsbProxyServer(private val delegate: ProxyServer) : UsbProxyServer {
     override fun updateFilter(filter: DestinationFilter) = delegate.updateFilter(filter)
 }
 
-fun interface UsbProxyServerFactory {
+fun interface SessionServerFactory {
     fun create(
         config: ProxyConfig,
         registry: ClientRegistry,
         egress: Egress,
         filter: DestinationFilter,
         onError: (Throwable) -> Unit,
-    ): UsbProxyServer
+    ): SessionServer
 }
 
-private val defaultServerFactory = UsbProxyServerFactory { config, registry, egress, filter, onError ->
-    RealUsbProxyServer(ProxyServer(config, registry, egress, filter, onError))
+private val defaultServerFactory = SessionServerFactory { config, registry, egress, filter, onError ->
+    RealSessionServer(ProxyServer(config, registry, egress, filter, onError))
 }
 
-/** Raised internally when [UsbSessionController] notices, after a blocking/suspending start step,
- *  that a concurrent [UsbSessionController.stop] has already moved the phase away from STARTING.
- *  Never escapes [UsbSessionController.doStart]. */
+/** Raised internally when [SessionController] notices, after a blocking/suspending start step,
+ *  that a concurrent [SessionController.stop] has already moved the phase away from STARTING.
+ *  Never escapes [SessionController.doStart]. */
 private class StartInterruptedByStopException : Exception()
 
 /**
@@ -89,14 +89,14 @@ private class StartInterruptedByStopException : Exception()
  * [state] once that call returns. A JVM test can pass a non-serial scope (e.g. `backgroundScope`
  * from `runTest`) since the virtual-time test dispatcher is itself effectively single-threaded.
  */
-class UsbSessionController(
+class SessionController(
     private val egress: SessionEgress,
     private val maxClients: () -> Int = { 1 },
     private val bindAddress: InetAddress = InetAddress.getByName("127.0.0.1"),
     private val port: Int = DEFAULT_PORT,
     private val peerSubnet: Cidr = Cidr.parse("127.0.0.0/8"),
     private val wifiDirectSubnet: Cidr = Cidr.parse("192.168.49.0/24"),
-    private val serverFactory: UsbProxyServerFactory = defaultServerFactory,
+    private val serverFactory: SessionServerFactory = defaultServerFactory,
     private val now: () -> Long = System::currentTimeMillis,
     private val scope: CoroutineScope,
     private val watchdogIntervalMs: Long = DEFAULT_WATCHDOG_INTERVAL_MS,
@@ -120,7 +120,7 @@ class UsbSessionController(
     private val _log = MutableStateFlow<List<LogEntry>>(emptyList())
     val log: StateFlow<List<LogEntry>> = _log.asStateFlow()
 
-    @Volatile private var activeServer: UsbProxyServer? = null
+    @Volatile private var activeServer: SessionServer? = null
 
     @Volatile private var activeRegistry: ClientRegistry? = null
 
@@ -163,7 +163,7 @@ class UsbSessionController(
     }
 
     private suspend fun doStart() {
-        var server: UsbProxyServer? = null
+        var server: SessionServer? = null
         try {
             egress.start()
             checkNotInterruptedByStop()
@@ -226,7 +226,7 @@ class UsbSessionController(
     /** (C1) Rolls back whatever [doStart] managed to start before it failed or was interrupted by
      *  a concurrent [stop]: the server first (never leave a listener bound), then the egress, each
      *  tolerant of throwing, then back to IDLE. */
-    private fun rollbackStart(server: UsbProxyServer?) {
+    private fun rollbackStart(server: SessionServer?) {
         runCatching { server?.stop() }
         runCatching { egress.stop() }
         teardown()
@@ -364,7 +364,7 @@ class UsbSessionController(
         teardown()
     }
 
-    /** Goes through [UsbProxyServer.revoke] (in production, `ProxyServer.revoke`), never the
+    /** Goes through [SessionServer.revoke] (in production, `ProxyServer.revoke`), never the
      *  registry directly, so the slot's live tunnels are cancelled too. */
     fun revoke(slotId: String): Boolean = activeServer?.revoke(slotId) ?: false
 

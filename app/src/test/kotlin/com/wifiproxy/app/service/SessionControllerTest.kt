@@ -76,13 +76,13 @@ private class FakeSessionEgress(available: Boolean = true) : SessionEgress {
     }
 }
 
-/** A controllable [UsbProxyServer]: [isAccepting] can be forced false to drive the watchdog,
+/** A controllable [SessionServer]: [isAccepting] can be forced false to drive the watchdog,
  *  [startThrows]/[stopThrows] drive the C1/I2 rollback paths, and [onStart] is a synchronous hook
  *  invoked from inside [start] - used to deterministically interleave a concurrent [stop] call
  *  exactly while a (virtual-time) start is "in flight" (C2). */
-private class FakeUsbProxyServer(
+private class FakeSessionServer(
     private val onStart: (() -> Unit)? = null,
-) : UsbProxyServer {
+) : SessionServer {
     override var isAccepting: Boolean = true
         private set
 
@@ -127,17 +127,17 @@ private class FakeUsbProxyServer(
 }
 
 @OptIn(ExperimentalCoroutinesApi::class)
-class UsbSessionControllerTest {
+class SessionControllerTest {
 
     private fun controller(
         egress: FakeSessionEgress = FakeSessionEgress(),
-        server: FakeUsbProxyServer = FakeUsbProxyServer(),
+        server: FakeSessionServer = FakeSessionServer(),
         scope: CoroutineScope,
         watchdogIntervalMs: Long = 30_000L,
         now: () -> Long = { 0L },
-    ) = UsbSessionController(
+    ) = SessionController(
         egress = egress,
-        serverFactory = UsbProxyServerFactory { _, _, _, _, _ -> server },
+        serverFactory = SessionServerFactory { _, _, _, _, _ -> server },
         scope = scope,
         watchdogIntervalMs = watchdogIntervalMs,
         now = now,
@@ -145,7 +145,7 @@ class UsbSessionControllerTest {
 
     @Test
     fun `start reaches RUNNING when egress is available`() = runTest {
-        val server = FakeUsbProxyServer()
+        val server = FakeSessionServer()
         val c = controller(server = server, scope = backgroundScope)
 
         c.start()
@@ -192,7 +192,7 @@ class UsbSessionControllerTest {
     @Test
     fun `stop tears the session down and leaves it restartable`() = runTest {
         val egress = FakeSessionEgress()
-        val server = FakeUsbProxyServer()
+        val server = FakeSessionServer()
         val c = controller(egress = egress, server = server, scope = backgroundScope)
         c.start()
         runCurrent()
@@ -213,7 +213,7 @@ class UsbSessionControllerTest {
 
     @Test
     fun `watchdog rebuilds the server when it stops accepting`() = runTest {
-        val server = FakeUsbProxyServer()
+        val server = FakeSessionServer()
         val c = controller(server = server, scope = backgroundScope, watchdogIntervalMs = 30_000L, now = { currentTime })
         c.start()
         runCurrent()
@@ -231,7 +231,7 @@ class UsbSessionControllerTest {
 
     @Test
     fun `watchdog leaves a healthy server alone`() = runTest {
-        val server = FakeUsbProxyServer()
+        val server = FakeSessionServer()
         val c = controller(server = server, scope = backgroundScope)
         c.start()
         runCurrent()
@@ -245,7 +245,7 @@ class UsbSessionControllerTest {
 
     @Test
     fun `watchdog does nothing once stopped back to idle`() = runTest {
-        val server = FakeUsbProxyServer()
+        val server = FakeSessionServer()
         val c = controller(server = server, scope = backgroundScope)
         c.start()
         runCurrent()
@@ -263,7 +263,7 @@ class UsbSessionControllerTest {
 
     @Test
     fun `watchdog rebuild failure is caught and degrades rather than crashing`() = runTest {
-        val server = FakeUsbProxyServer()
+        val server = FakeSessionServer()
         val c = controller(server = server, scope = backgroundScope, watchdogIntervalMs = 30_000L)
         c.start()
         runCurrent()
@@ -278,7 +278,7 @@ class UsbSessionControllerTest {
 
     @Test
     fun `watchdog refreshes the filter on every tick`() = runTest {
-        val server = FakeUsbProxyServer()
+        val server = FakeSessionServer()
         val c = controller(server = server, scope = backgroundScope, watchdogIntervalMs = 30_000L)
         c.start()
         runCurrent()
@@ -293,7 +293,7 @@ class UsbSessionControllerTest {
     @Test
     fun `link change refreshes the destination filter`() = runTest {
         val egress = FakeSessionEgress()
-        val server = FakeUsbProxyServer()
+        val server = FakeSessionServer()
         val c = controller(egress = egress, server = server, scope = backgroundScope)
         c.start()
         runCurrent()
@@ -308,7 +308,7 @@ class UsbSessionControllerTest {
     @Test
     fun `network generation change rebuilds the server once, not on the first value`() = runTest {
         val egress = FakeSessionEgress()
-        val server = FakeUsbProxyServer()
+        val server = FakeSessionServer()
         val c = controller(egress = egress, server = server, scope = backgroundScope)
         c.start()
         runCurrent()
@@ -329,7 +329,7 @@ class UsbSessionControllerTest {
     @Test
     fun `network generation change is ignored while idle`() = runTest {
         val egress = FakeSessionEgress()
-        val server = FakeUsbProxyServer()
+        val server = FakeSessionServer()
         val c = controller(egress = egress, server = server, scope = backgroundScope)
         c.start()
         runCurrent()
@@ -345,7 +345,7 @@ class UsbSessionControllerTest {
 
     @Test
     fun `revoke forwards to the server, not the registry`() = runTest {
-        val server = FakeUsbProxyServer()
+        val server = FakeSessionServer()
         val c = controller(server = server, scope = backgroundScope)
         c.start()
         runCurrent()
@@ -376,7 +376,7 @@ class UsbSessionControllerTest {
 
     @Test
     fun `second start is ignored while already running`() = runTest {
-        val server = FakeUsbProxyServer()
+        val server = FakeSessionServer()
         val c = controller(server = server, scope = backgroundScope)
         c.start()
         runCurrent()
@@ -392,7 +392,7 @@ class UsbSessionControllerTest {
     @Test
     fun `server start failure rolls back the egress and leaves IDLE with an error`() = runTest {
         val egress = FakeSessionEgress()
-        val server = FakeUsbProxyServer()
+        val server = FakeSessionServer()
         server.startThrows = IllegalStateException("bind failed")
         val c = controller(egress = egress, server = server, scope = backgroundScope)
 
@@ -408,7 +408,7 @@ class UsbSessionControllerTest {
     @Test
     fun `a later start works after a start failure`() = runTest {
         val egress = FakeSessionEgress()
-        val server = FakeUsbProxyServer()
+        val server = FakeSessionServer()
         server.startThrows = IllegalStateException("bind failed")
         val c = controller(egress = egress, server = server, scope = backgroundScope)
         c.start()
@@ -441,9 +441,9 @@ class UsbSessionControllerTest {
             override suspend fun resolve(host: String) = emptyList<InetAddress>()
             override suspend fun newChannel() = throw UnsupportedOperationException()
         }
-        val c = UsbSessionController(
+        val c = SessionController(
             egress = egress,
-            serverFactory = UsbProxyServerFactory { _, _, _, _, _ -> FakeUsbProxyServer() },
+            serverFactory = SessionServerFactory { _, _, _, _, _ -> FakeSessionServer() },
             scope = backgroundScope,
         )
 
@@ -459,9 +459,9 @@ class UsbSessionControllerTest {
 
     @Test
     fun `stop arriving mid-start rolls back and leaves no server running (deterministic)`() = runTest {
-        lateinit var c: UsbSessionController
+        lateinit var c: SessionController
         val egress = FakeSessionEgress()
-        val server = FakeUsbProxyServer(onStart = { c.stop() })
+        val server = FakeSessionServer(onStart = { c.stop() })
         c = controller(egress = egress, server = server, scope = backgroundScope)
 
         c.start()
@@ -488,8 +488,8 @@ class UsbSessionControllerTest {
     @OptIn(ExperimentalForInheritanceCoroutinesApi::class)
     @Test
     fun `stop landing right before the final RUNNING-DEGRADED write is not clobbered`() = runTest {
-        lateinit var c: UsbSessionController
-        val server = FakeUsbProxyServer()
+        lateinit var c: SessionController
+        val server = FakeSessionServer()
         val egress = object : SessionEgress {
             private val backing = MutableStateFlow(true)
             override val available: StateFlow<Boolean> = object : StateFlow<Boolean> by backing.asStateFlow() {
@@ -515,9 +515,9 @@ class UsbSessionControllerTest {
             override suspend fun resolve(host: String) = emptyList<InetAddress>()
             override suspend fun newChannel() = throw UnsupportedOperationException("not used in this test")
         }
-        c = UsbSessionController(
+        c = SessionController(
             egress = egress,
-            serverFactory = UsbProxyServerFactory { _, _, _, _, _ -> server },
+            serverFactory = SessionServerFactory { _, _, _, _, _ -> server },
             scope = backgroundScope,
         )
 
@@ -535,10 +535,10 @@ class UsbSessionControllerTest {
     // queued doStop runs, the stale doStop must leave the new session alone.
     @Test
     fun `a stale doStop does not tear down a session restarted behind it`() = runTest {
-        lateinit var c: UsbSessionController
+        lateinit var c: SessionController
         var firstStart = true
         val egress = FakeSessionEgress()
-        val server = FakeUsbProxyServer(onStart = {
+        val server = FakeSessionServer(onStart = {
             if (firstStart) {
                 firstStart = false
                 c.stop()
@@ -566,7 +566,7 @@ class UsbSessionControllerTest {
     fun `stop during a real concurrent start leaves no server running`() {
         val startedLatch = CountDownLatch(1)
         val releaseLatch = CountDownLatch(1)
-        val server = FakeUsbProxyServer(
+        val server = FakeSessionServer(
             onStart = {
                 startedLatch.countDown()
                 releaseLatch.await(2, TimeUnit.SECONDS)
@@ -575,9 +575,9 @@ class UsbSessionControllerTest {
         val realScope = CoroutineScope(SupervisorJob() + Dispatchers.Default.limitedParallelism(1))
         try {
             val egress = FakeSessionEgress()
-            val c = UsbSessionController(
+            val c = SessionController(
                 egress = egress,
-                serverFactory = UsbProxyServerFactory { _, _, _, _, _ -> server },
+                serverFactory = SessionServerFactory { _, _, _, _, _ -> server },
                 scope = realScope,
             )
 
@@ -604,7 +604,7 @@ class UsbSessionControllerTest {
     @Test
     fun `egress stop failure during doStop still reaches IDLE`() = runTest {
         val egress = FakeSessionEgress()
-        val server = FakeUsbProxyServer()
+        val server = FakeSessionServer()
         val c = controller(egress = egress, server = server, scope = backgroundScope)
         c.start()
         runCurrent()
@@ -621,7 +621,7 @@ class UsbSessionControllerTest {
     @Test
     fun `server stop failure during doStop still reaches IDLE`() = runTest {
         val egress = FakeSessionEgress()
-        val server = FakeUsbProxyServer()
+        val server = FakeSessionServer()
         val c = controller(egress = egress, server = server, scope = backgroundScope)
         c.start()
         runCurrent()
@@ -653,7 +653,7 @@ class UsbSessionControllerTest {
 
     @Test
     fun `onIdle fires once when a failed start rolls back, even though it was set before start()`() = runTest {
-        val server = FakeUsbProxyServer()
+        val server = FakeSessionServer()
         server.startThrows = IllegalStateException("bind failed")
         val c = controller(server = server, scope = backgroundScope)
         var idleCalls = 0

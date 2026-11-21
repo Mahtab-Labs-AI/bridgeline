@@ -45,13 +45,13 @@ private const val WAKE_LOCK_RENEW_INTERVAL_MS = 5 * 60 * 1000L
 private const val NOTIFICATION_REFRESH_INTERVAL_MS = 5_000L
 
 /**
- * Hosts [UsbSessionController] as a `connectedDevice` foreground service (design spec §3, §7,
+ * Hosts [SessionController] as a `connectedDevice` foreground service (design spec §3, §7,
  * §8a). [onCreate] calls `startForeground()` immediately - before building the (Android-API-
  * touching) egress and controller - so the service is never caught running foreground work
  * without a notification.
  *
  * (C2) [serviceScope] runs on `Dispatchers.Default.limitedParallelism(1)`, so every coroutine
- * [UsbSessionController] launches on it (start, stop, the watchdog, network-change handling, link-
+ * [SessionController] launches on it (start, stop, the watchdog, network-change handling, link-
  * change filter refreshes) is strictly serialized against every other one.
  */
 class ProxySessionService : Service() {
@@ -71,12 +71,12 @@ class ProxySessionService : Service() {
 
     private val serviceScope = CoroutineScope(SupervisorJob() + serial + exceptionHandler)
 
-    private var controller: UsbSessionController? = null
+    private var controller: SessionController? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var wakeLockJob: Job? = null
     private var notificationJob: Job? = null
 
-    /** Every call into [UsbSessionController.onIdle] is re-posted through this (R3): that callback
+    /** Every call into [SessionController.onIdle] is re-posted through this (R3): that callback
      *  can run on the serial worker thread (during a normal `doStop`/rolled-back `doStart`) or on
      *  the background shutdown thread ([onDestroy]'s [shutdownBlocking] path) - never reliably on
      *  Main - but everything it touches here ([currentStartId], [controller], [notificationJob],
@@ -88,11 +88,11 @@ class ProxySessionService : Service() {
      *  stop but before the service actually dies, `stopSelf(staleId)` is a no-op and the service
      *  survives for the newer command, per the `stopSelf(int)` contract. Only ever read or written
      *  from Main (R3): [onStartCommand] always runs there, and so does every read of it now that
-     *  [UsbSessionController.onIdle] is re-posted onto [mainHandler] before touching it. */
+     *  [SessionController.onIdle] is re-posted onto [mainHandler] before touching it. */
     private var currentStartId: Int = 0
 
     /** Set on Main (M-b) when a Start intent arrives while the session is STOPPING: calling
-     *  [UsbSessionController.start] in that phase is a documented no-op, so the request would
+     *  [SessionController.start] in that phase is a documented no-op, so the request would
      *  otherwise simply be dropped. The onIdle hand-off below checks this once the session actually
      *  reaches IDLE and, if set, starts a fresh session instead of letting the service stop. */
     private var pendingStart: Boolean = false
@@ -162,16 +162,16 @@ class ProxySessionService : Service() {
         return START_NOT_STICKY
     }
 
-    private fun buildController(): UsbSessionController {
+    private fun buildController(): SessionController {
         // (R6) applicationContext, not `this`: CellularEgress/its ConnectivityManager outlive any
         // one onStartCommand and are reachable from SessionHolder long after this Service instance
         // would otherwise be eligible for GC, so building it from the Service context (implicitly
         // keeping the Service alive) risks retaining a destroyed service.
         val connectivityManager = applicationContext.getSystemService(ConnectivityManager::class.java)
         val egress = CellularEgress(connectivityManager)
-        val newController = UsbSessionController(egress = egress, scope = serviceScope)
+        val newController = SessionController(egress = egress, scope = serviceScope)
         // (C1) Set before this controller's start() is ever called: see the kdoc on
-        // UsbSessionController.onIdle for why this must be a direct callback, not something this
+        // SessionController.onIdle for why this must be a direct callback, not something this
         // service subscribes to by collecting controller.state.
         //
         // (R3) onIdle can run on the serial worker (a normal doStop/rolled-back doStart) or on the
@@ -252,7 +252,7 @@ class ProxySessionService : Service() {
     /** (I4) Confines every wake-lock call to `Dispatchers.Main`, and keeps it held (re-acquiring
      *  every [WAKE_LOCK_RENEW_INTERVAL_MS], well inside [WAKE_LOCK_TIMEOUT_MS]) for as long as the
      *  phase is RUNNING or DEGRADED, instead of only renewing it on a phase change. */
-    private fun startWakeLockManagement(c: UsbSessionController) {
+    private fun startWakeLockManagement(c: SessionController) {
         wakeLockJob?.cancel()
         wakeLockJob = serviceScope.launch(Dispatchers.Main) {
             c.state.collectLatest { phase ->
@@ -300,7 +300,7 @@ class ProxySessionService : Service() {
      *  lands while it is suspended. On the serial worker, a stale job could be mid-way through
      *  removeNotification() - i.e. stopForeground() - right as Main re-enters the foreground for a
      *  restarted session, leaving that session running without foreground status. */
-    private fun startNotificationUpdates(c: UsbSessionController) {
+    private fun startNotificationUpdates(c: SessionController) {
         notificationJob?.cancel()
         notificationJob = serviceScope.launch(Dispatchers.Main) {
             combine(c.state, c.degradedReason) { phase, reason -> phase to reason }.collectLatest { (phase, reason) ->

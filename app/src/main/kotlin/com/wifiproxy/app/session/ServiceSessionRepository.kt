@@ -10,7 +10,7 @@ import android.provider.Settings
 import androidx.core.app.NotificationManagerCompat
 import com.wifiproxy.app.service.ProxySessionService
 import com.wifiproxy.app.service.SessionHolder
-import com.wifiproxy.app.service.UsbSessionController
+import com.wifiproxy.app.service.SessionController
 import com.wifiproxy.core.clients.Slot
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -32,7 +32,7 @@ private const val PROXY_PORT = 8081
 
 /**
  * The real [SessionRepository]: `start`/`stop` drive [ProxySessionService], and [session]/[log]
- * read the live [UsbSessionController] through [SessionHolder] (there's no controller - and so no
+ * read the live [SessionController] through [SessionHolder] (there's no controller - and so no
  * slots - until the service has actually been started once).
  *
  * `addDevice`/`inviteFor` return null: Wi-Fi Direct devices are Plan 2b. [checks] and [settings]
@@ -84,7 +84,7 @@ class ServiceSessionRepository(
     private fun tickerForPhase(phase: SessionPhase): Flow<Unit> =
         if (phase == SessionPhase.IDLE) flowOf(Unit) else ticker
 
-    private fun sessionFlowFor(controller: UsbSessionController) =
+    private fun sessionFlowFor(controller: SessionController) =
         combine(
             controller.state,
             controller.degradedReason,
