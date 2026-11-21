@@ -30,6 +30,11 @@ data class ProxyConfig(
      *  pre-admission share of [maxConnections] so a slotless peer with many IP aliases can't
      *  crowd out admitted clients. */
     val maxPendingHeads: Int = 64,
+    /** Admits any peer in [peerSubnet] that asks, with an auto slot, while seats are free (see
+     *  [ClientRegistry.admitOrCreate]), and serves the fixed `/proxy.pac` and
+     *  `/proxy.mobileconfig`. A per-listener property, never a registry-wide one: the registry is
+     *  shared with the USB listener, which must never admit anyone but its pinned laptop. */
+    val openAdmission: Boolean = false,
 ) {
     init {
         require(!bindAddress.isAnyLocalAddress) { "refusing wildcard bind address $bindAddress" }

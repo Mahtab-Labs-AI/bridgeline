@@ -62,6 +62,59 @@ class LocalContentTest {
         assertEquals(slot.id, registry.admittedSlot(peer)?.id)
     }
 
+    private fun open(wifi: WifiCredentials? = null, reg: ClientRegistry = registry) =
+        LocalContent(reg, "192.168.49.1", 8080, wifi, openAdmission = true)
+
+    @Test
+    fun `fixed pac path is 404 and admits nobody while admission is closed`() {
+        assertEquals(404, content().serve(Local("GET", "/proxy.pac"), peer).status)
+        assertEquals(404, content(WifiCredentials("DIRECT-ab-Test", "password1")).serve(Local("GET", "/proxy.mobileconfig"), peer).status)
+        assertTrue(registry.slots().isEmpty())
+    }
+
+    @Test
+    fun `fixed pac path admits the peer with an auto slot while admission is open`() {
+        val r = open().serve(Local("GET", "/proxy.pac"), peer)
+        assertEquals(200, r.status)
+        assertEquals(PacFile.CONTENT_TYPE, r.contentType)
+        assertTrue("PROXY 192.168.49.1:8080" in r.body.toString(Charsets.UTF_8))
+        val slot = registry.admittedSlot(peer)!!
+        assertTrue(slot.auto)
+    }
+
+    @Test
+    fun `fixed mobileconfig points at the fixed pac path`() {
+        assertEquals(404, open(wifi = null).serve(Local("GET", "/proxy.mobileconfig"), peer).status)
+        assertTrue(registry.slots().isEmpty())
+        val r = open(WifiCredentials("DIRECT-ab-Test", "password1")).serve(Local("GET", "/proxy.mobileconfig"), peer)
+        assertEquals(200, r.status)
+        assertEquals(MobileConfig.CONTENT_TYPE, r.contentType)
+        assertTrue("http://192.168.49.1:8080/proxy.pac" in r.body.toString(Charsets.UTF_8))
+        assertTrue(registry.admittedSlot(peer)!!.auto)
+    }
+
+    @Test
+    fun `fixed pac path is 403 when the registry is full`() {
+        val full = ClientRegistry(maxClients = 1)
+        full.addSlot("a")!!
+        assertEquals(403, open(reg = full).serve(Local("GET", "/proxy.pac"), peer).status)
+        assertNull(full.admittedSlot(peer))
+    }
+
+    @Test
+    fun `fixed paths are GET only`() {
+        assertEquals(405, open().serve(Local("POST", "/proxy.pac"), peer).status)
+        assertTrue(registry.slots().isEmpty())
+    }
+
+    @Test
+    fun `token paths keep working while admission is open`() {
+        val slot = registry.addSlot("a")!!
+        assertEquals(200, open().serve(Local("GET", "/${slot.token}.pac"), peer).status)
+        assertEquals(slot.id, registry.admittedSlot(peer)?.id)
+        assertEquals(1, registry.slots().size)
+    }
+
     @Test
     fun `wifi credentials never print the password`() {
         assertFalse("password1" in WifiCredentials("s", "password1").toString())

@@ -48,12 +48,13 @@ class ProxyServerTest {
         maxPendingHeadsPerPeer: Int = 16,
         maxPendingHeads: Int = 64,
         connectTimeoutMs: Long = 10_000,
+        openAdmission: Boolean = false,
         onError: (Throwable) -> Unit = {},
     ) {
         val config = ProxyConfig(
             bindAddress = loopback, port = 0, peerSubnet = peerSubnet, wifi = wifi, idleTimeoutMs = idleMs,
             maxConnections = maxConnections, maxPendingHeadsPerPeer = maxPendingHeadsPerPeer,
-            maxPendingHeads = maxPendingHeads, connectTimeoutMs = connectTimeoutMs,
+            maxPendingHeads = maxPendingHeads, connectTimeoutMs = connectTimeoutMs, openAdmission = openAdmission,
         )
         server = ProxyServer(config, registry, egress, filter, onError).also { it.start() }
     }
@@ -178,6 +179,60 @@ class ProxyServerTest {
     fun `unadmitted client gets 403`() {
         start()
         assertTrue(rawRequest("CONNECT example.com:443 HTTP/1.1\r\n\r\n").startsWith("HTTP/1.1 403"))
+    }
+
+    @Test
+    fun `open admission lets an uninvited client use a manual proxy`() {
+        start(openAdmission = true)
+        val echo = startEcho()
+        val (s, head) = openConnect(echo.localPort)
+        assertTrue(head.startsWith("HTTP/1.1 200 Connection Established"), head)
+        s.getOutputStream().write("ping".toByteArray())
+        assertEquals("ping", String(s.getInputStream().readNBytes(4)))
+        val slot = registry.slots().single()
+        assertTrue(slot.auto)
+        assertEquals(loopback, slot.boundIp)
+        assertTrue(registry.snapshot().isEmpty())
+    }
+
+    @Test
+    fun `closed admission never auto-creates a slot`() {
+        start(openAdmission = false)
+        val echo = startEcho()
+        assertTrue(rawRequest("CONNECT 127.0.0.1:${echo.localPort} HTTP/1.1\r\n\r\n").startsWith("HTTP/1.1 403"))
+        assertTrue(rawRequest("GET /proxy.pac HTTP/1.1\r\nHost: x\r\n\r\n").startsWith("HTTP/1.1 404"))
+        assertTrue(registry.slots().isEmpty())
+    }
+
+    @Test
+    fun `open admission gives 403 when every seat is taken`() {
+        registry = ClientRegistry(maxClients = 1)
+        registry.addSlot("invited")!!
+        start(openAdmission = true)
+        val echo = startEcho()
+        assertTrue(rawRequest("CONNECT 127.0.0.1:${echo.localPort} HTTP/1.1\r\n\r\n").startsWith("HTTP/1.1 403"))
+        assertTrue(rawRequest("GET /proxy.pac HTTP/1.1\r\nHost: x\r\n\r\n").startsWith("HTTP/1.1 403"))
+        assertEquals(1, registry.slots().size)
+    }
+
+    @Test
+    fun `open admission serves the fixed pac path and admits the client`() {
+        start(openAdmission = true)
+        val response = rawRequest("GET /proxy.pac HTTP/1.1\r\nHost: x\r\n\r\n")
+        assertTrue(response.startsWith("HTTP/1.1 200"), response)
+        assertTrue("PROXY 127.0.0.1:${server.localPort}" in response, response)
+        assertTrue(registry.admittedSlot(loopback)!!.auto)
+    }
+
+    @Test
+    fun `a revoked auto slot loses its live tunnels`() {
+        start(openAdmission = true)
+        val echo = startEcho()
+        val (s, head) = openConnect(echo.localPort)
+        assertTrue(head.startsWith("HTTP/1.1 200"), head)
+        val slot = registry.slots().single()
+        assertTrue(server.revoke(slot.id))
+        assertClosed(s)
     }
 
     @Test

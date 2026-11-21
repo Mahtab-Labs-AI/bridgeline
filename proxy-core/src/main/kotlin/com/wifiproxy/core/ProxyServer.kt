@@ -135,7 +135,7 @@ class ProxyServer(
         }
         val dialer = Dialer.forEgress(nio, egress, timeoutMs = config.connectTimeoutMs)
         val boundPort = (ch.localAddress as InetSocketAddress).port
-        val local = LocalContent(registry, config.bindAddress.hostAddress, boundPort, config.wifi)
+        val local = LocalContent(registry, config.bindAddress.hostAddress, boundPort, config.wifi, config.openAdmission)
         val s = CoroutineScope(SupervisorJob() + Dispatchers.Default + CoroutineExceptionHandler { _, e -> safeOnError(e) })
         val r = Run(nio, ch, dialer, local, s)
         run = r
@@ -312,7 +312,10 @@ class ProxyServer(
         leftover: ByteArray,
         forward: ProxyRequest.Forward?,
     ) {
-        val slot = registry.admittedSlot(peer) ?: return respond(r.nio, client, HttpResponse.FORBIDDEN)
+        // Open admission is this listener's property, not the (shared) registry's: the USB
+        // listener over the same registry never auto-creates a slot. A full registry is a 403.
+        val admitted = if (config.openAdmission) registry.admitOrCreate(peer) else registry.admittedSlot(peer)
+        val slot = admitted ?: return respond(r.nio, client, HttpResponse.FORBIDDEN)
         // The peer is genuinely admitted now; it's no longer part of the pre-admission DoS surface
         // the pending-head caps exist to bound, even though its response (or tunnel) isn't done yet.
         pendingHead.release()
@@ -325,7 +328,9 @@ class ProxyServer(
         tunnels.compute(slot.id) { _, existing -> (existing ?: ConcurrentHashMap.newKeySet()).apply { add(job) } }
         var upstream: SocketChannel? = null
         try {
-            // A revoke that raced with the admission check above must still win.
+            // A revoke that raced with the admission check above must still win. Never creates a
+            // slot, even under open admission: a revoked auto slot's replacement is a new slot,
+            // so its id differs and this connection is refused.
             if (registry.admittedSlot(peer)?.id != slot.id) return respond(r.nio, client, HttpResponse.FORBIDDEN)
             val up = try {
                 open(r, host, port)
