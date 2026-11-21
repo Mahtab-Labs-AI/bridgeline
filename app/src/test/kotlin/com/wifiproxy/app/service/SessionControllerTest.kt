@@ -190,6 +190,10 @@ private val USB_ONLY = SessionConfig(usbEnabled = true, wifi = null, wifiPort = 
 private val WIFI_ONLY = SessionConfig(usbEnabled = false, wifi = WIFI, wifiPort = 8080, maxClients = 3)
 private val BOTH = SessionConfig(usbEnabled = true, wifi = WIFI, wifiPort = 8080, maxClients = 3)
 
+// Code mode: saved devices are only restored into the registry when codes are required (D8).
+private val CODED_WIFI_ONLY = WIFI_ONLY.copy(requireDeviceCodes = true)
+private val CODED_BOTH = BOTH.copy(requireDeviceCodes = true)
+
 @OptIn(ExperimentalCoroutinesApi::class)
 class SessionControllerTest {
 
@@ -858,7 +862,7 @@ class SessionControllerTest {
     fun `devices persist with their platform and are restored on the next start`() = runTest {
         val link = FakeLink()
         val slots = MemorySlots()
-        val c = controller(scope = backgroundScope, link = link, slots = slots, config = WIFI_ONLY)
+        val c = controller(scope = backgroundScope, link = link, slots = slots, config = CODED_WIFI_ONLY)
         c.start(); runCurrent(); link.up(); runCurrent()
         val added = c.addDevice("Ben's iPhone", ClientPlatform.IPHONE)!!
         assertEquals(listOf(PersistedSlot(c.registry!!.snapshot().single(), ClientPlatform.IPHONE)), slots.saved)
@@ -941,7 +945,7 @@ class SessionControllerTest {
         }
         val slots = MemorySlots(stored)
         val servers = mutableListOf<Pair<ProxyConfig, FakeSessionServer>>()
-        var config = BOTH
+        var config = CODED_BOTH
         val c = SessionController(
             egress = FakeSessionEgress(),
             link = link,
@@ -967,7 +971,7 @@ class SessionControllerTest {
         // FakeSessionServer.revoke can't remove id-2 from the registry (ClientRegistry.revoke is
         // internal), so all three are still saved; the point is that id-3 was never dropped.
         c.stop(); runCurrent()
-        config = WIFI_ONLY
+        config = CODED_WIFI_ONLY
         c.start(); runCurrent()
         assertEquals(listOf("id-1", "id-2", "id-3"), c.registry!!.slots().map { it.id })
     }
@@ -1021,7 +1025,7 @@ class SessionControllerTest {
         val link = FakeLink()
         val slots = MemorySlots(storedSlots(4))
         val servers = mutableListOf<Pair<ProxyConfig, FakeSessionServer>>()
-        val c = controller(scope = backgroundScope, link = link, slots = slots, config = WIFI_ONLY, servers = servers)
+        val c = controller(scope = backgroundScope, link = link, slots = slots, config = CODED_WIFI_ONLY, servers = servers)
         c.start(); runCurrent(); link.up(); runCurrent()
         assertEquals(listOf("id-1", "id-2", "id-3"), c.registry!!.slots().map { it.id })
 
@@ -1047,7 +1051,7 @@ class SessionControllerTest {
             egress = FakeSessionEgress(),
             link = link,
             slots = slots,
-            config = { WIFI_ONLY },
+            config = { CODED_WIFI_ONLY },
             serverFactory = SessionServerFactory { _, _, _, _, _ ->
                 FakeSessionServer(onRevoke = {
                     if (stopDuringRevoke) {
@@ -1111,7 +1115,7 @@ class SessionControllerTest {
     fun `addDevice counts inactive saved devices, so a revoke can't hand their seat to a new one`() = runTest {
         val link = FakeLink()
         val slots = MemorySlots(storedSlots(3))
-        val c = revokingController(link, slots, BOTH, mutableListOf())
+        val c = revokingController(link, slots, CODED_BOTH, mutableListOf())
         c.start(); runCurrent(); link.up(); runCurrent()
         // Laptop + id-1 + id-2 hold the three seats; id-3 is saved but inactive.
         assertTrue(c.revoke("id-2"))
@@ -1127,7 +1131,7 @@ class SessionControllerTest {
         val link = FakeLink() // never goes Up: no Wi-Fi server, and USB is off
         val slots = MemorySlots(storedSlots(1))
         val created = mutableListOf<ProxyConfig>()
-        val c = revokingController(link, slots, WIFI_ONLY, created)
+        val c = revokingController(link, slots, CODED_WIFI_ONLY, created)
         c.start(); runCurrent()
         assertTrue(created.isEmpty())
 
@@ -1186,18 +1190,44 @@ class SessionControllerTest {
         assertEquals(pinned.id, registry.admittedSlot(InetAddress.getByName("127.0.0.1"))?.id)
     }
 
+    // Fix round 1: the user's real state - limit 3, USB on, two saved coded devices.
     @Test
-    fun `auto slots are never persisted, and revoking one saves only the coded devices`() = runTest {
+    fun `open mode restores no saved device, so both Wi-Fi seats are free, and code mode brings them back`() = runTest {
         val link = FakeLink()
-        val slots = MemorySlots(storedSlots(1))
-        val c = revokingController(link, slots, WIFI_ONLY, mutableListOf())
+        val stored = storedSlots(2)
+        val slots = MemorySlots(stored)
+        var config = BOTH
+        val c = SessionController(
+            egress = FakeSessionEgress(),
+            link = link,
+            slots = slots,
+            config = { config },
+            serverFactory = SessionServerFactory { cfg, registry, egress, filter, _ ->
+                RegistryRevokingServer(ProxyServer(cfg, registry, egress, filter))
+            },
+            scope = backgroundScope,
+            now = { 0L },
+        )
         c.start(); runCurrent(); link.up(); runCurrent()
-        val auto = c.registry!!.admitOrCreate(InetAddress.getByName("192.168.49.30"))!!
-        assertEquals(ClientPlatform.UNKNOWN, c.platformOf(auto.id))
 
-        assertTrue(c.revoke(auto.id))
-        assertEquals(listOf("id-1"), slots.saved.map { it.record.id })
-        assertEquals(listOf("id-1"), c.registry!!.slots().map { it.id })
+        val registry = c.registry!!
+        assertEquals(1, registry.slots().size)
+        assertTrue(registry.slots().single().pinned)
+        assertTrue(c.log.value.any { it.message == "2 saved device(s) kept for code mode" })
+        val first = registry.admitOrCreate(InetAddress.getByName("192.168.49.30"))!!
+        assertNotNull(registry.admitOrCreate(InetAddress.getByName("192.168.49.31")))
+        assertNull(registry.admitOrCreate(InetAddress.getByName("192.168.49.32")))
+        assertEquals(ClientPlatform.UNKNOWN, c.platformOf(first.id))
+
+        // Revoking an auto slot persists, and must keep both stored devices exactly as they were.
+        assertTrue(c.revoke(first.id))
+        assertEquals(stored, slots.saved)
+
+        c.stop(); runCurrent()
+        config = BOTH.copy(requireDeviceCodes = true)
+        c.start(); runCurrent()
+        assertEquals(listOf("id-1", "id-2"), c.registry!!.slots().filterNot { it.pinned }.map { it.id })
+        assertEquals(stored, slots.saved)
     }
 
     @Test

@@ -290,12 +290,25 @@ class SessionController(
                 // While USB sharing is on, the laptop always keeps its seat: saved Wi-Fi devices
                 // only get the rest. Those that don't fit stay saved (see persist) but inactive
                 // for this session, so a restore never deletes a stored device.
+                //
+                // (D8) Under open admission no saved device is restored at all: each would hold a
+                // seat while unbound, filling the registry before anyone connects. They all stay
+                // saved (inactive, written back by persist) for the next code-mode session; their
+                // old per-device URLs still work meanwhile, as auto slots (LocalContent).
                 val maxClients = cfg.maxClients.coerceIn(1, ClientRegistry.MAX_CLIENTS_LIMIT)
-                val seats = maxClients - (if (cfg.usbEnabled) 1 else 0)
+                val seats = if (!cfg.requireDeviceCodes) 0 else maxClients - (if (cfg.usbEnabled) 1 else 0)
                 val persisted = slots.load()
                 val restored = persisted.take(seats)
                 inactiveSlots = persisted.drop(seats)
-                if (inactiveSlots.isNotEmpty()) appendLog("${inactiveSlots.size} saved device(s) inactive: no free slot")
+                if (inactiveSlots.isNotEmpty()) {
+                    appendLog(
+                        if (cfg.requireDeviceCodes) {
+                            "${inactiveSlots.size} saved device(s) inactive: no free slot"
+                        } else {
+                            "${inactiveSlots.size} saved device(s) kept for code mode"
+                        },
+                    )
+                }
                 platforms.clear()
                 restored.forEach { platforms[it.record.id] = it.platform }
                 val registry = ClientRegistry(maxClients = maxClients, initial = restored.map { it.record })
