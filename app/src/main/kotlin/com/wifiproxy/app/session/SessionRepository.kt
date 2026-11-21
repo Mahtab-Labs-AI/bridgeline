@@ -44,8 +44,9 @@ data class SessionUi(
     val lastError: String? = null,
     /** True while the Wi-Fi Direct group is Up and its listener runs, i.e. devices can be invited. */
     val wifiUp: Boolean = false,
-    /** Where devices reach the proxy right now: the Wi-Fi listener while it serves, the USB one
-     *  (`127.0.0.1:8081 (USB)`) for a USB-only session, else null (idle, or Wi-Fi not up yet). */
+    /** Where devices reach the proxy right now: the Wi-Fi listener while it serves, else the USB
+     *  one (`127.0.0.1:8081 (USB)`) while that listener is up, else null (idle, or a Wi-Fi-only
+     *  session whose Wi-Fi isn't up yet). */
     val proxyAddress: String? = null,
 )
 

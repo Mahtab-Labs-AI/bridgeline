@@ -95,6 +95,7 @@ fun SettingsScreen(
     var portError by remember { mutableStateOf<String?>(null) }
     var savedMessage by remember { mutableStateOf(false) }
     var pendingPasswordConfirm by remember { mutableStateOf(false) }
+    var pendingRenameConfirm by remember { mutableStateOf(false) }
 
     // (I7) The real session lives independently of whichever repository is currently active (it's
     // the fake while in demo mode), so this reads SessionHolder directly rather than
@@ -379,11 +380,14 @@ fun SettingsScreen(
 
         Button(
             onClick = {
-                // Only a password that really differs from the saved one deletes the devices.
-                if (password != savedSettings.password) {
-                    pendingPasswordConfirm = true
-                } else {
-                    applySave()
+                val sharing = session.phase != SessionPhase.IDLE && session.phase != SessionPhase.STOPPING
+                when {
+                    // Only a password that really differs from the saved one deletes the devices.
+                    password != savedSettings.password -> pendingPasswordConfirm = true
+                    // A rename of saved credentials restarts a running session under the new SSID.
+                    sharing && savedSettings.ssidSuffix.isNotEmpty() && suffix != savedSettings.ssidSuffix ->
+                        pendingRenameConfirm = true
+                    else -> applySave()
                 }
             },
             enabled = editable && suffixError == null && passwordError == null,
@@ -414,6 +418,23 @@ fun SettingsScreen(
             },
             dismissButton = {
                 TextButton(onClick = { pendingPasswordConfirm = false }) { Text("Cancel") }
+            },
+        )
+    }
+
+    if (pendingRenameConfirm) {
+        AlertDialog(
+            onDismissRequest = { pendingRenameConfirm = false },
+            title = { Text("Rename the network?") },
+            text = { Text("Renaming restarts sharing; devices must rejoin the new network (their invites stay valid).") },
+            confirmButton = {
+                TextButton(onClick = {
+                    pendingRenameConfirm = false
+                    applySave()
+                }) { Text("Rename") }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingRenameConfirm = false }) { Text("Cancel") }
             },
         )
     }

@@ -69,8 +69,9 @@ fun HomeScreen(repository: SessionRepository, modifier: Modifier = Modifier, onS
             phase = session.phase,
             degradedReason = session.degradedReason,
             ssid = session.ssid,
-            // (E3.2) Only an address that really serves: the Wi-Fi listener while it runs, the USB
-            // one for a USB-only session, "—" while Wi-Fi isn't up yet, nothing while idle.
+            // (E3.2) Only an address that really serves: the Wi-Fi listener while it runs, else the
+            // USB one while that listener is up, "—" for a Wi-Fi-only session whose Wi-Fi isn't up
+            // yet, nothing while idle.
             proxyAddress = if (session.phase == SessionPhase.IDLE) null else session.proxyAddress ?: "—",
             lastError = session.lastError,
         )

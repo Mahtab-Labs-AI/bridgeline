@@ -250,7 +250,8 @@ class ServiceSessionRepository(
         val endpoint = if (sharing) controller?.wifiEndpoint else null
         val proxyAddress = when {
             endpoint != null -> "${endpoint.group.ownerAddress.hostAddress}:${endpoint.port}"
-            sharing && controller?.wifiConfigured == false && controller.usbListening -> USB_PROXY_ADDRESS
+            // USB-only, or a USB + Wi-Fi session whose Wi-Fi isn't serving: the laptop still is.
+            sharing && controller?.usbListening == true -> USB_PROXY_ADDRESS
             else -> null
         }
         return SessionUi(
