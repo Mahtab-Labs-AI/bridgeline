@@ -12,7 +12,7 @@ Share a host Android phone's **cellular** data with up to **3** other phones ove
 |---|---|
 | Client devices | Any phone (Android or iPhone). **No app install** — client only joins Wi-Fi and sets a proxy (PAC URL or `.mobileconfig`). |
 | Host | **Non-root, sideload only** (not Play Store). Public APIs only; no hidden APIs required. |
-| Platform | Kotlin, single process. `minSdk 29`, `targetSdk`/`compileSdk 37`. |
+| Platform | Kotlin, single process. `minSdk 29`, `targetSdk`/`compileSdk 36`. |
 | Clients | 1–3 concurrent, configurable in the app (default 1). |
 | Access | Wi-Fi password **predefined by the host user**; no default ships. |
 
@@ -249,3 +249,29 @@ Laptop app → laptop 127.0.0.1:8081 ──adb forward (USB)──► host 127.0
 4. **Slot hijack by a password holder** — admission is source-IP + token, and the token travels over plain HTTP on a shared WPA2-PSK link. Anyone who knows the Wi-Fi password and captures a victim's handshake can decrypt a PAC re-fetch and steal the token, or spoof a bound IP; victim and attacker then rebind the slot back and forth. Inherent to the no-client-app design. Mitigation: treat the Wi-Fi password as the real trust boundary, rotate it after sharing with someone untrusted, revoke unknown slots.
 5. **Exposure** — wildcard bind or SSRF into host loopback. Mitigation: GO-IP-only bind, peer subnet check, post-resolution destination filter.
 6. **Egress correctness under churn** — stale `Network` handle or DNS slipping onto Wi-Fi. Mitigation: bound-or-refuse, atomic handle swap.
+
+## 12. Plan 2b decisions (2026-11-21)
+
+Plan 2a (USB) and Plan 2b (Wi-Fi Direct) are both implemented; `:proxy-core` has 171 tests and `:app` has 197, all green, with zero Kotlin warnings. These are the deviations and additions from real implementation and real-device testing, superseding the sections above where they conflict.
+
+1. **No `Failed` phase.** A link that needs the user (firmware ignored the SSID or password, Wi-Fi Direct unsupported, a missing permission, 10 consecutive failures) shows as `Degraded` with that reason, and stops retrying. USB sharing keeps working. The user fixes the problem and restarts sharing.
+2. **Wi-Fi Direct runs only when credentials are set.** A session with no password is USB-only; start is refused only when there is neither USB sharing nor a password. §4's "first session can't start without a password" predates USB.
+3. **`unbind(ip)` on client leave is not implemented.** `WifiP2pGroup.clientList` reports MAC addresses, not IPs. Rebinding on the next PAC fetch already moves a slot.
+4. **Coded devices are added and revoked only while sharing.** Adding needs the group-owner IP for the PAC URL; revoking goes through a live `ProxyServer`.
+5. **Only a password change deletes saved coded devices.** A rename (SSID suffix only) restarts sharing, with a confirmation, but keeps saved devices.
+6. **SSID suffix rules:** `A–Z a–z 0–9 _ -`, 1–22 characters, keeping the SSID within 32 bytes. The `DIRECT-xy-` code is chosen at random once and kept for good, so the SSID never changes and clients auto-rejoin.
+7. **D7 (user decision).** While USB sharing is on, the USB laptop always keeps a seat, and the pinned slot can't be revoked. In code mode, saved Wi-Fi devices beyond `maxClients - 1` stay saved but inactive and are never deleted. Settings refuses changes that would push devices out.
+8. **D8 (user decision): open admission is the default**, replacing §4 Layer 2 as the default mode.
+   - Any device that has joined the Wi-Fi Direct group (so it knows the Wi-Fi password) may use the proxy, up to the device limit — it needs no per-device token.
+   - Fixed URLs serve every admitted device: `http://<owner>:<port>/proxy.pac` and `/proxy.mobileconfig`. A manual proxy `<owner>:<port>` also works, with no PAC fetch needed first.
+   - Auto slots (one per joined IP) are never persisted and are removed on a group teardown.
+   - The host's own owner address is never seated, on either the fixed or the token paths.
+   - The optional setting "Require a code for each device" restores the per-device token flow from §4 Layer 2. Saved coded devices hold no seats while open admission is active.
+   - The trust boundary is the Wi-Fi password, as §11 risk 4 anticipated: disconnecting frees a seat, but the device can simply rejoin; changing the password is what keeps it out.
+9. **VPN limitation.** A VPN on the host that covers this app routes the proxy's replies to Wi-Fi Direct clients into the tunnel, so clients time out. The app warns (a Setup check plus a Home banner) but cannot fix this in-app without root. Users must use split tunnelling (exclude Wi-Fi Proxy) or turn the VPN off.
+10. **Other changes:**
+    - The group-info wait (§6, read-back verification) is about 30 s, not the original few seconds; a matching existing group is adopted, and 5 GHz falls back to `AUTO` on a timeout.
+    - On API 29–32, Location must be on; there is a Setup check, and it is fatal with a clear message if Location is off.
+    - Credentials are Keystore-encrypted, per §4. A transient Keystore error reads as "unreadable", which refuses saves and never wipes anything.
+    - `START_STICKY` restarts sharing after process death, per §6. A foreground start that the system refuses shows a "Tap to resume" notice instead of failing silently.
+- `targetSdk`/`compileSdk` is **36**, not 37 as §1 originally said. Compose BOM 2026.06.01 is the newest that works with compileSdk 36 and AGP 8.13. Moving to 37 needs AGP 9.

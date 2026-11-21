@@ -8,7 +8,9 @@ app-level HTTP proxy (no system tethering). Design: `docs/superpowers/specs/2026
 | Module | Status | What |
 |---|---|---|
 | `:proxy-core` | Plan 1 (done) | Pure Kotlin/JVM proxy data plane: slots/admission, parser, PAC/mobileconfig/probes, destination filter, dialer, NIO tunnel server |
-| `:app` | Plan 2–3 | Android host app (service, Wi-Fi Direct, cellular egress, UI) |
+| `:app` | Plans 2a (USB) and 2b (Wi-Fi Direct), done | Android host app (service, Wi-Fi Direct, USB, cellular egress, UI) |
+
+`:proxy-core` has 171 tests and `:app` has 197, all green, with zero Kotlin warnings.
 
 ## Build and test (Windows)
 
@@ -16,6 +18,12 @@ app-level HTTP proxy (no system tethering). Design: `docs/superpowers/specs/2026
 . .\scripts\env.ps1          # puts JDK 21 on JAVA_HOME for this session
 .\gradlew.bat :proxy-core:test
 ```
+
+## Using it
+
+- **Wi-Fi Direct (open mode, the default):** start sharing, then join the host's `DIRECT-xy-…` group with its password. Any joined device can then use `http://<owner>:<port>/proxy.pac` (Automatic/Proxy Auto-Config) or the manual proxy `<owner>:<port>` directly, no PAC fetch needed first. iPhones can instead install `/proxy.mobileconfig` in Safari. "Require a code for each device" in Settings switches back to the per-device invite/token flow.
+- **USB (laptop):** turn on "USB sharing", then run `tools/usb-client/connect-usb.ps1` on the laptop (Windows). It finds `adb`, forwards `tcp:8081`, and sets the laptop's system proxy for you.
+- **VPN note:** a VPN on the host that covers this app routes the proxy's replies to Wi-Fi Direct clients into the tunnel, so those clients time out. The app warns on Home and in the Setup check. Fix by excluding this app from the VPN (split tunnelling) or turning the VPN off; it can't be fixed in-app without root.
 
 ## `:proxy-core` rules
 
@@ -28,31 +36,31 @@ app-level HTTP proxy (no system tethering). Design: `docs/superpowers/specs/2026
 
 ## Handoff notes for Plan 2 (Android host)
 
-Code review turned up these points:
+Code review turned up these points. Status below reflects Plan 2a (USB) and Plan 2b (Wi-Fi Direct), both now done.
 
-**Egress**
+**Egress** — done.
 - `newChannel()` must never return an unbound channel ("bound or refuse").
 - If binding fails, it must close the channel it opened.
 - It throws `EgressUnavailableException` when the network is gone.
 - `resolve()` must be cancellable and time-bounded. Use `DnsResolver` with a timeout, not a blocking `getAllByName` in `withContext(IO)`.
 
-**Filter**
+**Filter** — done.
 - Pass the phone's own interface addresses as `hostAddresses` to `DestinationFilter.default(...)`.
 - Call `ProxyServer.updateFilter` whenever `LinkProperties` change.
 
-**Registry**
+**Registry** — done.
 - Call `ClientRegistry.clearBindings()` on group teardown or recreate, and on password change.
 - Persist `snapshot()` and restore it as `initial`.
 
-**Watchdog**
+**Watchdog** — done.
 - Watch `ProxyServer.isAccepting`. If it is false (for example the NIO loop died), the server socket may still be bound, so recover with `stop()` followed by `start()`.
 - `onError` reports only non-I/O bugs and accept-loop failures.
 - `stop()` blocks for up to about 1 s, because it joins the loop thread. Never call it on the main thread.
 
-**Revoke**
+**Revoke** — done.
 - Revoke a slot only through `ProxyServer.revoke`, which also cancels the slot's live tunnels. `ClientRegistry.revoke` is `internal`.
 
-**Lifecycle**
+**Lifecycle** — done.
 - `ProxyConfig` is immutable and carries the bind address and Wi-Fi credentials. When the password, the group-owner IP or the egress network changes, `stop()` the server and build a new `ProxyServer`. That closes every tunnel; the spec requires it ("password change drops everyone"; tunnels bound to the old `Network` are dead anyway).
 
 **Egress implementation**
