@@ -1,20 +1,23 @@
 package com.wifiproxy.app.wifi
 
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.channelFlow
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.flow.map
-import kotlinx.coroutines.flow.merge
-import kotlinx.coroutines.flow.onStart
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 const val REASON_CREATING = "Creating the Wi-Fi Direct group"
 const val REASON_RETRYING = "Wi-Fi Direct group failed; retrying"
@@ -28,6 +31,14 @@ private const val MAX_BACKOFF_MS = 60_000L
  * and passphrase (spec §4 read-back verification), and recreates it with the same credentials
  * whenever it is lost (spec §6), backing off 1 s → 2 s → … → 60 s. Every Android call goes
  * through [api], so all of this runs on the JVM under virtual time.
+ *
+ * [start], [stop] and the internal re-creates never race each other: every state change is a
+ * [Command] processed, one at a time and strictly in order, by a single supervisor coroutine (see
+ * [commands]). Before it acts on a command - starting a new run, or tearing down with
+ * `removeGroup` + `Idle` - the supervisor always cancels and *fully, non-cancellably* joins
+ * whatever run came before, even one stuck inside an uncancellable Android call. That means an
+ * earlier run can never act after a later command has started being processed, and there is never
+ * a window where two runs are both live, or where a run and a teardown are both in flight.
  */
 class P2pGroupLink(
     private val api: P2pApi,
@@ -41,29 +52,48 @@ class P2pGroupLink(
     override val state: StateFlow<LinkState> = _state.asStateFlow()
 
     private val healthChecks = Channel<Unit>(Channel.CONFLATED)
-    private var job: Job? = null
 
-    override fun start(config: LinkConfig) {
-        // Chain onto the previous run rather than just cancel()-ing it: this guarantees the old
-        // run has fully stopped (and so can't race a concurrent stop()) before the new one touches
-        // the API, while still returning immediately as the contract requires.
-        val prev = job
-        job = scope.launch {
-            prev?.cancelAndJoin()
-            run(config)
+    private sealed interface Command {
+        data class Start(val config: LinkConfig) : Command
+        data class Stop(val done: CompletableDeferred<Unit>) : Command
+    }
+
+    /** Every start()/stop() is a [Command] sent here; [UNLIMITED][Channel.UNLIMITED] because
+     *  [start] must not suspend or drop a request. A single long-lived coroutine (below) drains
+     *  this strictly in order, which is what makes start/stop/recreate race-free. */
+    private val commands = Channel<Command>(Channel.UNLIMITED)
+
+    init {
+        scope.launch {
+            var job: Job? = null
+            for (command in commands) {
+                // Whatever run is current is no longer wanted as of this command; wait for it to
+                // actually finish - uncancellably, since it might itself be stuck inside an
+                // uncancellable Android call - before acting on the command. This is the one rule
+                // that makes the whole class race-free: nothing below ever runs while an old run
+                // might still touch the API.
+                job?.let { withContext(NonCancellable) { it.cancelAndJoin() } }
+                when (command) {
+                    is Command.Start -> job = scope.launch { run(command.config) }
+                    is Command.Stop -> {
+                        job = null
+                        api.removeGroup()
+                        _state.value = LinkState.Idle
+                        command.done.complete(Unit)
+                    }
+                }
+            }
         }
     }
 
+    override fun start(config: LinkConfig) {
+        commands.trySend(Command.Start(config))
+    }
+
     override suspend fun stop() {
-        // Capture the job we're stopping; if a start() replaces it with a newer run while we're
-        // suspended in cancelAndJoin(), that newer run is not ours to tear down - leave it alone.
-        val stopping = job
-        stopping?.cancelAndJoin()
-        if (job === stopping) {
-            job = null
-            api.removeGroup()
-            _state.value = LinkState.Idle
-        }
+        val done = CompletableDeferred<Unit>()
+        commands.trySend(Command.Stop(done))
+        done.await()
     }
 
     override fun checkHealth() {
@@ -100,10 +130,7 @@ class P2pGroupLink(
                 is Attempt.Up -> {
                     failures = 0
                     _state.value = attempt.state
-                    if (awaitLoss()) {
-                        lostPreviously = true
-                        _state.value = LinkState.Down(REASON_LOST)
-                    }
+                    if (awaitLoss()) lostPreviously = true
                 }
                 is Attempt.Fatal -> {
                     _state.value = LinkState.Failed(attempt.message)
@@ -168,20 +195,10 @@ class P2pGroupLink(
     }
 
     /** Suspends while the group is up. True when the group was lost; false when Wi-Fi went off
-     *  (the outer loop then waits for it to come back).
-     *
-     *  [connectionChanged][P2pApi.connectionChanged] has no replay, and we only start collecting
-     *  it here - after the create/verify round trip - so a loss that happened in that gap (or
-     *  that arrived while nobody was listening) would otherwise go unnoticed until the 30 s
-     *  watchdog's [checkHealth]. [onStart] forces one immediate [P2pApi.groupInfo] check as soon
-     *  as we start listening, so that case is caught right away instead. */
+     *  (the outer loop then waits for it to come back). */
     private suspend fun awaitLoss(): Boolean {
         var lost = false
-        merge(
-            api.connectionChanged.map { false },
-            healthChecks.receiveAsFlow().map { false },
-            api.p2pEnabled.filter { !it }.map { true },
-        ).onStart { emit(false) }.first { wifiOff ->
+        lossEvents().first { wifiOff ->
             when {
                 wifiOff -> true
                 api.groupInfo() == null -> { lost = true; true }
@@ -189,5 +206,22 @@ class P2pGroupLink(
             }
         }
         return lost
+    }
+
+    /**
+     * [P2pApi.connectionChanged] has no replay, so a loss it signals before we're listening would
+     * otherwise go unnoticed until the 30 s watchdog's [checkHealth]. A plain
+     * `merge(...).onStart { emit(false) }` doesn't close that gap: the `onStart` emission runs
+     * *before* the merged flows are subscribed, so a loss between the emission and the actual
+     * subscription is still missed. Here, each source is subscribed with
+     * [CoroutineStart.UNDISPATCHED] - which runs the collector synchronously up to its first
+     * suspension point - *before* the synthetic initial `false` is sent, so by the time that
+     * initial [P2pApi.groupInfo] re-check runs, all three sources are already live.
+     */
+    private fun lossEvents(): Flow<Boolean> = channelFlow {
+        launch(start = CoroutineStart.UNDISPATCHED) { api.connectionChanged.collect { send(false) } }
+        launch(start = CoroutineStart.UNDISPATCHED) { healthChecks.receiveAsFlow().collect { send(false) } }
+        launch(start = CoroutineStart.UNDISPATCHED) { api.p2pEnabled.filter { !it }.collect { send(true) } }
+        send(false)
     }
 }

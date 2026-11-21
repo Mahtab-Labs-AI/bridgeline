@@ -49,9 +49,13 @@ private class FakeP2pApi : P2pApi {
         return result
     }
 
+    /** Fired every time removeGroup() actually runs, so tests can record relative ordering. */
+    var onRemoveGroup: () -> Unit = {}
+
     override suspend fun removeGroup() {
         removeCalls++
         group = null
+        onRemoveGroup()
     }
 
     override suspend fun groupInfo(): GroupInfo? = group
@@ -232,6 +236,89 @@ class P2pGroupLinkTest {
         // A later stop() still stops the (second) run cleanly.
         link.stop()
         assertEquals(LinkState.Idle, link.state.value)
+
+        // Nothing is left alive to react: a later "loss" signal causes no new request.
+        val requestsAfterStop = api.requests.size
+        api.loseGroup()
+        runCurrent()
+        assertEquals(requestsAfterStop, api.requests.size)
+    }
+
+    @Test
+    fun `case a - start just before stop leaves no orphan run once the dust settles`() = runTest {
+        // Round-1 bug: start(B) is cancelled before it's ever dispatched (so B's body, which would
+        // have cancelled A, never runs); stop() then tears down on its own (stale) notion of "the
+        // current run", while A - still in awaitLoss - sees the removal as a loss and recreates,
+        // orphaned, with nothing left referencing it.
+        val api = FakeP2pApi()
+        val link = newLink(api)
+        link.start(LinkConfig(CREDS, prefer5Ghz = false))
+        runCurrent()
+
+        link.start(LinkConfig(CREDS2, prefer5Ghz = false))
+        link.stop() // suspend, called directly - deliberately no runCurrent() before this
+        runCurrent()
+
+        assertEquals(LinkState.Idle, link.state.value)
+        val requestsAfterStop = api.requests.size
+
+        api.loseGroup()
+        runCurrent()
+        assertEquals(LinkState.Idle, link.state.value)
+        assertEquals(requestsAfterStop, api.requests.size)
+    }
+
+    @Test
+    fun `case b - a stop landing while the old run is mid create still removes the group it makes`() = runTest {
+        // Round-1 bug: B's cancellable join on A throws right away (without actually waiting for A
+        // to finish), so stop() tears down while A is still in flight; A's createGroup() then
+        // completes *after* the removeGroup, leaving a real group behind while state says Idle.
+        val api = FakeP2pApi()
+        val gate = CompletableDeferred<Unit>()
+        api.createGroupGate = gate
+        val link = newLink(api)
+
+        link.start(LinkConfig(CREDS, prefer5Ghz = false))
+        runCurrent()
+        link.start(LinkConfig(CREDS2, prefer5Ghz = false))
+        runCurrent()
+
+        val stopJob = launch { link.stop() }
+        // Let stop() run as far as it can before the gate opens: on the old (round-1) code, B's
+        // own cancellation interrupts its join on A immediately (it doesn't actually wait for A to
+        // finish), so stop() tears down right here, believing it's done.
+        runCurrent()
+        // Only now does A's gated createGroup() resolve - too late, after the teardown already
+        // ran.
+        gate.complete(Unit)
+        runCurrent()
+
+        assertEquals(LinkState.Idle, link.state.value)
+        assertEquals(null, api.group)
+        assertTrue(stopJob.isCompleted)
+    }
+
+    @Test
+    fun `two concurrent stop calls both complete, each only after its own removeGroup`() = runTest {
+        val api = FakeP2pApi()
+        val link = newLink(api)
+        link.start(LinkConfig(CREDS, prefer5Ghz = false))
+        runCurrent()
+
+        val order = mutableListOf<String>()
+        api.onRemoveGroup = { order += "removeGroup" }
+
+        val stop1 = launch { link.stop(); order += "stop1" }
+        val stop2 = launch { link.stop(); order += "stop2" }
+        runCurrent()
+
+        assertTrue(stop1.isCompleted)
+        assertTrue(stop2.isCompleted)
+        // The supervisor processes both Stop commands - including both removeGroup() calls -
+        // before either waiting stop() caller is resumed (completing a Deferred doesn't preempt
+        // the completer). Both removeGroup() calls precede both completions, and - since commands
+        // are processed strictly in submission order - stop1 completes before stop2.
+        assertEquals(listOf("removeGroup", "removeGroup", "stop1", "stop2"), order)
     }
 
     @Test
