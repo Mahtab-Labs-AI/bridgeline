@@ -41,6 +41,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.wifiproxy.app.devices.DisconnectDialog
 import com.wifiproxy.app.session.ClientPlatform
 import com.wifiproxy.app.session.SessionPhase
 import com.wifiproxy.app.session.SessionRepository
@@ -96,8 +97,13 @@ fun HomeScreen(repository: SessionRepository, modifier: Modifier = Modifier, onS
 
         session.slots.forEach { slot ->
             // (D7) The USB laptop always keeps its seat while USB sharing is on: no Revoke.
+            // Auto slots (open admission) are listed and revocable like any other Wi-Fi device.
             val revocable = slot.platform != ClientPlatform.LAPTOP
-            SlotRow(slot = slot, onRevokeClick = if (revocable) ({ slotPendingRevoke = slot }) else null)
+            SlotRow(
+                slot = slot,
+                revokeLabel = if (session.openAdmission || slot.auto) "Disconnect" else "Revoke",
+                onRevokeClick = if (revocable) ({ slotPendingRevoke = slot }) else null,
+            )
         }
 
         HorizontalDivider()
@@ -110,20 +116,32 @@ fun HomeScreen(repository: SessionRepository, modifier: Modifier = Modifier, onS
     }
 
     slotPendingRevoke?.let { slot ->
-        AlertDialog(
-            onDismissRequest = { slotPendingRevoke = null },
-            title = { Text("Revoke ${slot.name}?") },
-            text = { Text("This device loses access immediately and must be re-invited to rejoin.") },
-            confirmButton = {
-                TextButton(onClick = {
+        // (D8) Under open admission a revoke only lasts until the device reconnects.
+        if (session.openAdmission || slot.auto) {
+            DisconnectDialog(
+                slot = slot,
+                onConfirm = {
                     repository.revoke(slot.id)
                     slotPendingRevoke = null
-                }) { Text("Revoke") }
-            },
-            dismissButton = {
-                TextButton(onClick = { slotPendingRevoke = null }) { Text("Cancel") }
-            },
-        )
+                },
+                onDismiss = { slotPendingRevoke = null },
+            )
+        } else {
+            AlertDialog(
+                onDismissRequest = { slotPendingRevoke = null },
+                title = { Text("Revoke ${slot.name}?") },
+                text = { Text("This device loses access immediately and must be re-invited to rejoin.") },
+                confirmButton = {
+                    TextButton(onClick = {
+                        repository.revoke(slot.id)
+                        slotPendingRevoke = null
+                    }) { Text("Revoke") }
+                },
+                dismissButton = {
+                    TextButton(onClick = { slotPendingRevoke = null }) { Text("Cancel") }
+                },
+            )
+        }
     }
 }
 
@@ -222,7 +240,7 @@ private fun MobileDataChip(cellularUp: Boolean) {
 }
 
 @Composable
-private fun SlotRow(slot: SlotUi, onRevokeClick: (() -> Unit)?) {
+private fun SlotRow(slot: SlotUi, revokeLabel: String, onRevokeClick: (() -> Unit)?) {
     ElevatedCard(modifier = Modifier.fillMaxWidth()) {
         Row(
             modifier = Modifier
@@ -252,7 +270,7 @@ private fun SlotRow(slot: SlotUi, onRevokeClick: (() -> Unit)?) {
             }
             if (onRevokeClick != null) {
                 IconButton(onClick = onRevokeClick) {
-                    Icon(Icons.Filled.Close, contentDescription = "Revoke ${slot.name}")
+                    Icon(Icons.Filled.Close, contentDescription = "$revokeLabel ${slot.name}")
                 }
             }
         }

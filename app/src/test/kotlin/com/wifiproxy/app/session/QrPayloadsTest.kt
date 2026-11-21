@@ -30,6 +30,12 @@ class QrPayloadsTest {
     }
 
     @Test
+    fun `open admission urls are the fixed paths the proxy serves`() {
+        assertEquals("http://192.168.49.1:8080/proxy.pac", QrPayloads.openPacUrl("192.168.49.1", 8080))
+        assertEquals("http://192.168.49.1:9090/proxy.mobileconfig", QrPayloads.openMobileConfigUrl("192.168.49.1", 9090))
+    }
+
+    @Test
     fun `mobileconfig url mirrors the pac url with a different extension`() {
         assertEquals(
             "http://192.168.49.1:8080/abc123.mobileconfig",

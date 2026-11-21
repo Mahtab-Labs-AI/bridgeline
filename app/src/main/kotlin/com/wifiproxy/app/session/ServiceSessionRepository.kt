@@ -106,12 +106,8 @@ class ServiceSessionRepository(
     /** Bumped by every [updateSettings], so the initial snapshot never overwrites a newer save. */
     private val settingsEpoch = AtomicInteger()
 
-    private val host = combine(_settings, configuredSsid) { settings, ssid -> HostView(settings, ssid) }
-
-    private val _checks = MutableStateFlow<List<SetupCheck>>(emptyList())
-    override val checks: StateFlow<List<SetupCheck>> = _checks.asStateFlow()
-
-    // A plain SharedPreferences read (in memory once loaded), like the other prefs above.
+    // A plain SharedPreferences read (in memory once loaded), like the other prefs above. Declared
+    // before [host], which combines it.
     private val _requireDeviceCodes = MutableStateFlow(hostConfig.requireDeviceCodes)
     override val requireDeviceCodes: StateFlow<Boolean> = _requireDeviceCodes.asStateFlow()
 
@@ -121,6 +117,13 @@ class ServiceSessionRepository(
         hostConfig.requireDeviceCodes = value
         _requireDeviceCodes.value = value
     }
+
+    private val host = combine(_settings, configuredSsid, _requireDeviceCodes) { settings, ssid, requireCodes ->
+        HostView(settings, ssid, requireCodes)
+    }
+
+    private val _checks = MutableStateFlow<List<SetupCheck>>(emptyList())
+    override val checks: StateFlow<List<SetupCheck>> = _checks.asStateFlow()
 
     // Unknown (null) until first computed: the USB switch stays disabled until then.
     private val _usbSwitchAllowed = MutableStateFlow<Boolean?>(null)
@@ -216,7 +219,11 @@ class ServiceSessionRepository(
     // 5s grace period means a quick tab switch doesn't restart the ticker from scratch.
     override val session: StateFlow<SessionUi> = SessionHolder.controller
         .flatMapLatest { controller -> controller?.let(::sessionFlowFor) ?: host.map(::idleUi) }
-        .stateIn(repositoryScope, SharingStarted.WhileSubscribed(5_000), idleUi(HostView(_settings.value, configuredSsid.value)))
+        .stateIn(
+            repositoryScope,
+            SharingStarted.WhileSubscribed(5_000),
+            idleUi(HostView(_settings.value, configuredSsid.value, _requireDeviceCodes.value)),
+        )
 
     override val log: StateFlow<List<LogEntry>> = SessionHolder.controller
         .flatMapLatest { it?.log ?: flowOf(emptyList()) }
@@ -252,7 +259,7 @@ class ServiceSessionRepository(
         val link: LinkState,
     )
 
-    private data class HostView(val settings: HostSettings, val ssid: String?)
+    private data class HostView(val settings: HostSettings, val ssid: String?, val requireDeviceCodes: Boolean)
 
     private fun buildUi(live: Live, host: HostView, controller: SessionController?): SessionUi {
         val up = live.link as? LinkState.Up
@@ -277,6 +284,8 @@ class ServiceSessionRepository(
             lastError = live.lastError,
             wifiUp = endpoint != null,
             proxyAddress = proxyAddress,
+            // A running session keeps the mode it started with; idle shows the next start's.
+            openAdmission = (if (sharing) controller?.openAdmission else null) ?: !host.requireDeviceCodes,
         )
     }
 
@@ -294,6 +303,7 @@ class ServiceSessionRepository(
         bytesUp = bytesUp,
         bytesDown = bytesDown,
         activeTunnels = activeTunnels,
+        auto = auto,
     )
 
     override fun start() {
@@ -316,12 +326,12 @@ class ServiceSessionRepository(
 
     /** Null unless the Wi-Fi listener is really serving the group (the PAC URL needs the
      *  group-owner address and a live port; see [SessionController.wifiEndpoint]) and [slotId] is
-     *  a live, non-pinned slot. */
+     *  a live, invited slot: never the pinned laptop, never an auto slot (it has no invite). */
     override fun inviteFor(slotId: String): DeviceInvite? {
         val controller = SessionHolder.controller.value ?: return null
         val endpoint = controller.wifiEndpoint ?: return null
         val up = endpoint.group
-        val slot = controller.registry?.slots()?.firstOrNull { it.id == slotId && !it.pinned } ?: return null
+        val slot = controller.registry?.slots()?.firstOrNull { it.id == slotId && !it.pinned && !it.auto } ?: return null
         val port = endpoint.port
         val owner = up.ownerAddress.hostAddress ?: return null
         return DeviceInvite(
@@ -329,6 +339,23 @@ class ServiceSessionRepository(
             wifiQr = QrPayloads.wifiQr(up.credentials.ssid, up.credentials.password),
             pacUrl = QrPayloads.pacUrl(owner, port, slot.token),
             mobileConfigUrl = QrPayloads.mobileConfigUrl(owner, port, slot.token),
+        )
+    }
+
+    /** The real group-owner address and Wi-Fi port, only while an open-admission session's Wi-Fi
+     *  listener really serves (same rule as [inviteFor]). */
+    override fun openInvite(): OpenInvite? {
+        val controller = SessionHolder.controller.value ?: return null
+        if (controller.openAdmission != true) return null
+        val endpoint = controller.wifiEndpoint ?: return null
+        val owner = endpoint.group.ownerAddress.hostAddress ?: return null
+        val credentials = endpoint.group.credentials
+        return OpenInvite(
+            wifiQr = QrPayloads.wifiQr(credentials.ssid, credentials.password),
+            host = owner,
+            port = endpoint.port,
+            pacUrl = QrPayloads.openPacUrl(owner, endpoint.port),
+            mobileConfigUrl = QrPayloads.openMobileConfigUrl(owner, endpoint.port),
         )
     }
 

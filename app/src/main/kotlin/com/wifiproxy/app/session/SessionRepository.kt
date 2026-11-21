@@ -30,6 +30,8 @@ data class SlotUi(
     val bytesUp: Long,
     val bytesDown: Long,
     val activeTunnels: Int,
+    /** An auto slot (open admission, D8): admitted by its IP alone, with no invite. */
+    val auto: Boolean = false,
 )
 
 data class SessionUi(
@@ -50,6 +52,9 @@ data class SessionUi(
      *  one (`127.0.0.1:8081 (USB)`) while that listener is up, else null (idle, or a Wi-Fi-only
      *  session whose Wi-Fi isn't up yet). */
     val proxyAddress: String? = null,
+    /** (D8) The running session's Wi-Fi admission while sharing, else what the next start will
+     *  use: true means no per-device code is needed. False for the demo, which shows invites. */
+    val openAdmission: Boolean = false,
 )
 
 data class HostSettings(
@@ -72,6 +77,19 @@ data class DeviceInvite(
 ) {
     /** Spec §6: the QR carries the Wi-Fi password and both URLs the slot token. */
     override fun toString() = "DeviceInvite(slotId=$slotId, wifiQr=****, pacUrl=****, mobileConfigUrl=****)"
+}
+
+/** What any device needs to join under open admission (D8): the Wi-Fi network plus the fixed
+ *  proxy addresses, the same for every device. */
+data class OpenInvite(
+    val wifiQr: String,
+    val host: String,
+    val port: Int,
+    val pacUrl: String,
+    val mobileConfigUrl: String,
+) {
+    /** Spec §6: the QR carries the Wi-Fi password. */
+    override fun toString() = "OpenInvite(wifiQr=****, host=$host, port=$port)"
 }
 
 enum class CheckStatus { OK, ACTION_NEEDED, NOT_APPLICABLE }
@@ -107,6 +125,10 @@ interface SessionRepository {
     fun addDevice(name: String, platform: ClientPlatform): DeviceInvite?
 
     fun inviteFor(slotId: String): DeviceInvite?
+
+    /** The shared setup for every device under open admission, or null unless a session with
+     *  open admission has its Wi-Fi listener serving. Null for the demo. */
+    fun openInvite(): OpenInvite? = null
 
     fun revoke(slotId: String)
 

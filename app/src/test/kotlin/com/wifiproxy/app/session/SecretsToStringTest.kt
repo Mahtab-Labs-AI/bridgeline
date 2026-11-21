@@ -31,4 +31,17 @@ class SecretsToStringTest {
         }
         assertTrue(text.contains("slot-42"))
     }
+
+    @Test
+    fun `OpenInvite never prints its Wi-Fi QR`() {
+        val text = OpenInvite(
+            wifiQr = QrPayloads.wifiQr("DIRECT-k3-HostPhone", password),
+            host = "192.168.49.1",
+            port = 8080,
+            pacUrl = QrPayloads.openPacUrl("192.168.49.1", 8080),
+            mobileConfigUrl = QrPayloads.openMobileConfigUrl("192.168.49.1", 8080),
+        ).toString()
+        assertFalse(text.contains(password))
+        assertFalse(text.contains("WIFI:"))
+    }
 }

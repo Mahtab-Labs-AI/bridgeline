@@ -21,4 +21,9 @@ object QrPayloads {
 
     fun mobileConfigUrl(host: String, port: Int, token: String): String =
         "http://$host:$port/$token.mobileconfig"
+
+    /** Open admission's fixed PAC path (D8), served to any device in the group. */
+    fun openPacUrl(host: String, port: Int): String = "http://$host:$port/proxy.pac"
+
+    fun openMobileConfigUrl(host: String, port: Int): String = "http://$host:$port/proxy.mobileconfig"
 }

@@ -59,6 +59,7 @@ import com.wifiproxy.app.kit.KitProgress
 import com.wifiproxy.app.kit.LaptopKitBuilder
 import com.wifiproxy.app.session.ClientPlatform
 import com.wifiproxy.app.session.DeviceInvite
+import com.wifiproxy.app.session.OpenInvite
 import com.wifiproxy.app.session.SessionPhase
 import com.wifiproxy.app.session.SessionRepository
 import com.wifiproxy.app.session.SlotUi
@@ -169,9 +170,227 @@ private fun DemoDevicesContent(repository: SessionRepository, modifier: Modifier
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun RealDevicesContent(repository: SessionRepository, modifier: Modifier, usbSharingEnabled: Boolean) {
+    val session by repository.session.collectAsStateWithLifecycle()
+    if (session.openAdmission) {
+        OpenDevicesContent(repository, modifier, usbSharingEnabled)
+    } else {
+        CodedDevicesContent(repository, modifier, usbSharingEnabled)
+    }
+}
+
+/**
+ * (D8) Open admission: no per-device invite and no "Add device". One shared setup - the Wi-Fi QR
+ * plus the fixed proxy addresses, each with a Copy button - and the devices that joined, each
+ * with a Disconnect (a revoke) that only lasts while they don't know the password.
+ */
+@Composable
+private fun OpenDevicesContent(repository: SessionRepository, modifier: Modifier, usbSharingEnabled: Boolean) {
+    val session by repository.session.collectAsStateWithLifecycle()
+    var slotPendingDisconnect by remember { mutableStateOf<SlotUi?>(null) }
+
+    val laptopSlot = session.slots.firstOrNull { it.platform == ClientPlatform.LAPTOP }
+    val wifiSlots = session.slots.filter { it.platform != ClientPlatform.LAPTOP }
+    val full = session.slots.size >= session.maxClients
+    // Re-read only when what it's built from changes, not on every 1 s counter tick.
+    val invite = remember(repository, session.phase, session.wifiUp, session.proxyAddress, session.ssid) {
+        repository.openInvite()
+    }
+
+    Column(
+        modifier = modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        ScreenTitle(text = "Devices", trailing = "${session.slots.size}/${session.maxClients}")
+
+        if (laptopSlot != null || usbSharingEnabled) {
+            LaptopUsbCard(slot = laptopSlot)
+        }
+
+        if (invite != null) {
+            OpenSetupCard(invite = invite, ssid = session.ssid)
+        } else {
+            Text(
+                text = when {
+                    session.phase == SessionPhase.IDLE -> "Start sharing to connect Wi-Fi devices."
+                    else -> session.degradedReason ?: "Waiting for the Wi-Fi Direct group…"
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+
+        Text(text = "Connected devices", style = MaterialTheme.typography.titleMedium)
+        if (wifiSlots.isEmpty()) {
+            Text(
+                text = "None yet. A device shows up here once it uses the proxy.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        wifiSlots.forEach { slot ->
+            ConnectedDeviceRow(slot = slot, onDisconnect = { slotPendingDisconnect = slot })
+        }
+        if (full) {
+            Text(
+                text = "All ${session.maxClients} slots are in use, so a new device gets no access. " +
+                    "Disconnect one, or raise the limit in Settings.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+            )
+        }
+
+        Spacer(modifier = Modifier.height(8.dp))
+        LaptopKitCard()
+    }
+
+    slotPendingDisconnect?.let { slot ->
+        DisconnectDialog(
+            slot = slot,
+            onConfirm = {
+                repository.revoke(slot.id)
+                slotPendingDisconnect = null
+            },
+            onDismiss = { slotPendingDisconnect = null },
+        )
+    }
+}
+
+/** Shared with Home: what a revoke means under open admission (D8). */
+@Composable
+internal fun DisconnectDialog(slot: SlotUi, onConfirm: () -> Unit, onDismiss: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Disconnect ${slot.name}?") },
+        text = {
+            Text(
+                buildString {
+                    append("Its connections close now")
+                    append(if (slot.auto) "." else ", and its invite is deleted.")
+                    append(" It can reconnect while it knows the Wi-Fi password: to keep it out, change the password in Settings.")
+                },
+            )
+        },
+        confirmButton = { TextButton(onClick = onConfirm) { Text("Disconnect") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
+}
+
+@Composable
+private fun OpenSetupCard(invite: OpenInvite, ssid: String) {
+    val context = LocalContext.current
+    ElevatedCard(modifier = Modifier.fillMaxWidth()) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text(text = "1. Join the Wi-Fi network", style = MaterialTheme.typography.titleSmall)
+            Text(
+                text = "Scan the QR, or join $ssid with the password from Settings.",
+                style = MaterialTheme.typography.bodySmall,
+            )
+            Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                RevealableWifiQr(wifiQr = invite.wifiQr)
+            }
+
+            HorizontalDivider()
+            Text(text = "2. Set the proxy", style = MaterialTheme.typography.titleSmall)
+
+            Text(text = "Android or laptop", style = MaterialTheme.typography.labelLarge)
+            Text(
+                text = "In the Wi-Fi network's settings: Proxy → Automatic, then paste this URL.",
+                style = MaterialTheme.typography.bodySmall,
+            )
+            CopyableCommand(label = "Automatic proxy URL", command = invite.pacUrl, context = context)
+            Text(text = "Or Proxy → Manual:", style = MaterialTheme.typography.bodySmall)
+            CopyableCommand(label = "Proxy host", command = invite.host, context = context)
+            CopyableCommand(label = "Proxy port", command = invite.port.toString(), context = context)
+            Text(
+                text = "On Android, also set Private DNS to Off or Automatic.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(text = "iPhone", style = MaterialTheme.typography.labelLarge)
+            Text(
+                text = "Settings → Wi-Fi → (i) next to the network → Configure Proxy → Automatic, then paste this URL.",
+                style = MaterialTheme.typography.bodySmall,
+            )
+            CopyableCommand(label = "Automatic proxy URL for iPhone", command = invite.pacUrl, context = context)
+            Text(
+                text = "Or open this link in Safari and install the profile:",
+                style = MaterialTheme.typography.bodySmall,
+            )
+            CopyableCommand(label = "Profile link", command = invite.mobileConfigUrl, context = context)
+        }
+    }
+}
+
+@Composable
+private fun ConnectedDeviceRow(slot: SlotUi, onDisconnect: () -> Unit) {
+    ElevatedCard(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                imageVector = slot.platform.icon(),
+                contentDescription = null,
+                modifier = Modifier.size(32.dp),
+            )
+            Spacer(modifier = Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(text = slot.name, style = MaterialTheme.typography.titleSmall)
+                Text(
+                    text = slot.ip ?: "Not connected",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    text = "↑ ${formatBytes(slot.bytesUp)}   ↓ ${formatBytes(slot.bytesDown)}",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            TextButton(onClick = onDisconnect) { Text("Disconnect") }
+        }
+    }
+}
+
+/** The Wi-Fi QR carries the password, so it stays covered until tapped. */
+@Composable
+private fun RevealableWifiQr(wifiQr: String) {
+    var revealed by remember(wifiQr) { mutableStateOf(false) }
+    Box(contentAlignment = Alignment.Center) {
+        QrCode(content = wifiQr)
+        if (!revealed) {
+            Box(
+                modifier = Modifier
+                    .size(220.dp)
+                    .background(
+                        MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.97f),
+                        RoundedCornerShape(8.dp),
+                    )
+                    .clickable { revealed = true },
+                contentAlignment = Alignment.Center,
+            ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Icon(Icons.Filled.Visibility, contentDescription = null)
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text("Tap to reveal", style = MaterialTheme.typography.labelLarge)
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun CodedDevicesContent(repository: SessionRepository, modifier: Modifier, usbSharingEnabled: Boolean) {
     val session by repository.session.collectAsStateWithLifecycle()
     val snackbarHostState = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
@@ -504,7 +723,6 @@ private fun AddDeviceDialog(onDismiss: () -> Unit, onConfirm: (String, ClientPla
 
 @Composable
 private fun InviteSheetContent(active: ActiveInvite) {
-    var wifiRevealed by remember(active) { mutableStateOf(false) }
     val context = LocalContext.current
     val configUrl = if (active.platform == ClientPlatform.IPHONE) {
         active.invite.mobileConfigUrl
@@ -524,27 +742,7 @@ private fun InviteSheetContent(active: ActiveInvite) {
         Text(text = "Invite: ${active.name}", style = MaterialTheme.typography.titleLarge)
 
         Text(text = "1. Wi-Fi network", style = MaterialTheme.typography.titleSmall)
-        Box(contentAlignment = Alignment.Center) {
-            QrCode(content = active.invite.wifiQr)
-            if (!wifiRevealed) {
-                Box(
-                    modifier = Modifier
-                        .size(220.dp)
-                        .background(
-                            MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.97f),
-                            RoundedCornerShape(8.dp),
-                        )
-                        .clickable { wifiRevealed = true },
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Icon(Icons.Filled.Visibility, contentDescription = null)
-                        Spacer(modifier = Modifier.height(8.dp))
-                        Text("Tap to reveal", style = MaterialTheme.typography.labelLarge)
-                    }
-                }
-            }
-        }
+        RevealableWifiQr(wifiQr = active.invite.wifiQr)
 
         HorizontalDivider()
 
