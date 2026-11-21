@@ -29,6 +29,7 @@ import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 import kotlin.test.fail
 
@@ -49,12 +50,14 @@ class ProxyServerTest {
         maxPendingHeads: Int = 64,
         connectTimeoutMs: Long = 10_000,
         openAdmission: Boolean = false,
+        idleSeatMs: Long = 3 * 60_000L,
         onError: (Throwable) -> Unit = {},
     ) {
         val config = ProxyConfig(
             bindAddress = loopback, port = 0, peerSubnet = peerSubnet, wifi = wifi, idleTimeoutMs = idleMs,
             maxConnections = maxConnections, maxPendingHeadsPerPeer = maxPendingHeadsPerPeer,
             maxPendingHeads = maxPendingHeads, connectTimeoutMs = connectTimeoutMs, openAdmission = openAdmission,
+            idleSeatMs = idleSeatMs,
         )
         server = ProxyServer(config, registry, egress, filter, onError).also { it.start() }
     }
@@ -68,6 +71,8 @@ class ProxyServerTest {
     /** A second loopback address, so a test can act as a guest rather than the listener's own
      *  (owner) address, which open admission never auto-admits. */
     private val guest = InetAddress.getByName("127.0.0.2")
+    private val guest2 = InetAddress.getByName("127.0.0.3")
+    private val guest3 = InetAddress.getByName("127.0.0.4")
 
     private fun connect(from: InetAddress?): Socket =
         if (from == null) Socket(loopback, server.localPort) else Socket(loopback, server.localPort, from, 0)
@@ -263,6 +268,85 @@ class ProxyServerTest {
         val slot = registry.slots().single()
         assertTrue(server.revoke(slot.id))
         assertClosed(s)
+    }
+
+    @Test
+    fun `a full registry with one idle auto slot admits a new peer and closes the idle tunnel`() {
+        var now = 0L
+        registry = ClientRegistry(maxClients = 2, clock = { now })
+        start(openAdmission = true, idleSeatMs = 1_000)
+        val echo = startEcho()
+        val (s1, head1) = openConnect(echo.localPort, from = guest)
+        assertTrue(head1.startsWith("HTTP/1.1 200"), head1)
+        val idleSlot = registry.slots().single { it.boundIp == guest }
+        now = 10L
+        assertNotNull(registry.admitOrCreate(guest2)) // fills the second seat, freshly active
+        now = 1_005L // guest's slot (last active at 0) is idle past idleSeatMs; guest2's (at 10) isn't
+        val (s2, head2) = openConnect(echo.localPort, from = guest3)
+        assertTrue(head2.startsWith("HTTP/1.1 200"), head2)
+        closeables += s2
+        assertClosed(s1)
+        assertTrue(registry.slots().none { it.id == idleSlot.id })
+        assertEquals(setOf(guest2, guest3), registry.slots().mapNotNull { it.boundIp }.toSet())
+    }
+
+    @Test
+    fun `a full registry with no idle auto slot still gives 403`() {
+        var now = 0L
+        registry = ClientRegistry(maxClients = 2, clock = { now })
+        start(openAdmission = true, idleSeatMs = 1_000)
+        registry.admitOrCreate(guest)
+        now = 10L
+        registry.admitOrCreate(guest2)
+        now = 500L // neither slot has been idle for idleSeatMs yet
+        assertTrue(
+            rawRequest("CONNECT 127.0.0.1:1 HTTP/1.1\r\n\r\n", from = guest3).startsWith("HTTP/1.1 403"),
+        )
+        assertEquals(2, registry.slots().size)
+    }
+
+    @Test
+    fun `a full registry of only pinned or coded slots gives 403 even when they are old`() {
+        var now = 0L
+        registry = ClientRegistry(maxClients = 2, clock = { now })
+        registry.addPinnedSlot("Laptop (USB)", guest)
+        val coded = registry.addSlot("phone")!!
+        registry.onPacFetch(coded.token, guest2)
+        start(openAdmission = true, idleSeatMs = 1_000)
+        now = 1_000_000L // both slots are ancient, but neither is an auto slot
+        assertTrue(
+            rawRequest("CONNECT 127.0.0.1:1 HTTP/1.1\r\n\r\n", from = guest3).startsWith("HTTP/1.1 403"),
+        )
+        assertEquals(2, registry.slots().size)
+    }
+
+    @Test
+    fun `the same eviction works through the fixed pac path`() {
+        var now = 0L
+        registry = ClientRegistry(maxClients = 2, clock = { now })
+        start(openAdmission = true, idleSeatMs = 1_000)
+        registry.admitOrCreate(guest)
+        now = 10L
+        registry.admitOrCreate(guest2)
+        now = 1_005L
+        val response = rawRequest("GET /proxy.pac HTTP/1.1\r\nHost: x\r\n\r\n", from = guest3)
+        assertTrue(response.startsWith("HTTP/1.1 200"), response)
+        assertTrue(registry.admittedSlot(guest3)!!.auto)
+        assertTrue(registry.slots().none { it.boundIp == guest })
+        assertEquals(2, registry.slots().size)
+    }
+
+    @Test
+    fun `a closed server never evicts even when idle and full`() {
+        var now = 0L
+        registry = ClientRegistry(maxClients = 1, clock = { now })
+        val idleAuto = registry.admitOrCreate(guest)!!
+        start(openAdmission = false, idleSeatMs = 1_000)
+        now = 1_000_000L
+        assertTrue(
+            rawRequest("CONNECT 127.0.0.1:1 HTTP/1.1\r\n\r\n", from = guest2).startsWith("HTTP/1.1 403"),
+        )
+        assertEquals(listOf(idleAuto.id), registry.slots().map { it.id })
     }
 
     @Test

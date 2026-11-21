@@ -1,6 +1,7 @@
 package com.wifiproxy.core
 
 import com.wifiproxy.core.clients.ClientRegistry
+import com.wifiproxy.core.clients.Slot
 import com.wifiproxy.core.content.LocalContent
 import com.wifiproxy.core.content.Probes
 import com.wifiproxy.core.egress.Dialer
@@ -136,7 +137,8 @@ class ProxyServer(
         val dialer = Dialer.forEgress(nio, egress, timeoutMs = config.connectTimeoutMs)
         val boundPort = (ch.localAddress as InetSocketAddress).port
         val local = LocalContent(
-            registry, config.bindAddress.hostAddress, boundPort, config.wifi, config.openAdmission, owner = config.bindAddress,
+            registry, config.bindAddress.hostAddress, boundPort, config.wifi, config.openAdmission,
+            owner = config.bindAddress, admit = ::admitOpen,
         )
         val s = CoroutineScope(SupervisorJob() + Dispatchers.Default + CoroutineExceptionHandler { _, e -> safeOnError(e) })
         val r = Run(nio, ch, dialer, local, s)
@@ -168,6 +170,20 @@ class ProxyServer(
     fun updateFilter(newFilter: DestinationFilter) {
         filter = newFilter
     }
+
+    /**
+     * Open admission's actual admission call: [ClientRegistry.admitOrCreate], or - only when the
+     * registry is full - one on-demand eviction of the least-recently-active idle auto slot
+     * (through [revoke], which also cancels its tunnels) followed by a single retry. Nothing is
+     * evicted while there's room, and there's no background sweeper: a full registry with no idle
+     * auto slot just stays full (403/null). Never evicts a pinned or coded slot; see
+     * [ClientRegistry.idleAutoSlotToEvict].
+     */
+    private fun admitOpen(peer: InetAddress): Slot? =
+        registry.admitOrCreate(peer) ?: registry.idleAutoSlotToEvict(config.idleSeatMs)?.let {
+            revoke(it)
+            registry.admitOrCreate(peer)
+        }
 
     private fun safeOnError(e: Throwable) {
         // A throwing callback must not bring down the accept loop or the Android process.
@@ -318,7 +334,7 @@ class ProxyServer(
         // listener over the same registry never auto-creates a slot. A full registry is a 403. The
         // group owner's own address (the host phone's apps) never gets an auto slot either.
         val open = config.openAdmission && peer != config.bindAddress
-        val admitted = if (open) registry.admitOrCreate(peer) else registry.admittedSlot(peer)
+        val admitted = if (open) admitOpen(peer) else registry.admittedSlot(peer)
         val slot = admitted ?: return respond(r.nio, client, HttpResponse.FORBIDDEN)
         // The peer is genuinely admitted now; it's no longer part of the pre-admission DoS surface
         // the pending-head caps exist to bound, even though its response (or tunnel) isn't done yet.

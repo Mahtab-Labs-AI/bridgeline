@@ -5,6 +5,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
+import kotlin.test.assertNotEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -366,6 +367,58 @@ class ClientRegistryTest {
         val auto = registry().admitOrCreate(ip("192.168.49.10"))!!
         assertFalse(auto.toString().contains(auto.token), auto.toString())
         assertTrue(auto.toString().contains("auto=true"), auto.toString())
+    }
+
+    @Test
+    fun `idleAutoSlotToEvict returns the least-recently-active idle auto slot`() {
+        var now = 1_000L
+        val r = ClientRegistry(maxClients = 3, tokens = tokens, clock = { now })
+        val a = r.admitOrCreate(ip("192.168.49.10"))!!
+        now = 2_000L
+        val b = r.admitOrCreate(ip("192.168.49.20"))!!
+        now = 10_000L
+        assertEquals(a.id, r.idleAutoSlotToEvict(5_000L))
+        assertNotEquals(b.id, r.idleAutoSlotToEvict(5_000L))
+    }
+
+    @Test
+    fun `pinned and coded slots are never idle-eviction candidates`() {
+        var now = 1_000L
+        val r = ClientRegistry(maxClients = 3, tokens = tokens, clock = { now })
+        r.addPinnedSlot("Laptop (USB)", ip("127.0.0.1"))
+        val coded = r.addSlot("phone")!!
+        r.onPacFetch(coded.token, ip("192.168.49.10"))
+        now = 1_000_000L
+        assertNull(r.idleAutoSlotToEvict(5_000L))
+    }
+
+    @Test
+    fun `a slot is not a candidate before idleMs has passed`() {
+        var now = 1_000L
+        val r = ClientRegistry(maxClients = 3, tokens = tokens, clock = { now })
+        r.admitOrCreate(ip("192.168.49.10"))!!
+        now = 5_999L
+        assertNull(r.idleAutoSlotToEvict(5_000L))
+        now = 6_000L
+        assertNotNull(r.idleAutoSlotToEvict(5_000L))
+    }
+
+    @Test
+    fun `addBytes refreshes activity so a recently-active auto slot is not a candidate`() {
+        var now = 1_000L
+        val r = ClientRegistry(maxClients = 3, tokens = tokens, clock = { now })
+        val a = r.admitOrCreate(ip("192.168.49.10"))!!
+        now = 100_000L
+        r.addBytes(a.id, 10, 0)
+        now = 104_000L
+        assertNull(r.idleAutoSlotToEvict(5_000L))
+        now = 105_000L
+        assertEquals(a.id, r.idleAutoSlotToEvict(5_000L))
+    }
+
+    @Test
+    fun `idleAutoSlotToEvict on an empty registry gives null`() {
+        assertNull(registry().idleAutoSlotToEvict(5_000L))
     }
 
     @Test

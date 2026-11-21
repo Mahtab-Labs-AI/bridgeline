@@ -35,6 +35,9 @@ data class ProxyConfig(
      *  `/proxy.mobileconfig`. A per-listener property, never a registry-wide one: the registry is
      *  shared with the USB listener, which must never admit anyone but its pinned laptop. */
     val openAdmission: Boolean = false,
+    /** Open admission only: an auto slot idle (see [ClientRegistry.idleAutoSlotToEvict]) for at
+     *  least this long may be evicted, on demand, to seat a new peer when every seat is taken. */
+    val idleSeatMs: Long = 3 * 60_000L,
 ) {
     init {
         require(!bindAddress.isAnyLocalAddress) { "refusing wildcard bind address $bindAddress" }
@@ -47,5 +50,6 @@ data class ProxyConfig(
         require(maxConnections > 0) { "maxConnections must be positive" }
         require(maxPendingHeadsPerPeer > 0) { "maxPendingHeadsPerPeer must be positive" }
         require(maxPendingHeads > 0) { "maxPendingHeads must be positive" }
+        require(idleSeatMs > 0) { "idleSeatMs must be positive" }
     }
 }

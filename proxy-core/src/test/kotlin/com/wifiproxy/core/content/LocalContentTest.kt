@@ -184,6 +184,9 @@ class LocalContentTest {
         assertFailsWith<IllegalArgumentException> {
             ProxyConfig(bindAddress = bindAddress, peerSubnet = peerSubnet, connectTimeoutMs = 0)
         }
+        assertFailsWith<IllegalArgumentException> {
+            ProxyConfig(bindAddress = bindAddress, peerSubnet = peerSubnet, idleSeatMs = 0)
+        }
     }
 
     @Test

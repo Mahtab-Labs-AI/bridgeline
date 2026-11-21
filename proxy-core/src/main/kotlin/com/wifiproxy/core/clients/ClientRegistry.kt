@@ -22,9 +22,13 @@ data class Slot(
     val pinned: Boolean = false,
     /** Created by [ClientRegistry.admitOrCreate] for an uninvited peer (open admission). */
     val auto: Boolean = false,
+    /** The last admission/request ([lastSeenMs]) or [ClientRegistry.addBytes] call for this slot.
+     *  Used by [ClientRegistry.idleAutoSlotToEvict]; an open tunnel with no fresh bytes doesn't
+     *  count as activity. */
+    val lastActivityMs: Long = 0L,
 ) {
     override fun toString(): String =
-        "Slot(id=$id, name=$name, token=<redacted>, boundIp=$boundIp, createdAtMs=$createdAtMs, lastSeenMs=$lastSeenMs, bytesUp=$bytesUp, bytesDown=$bytesDown, activeTunnels=$activeTunnels, pinned=$pinned, auto=$auto)"
+        "Slot(id=$id, name=$name, token=<redacted>, boundIp=$boundIp, createdAtMs=$createdAtMs, lastSeenMs=$lastSeenMs, bytesUp=$bytesUp, bytesDown=$bytesDown, activeTunnels=$activeTunnels, pinned=$pinned, auto=$auto, lastActivityMs=$lastActivityMs)"
 }
 
 /** The persistent part of a slot. The Android layer stores these and passes them back as `initial`. */
@@ -64,10 +68,13 @@ class ClientRegistry(
         var activeTunnels = 0
         val bytesUp = AtomicLong()
         val bytesDown = AtomicLong()
+        // Starts at the slot's creation time so a never-touched slot isn't mistaken for one idle
+        // since the epoch; addBytes updates it without the lock, as the byte counters already do.
+        val lastActivityMs = AtomicLong(record.createdAtMs)
 
         fun toSlot() = Slot(
             record.id, record.name, record.token, boundIp, record.createdAtMs,
-            lastSeenMs, bytesUp.get(), bytesDown.get(), activeTunnels, pinned, auto,
+            lastSeenMs, bytesUp.get(), bytesDown.get(), activeTunnels, pinned, auto, lastActivityMs.get(),
         )
     }
 
@@ -137,13 +144,17 @@ class ClientRegistry(
         if (entry.pinned || entry.auto) return null
         detach(ip, keep = entry)
         entry.boundIp = ip
-        entry.lastSeenMs = clock()
+        val now = clock()
+        entry.lastSeenMs = now
+        entry.lastActivityMs.set(now)
         entry.toSlot()
     }
 
     fun admittedSlot(ip: InetAddress): Slot? = synchronized(lock) {
         val entry = entries.values.firstOrNull { it.boundIp == ip } ?: return null
-        entry.lastSeenMs = clock()
+        val now = clock()
+        entry.lastSeenMs = now
+        entry.lastActivityMs.set(now)
         entry.toSlot()
     }
 
@@ -158,19 +169,38 @@ class ClientRegistry(
      */
     fun admitOrCreate(ip: InetAddress): Slot? = synchronized(lock) {
         entries.values.firstOrNull { it.boundIp == ip }?.let {
-            it.lastSeenMs = clock()
+            val now = clock()
+            it.lastSeenMs = now
+            it.lastActivityMs.set(now)
             return it.toSlot()
         }
         if (entries.size >= maxClients) return null
         val token = tokens.next()
         require(TOKEN_PATTERN.matches(token)) { "generated token has an invalid format" }
         val name = if (ip is Inet4Address) "Device ${ip.address[3].toInt() and 0xff}" else "Device"
-        val record = SlotRecord(UUID.randomUUID().toString(), name, token, clock())
+        val now = clock()
+        val record = SlotRecord(UUID.randomUUID().toString(), name, token, now)
         Entry(record, auto = true).also {
             it.boundIp = ip
-            it.lastSeenMs = clock()
+            it.lastSeenMs = now
+            it.lastActivityMs.set(now)
             entries[record.id] = it
         }.toSlot()
+    }
+
+    /**
+     * Under [lock], the id of the auto slot with the smallest [Slot.lastActivityMs] that is at
+     * least [idleMs] old (`lastActivityMs <= clock() - idleMs`), or null if there is none. Pinned
+     * and coded slots are never candidates - only an auto slot's seat ever frees itself. An open
+     * tunnel with no fresh bytes doesn't keep a slot out of consideration (see
+     * [ClientRegistry.addBytes]).
+     */
+    fun idleAutoSlotToEvict(idleMs: Long): String? = synchronized(lock) {
+        val threshold = clock() - idleMs
+        entries.values
+            .filter { it.auto && it.lastActivityMs.get() <= threshold }
+            .minByOrNull { it.lastActivityMs.get() }
+            ?.record?.id
     }
 
     /** Frees [ip] from every non-pinned slot but [keep]: an auto slot is removed, a coded one
@@ -204,6 +234,7 @@ class ClientRegistry(
         val entry = synchronized(lock) { entries[id] } ?: return
         entry.bytesUp.addAndGet(up)
         entry.bytesDown.addAndGet(down)
+        entry.lastActivityMs.set(clock())
     }
 
     /**

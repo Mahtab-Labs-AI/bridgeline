@@ -2,6 +2,7 @@ package com.wifiproxy.core.content
 
 import com.wifiproxy.core.WifiCredentials
 import com.wifiproxy.core.clients.ClientRegistry
+import com.wifiproxy.core.clients.Slot
 import com.wifiproxy.core.http.HttpResponse
 import com.wifiproxy.core.http.ProxyRequest
 import java.net.InetAddress
@@ -10,11 +11,14 @@ import java.net.InetAddress
  * Serves /<token>.pac and /<token>.mobileconfig. A successful fetch binds the slot to the peer IP.
  *
  * With [openAdmission] it also serves the fixed /proxy.pac and /proxy.mobileconfig, which admit
- * the peer through [ClientRegistry.admitOrCreate] (403 while every seat is taken). Without it,
- * those paths are 404 like any other unknown path. Under open admission an unknown token falls
- * back to [ClientRegistry.admitOrCreate] too, so an old per-device URL keeps working without
- * reserving a seat. [owner] - the listener's own (group-owner) address - is never given an auto
- * slot: the host phone's own apps must not take a seat.
+ * the peer through [admit] (403 while every seat is taken). Without it, those paths are 404 like
+ * any other unknown path. Under open admission an unknown token falls back to [admit] too, so an
+ * old per-device URL keeps working without reserving a seat. [owner] - the listener's own
+ * (group-owner) address - is never given an auto slot: the host phone's own apps must not take a
+ * seat. [admit] is open admission's actual admission call - [ClientRegistry.admitOrCreate] by
+ * default; `ProxyServer` passes its own `admitOpen`, which may evict an idle auto slot first, so
+ * the fixed paths and the token-path fallback get the same on-demand eviction as the manual
+ * proxy. This keeps `LocalContent` free of any `ProxyServer` dependency beyond that one function.
  */
 class LocalContent(
     private val registry: ClientRegistry,
@@ -23,6 +27,7 @@ class LocalContent(
     private val wifi: WifiCredentials?,
     private val openAdmission: Boolean = false,
     private val owner: InetAddress? = null,
+    private val admit: (InetAddress) -> Slot? = registry::admitOrCreate,
 ) {
     fun serve(request: ProxyRequest.Local, peer: InetAddress): HttpResponse {
         if (openAdmission) {
@@ -48,9 +53,9 @@ class LocalContent(
         return render(extension, pacUrl = "http://$proxyHost:$proxyPort/$FIXED_NAME.pac", profileSeed = "open:${wifi?.ssid}")
     }
 
-    /** Open admission's lookup: never creates a slot for [owner]. */
+    /** Open admission's lookup: never creates (or evicts for) a slot for [owner]. */
     private fun admitOpen(peer: InetAddress) =
-        if (peer == owner) registry.admittedSlot(peer) else registry.admitOrCreate(peer)
+        if (peer == owner) registry.admittedSlot(peer) else admit(peer)
 
     private fun render(extension: String, pacUrl: String, profileSeed: String): HttpResponse {
         val pac = PacFile.render(proxyHost, proxyPort)
