@@ -37,7 +37,7 @@ data class ProxyConfig(
     val openAdmission: Boolean = false,
     /** Open admission only: an auto slot idle (see [ClientRegistry.idleAutoSlotToEvict]) for at
      *  least this long may be evicted, on demand, to seat a new peer when every seat is taken. */
-    val idleSeatMs: Long = 3 * 60_000L,
+    val idleSeatMs: Long = DEFAULT_IDLE_SEAT_MS,
 ) {
     init {
         require(!bindAddress.isAnyLocalAddress) { "refusing wildcard bind address $bindAddress" }
@@ -51,5 +51,11 @@ data class ProxyConfig(
         require(maxPendingHeadsPerPeer > 0) { "maxPendingHeadsPerPeer must be positive" }
         require(maxPendingHeads > 0) { "maxPendingHeads must be positive" }
         require(idleSeatMs > 0) { "idleSeatMs must be positive" }
+    }
+
+    companion object {
+        /** [idleSeatMs]'s default (3 minutes); the app builds its "idle for N minutes" copy from
+         *  this instead of hard-coding the number a second time. */
+        const val DEFAULT_IDLE_SEAT_MS: Long = 3 * 60_000L
     }
 }

@@ -197,10 +197,15 @@ class ClientRegistry(
      */
     fun idleAutoSlotToEvict(idleMs: Long): String? = synchronized(lock) {
         val threshold = clock() - idleMs
-        entries.values
-            .filter { it.auto && it.lastActivityMs.get() <= threshold }
-            .minByOrNull { it.lastActivityMs.get() }
-            ?.record?.id
+        // Read each entry's lastActivityMs exactly once: addBytes updates it without the lock, so
+        // reading it again for minByOrNull after the filter already read it could rank a slot by
+        // a value that isn't the one that qualified it (or vice versa) if a byte arrived in between.
+        entries.values.asSequence()
+            .filter { it.auto }
+            .map { it.record.id to it.lastActivityMs.get() }
+            .filter { (_, lastActivityMs) -> lastActivityMs <= threshold }
+            .minByOrNull { (_, lastActivityMs) -> lastActivityMs }
+            ?.first
     }
 
     /** Frees [ip] from every non-pinned slot but [keep]: an auto slot is removed, a coded one
@@ -234,7 +239,10 @@ class ClientRegistry(
         val entry = synchronized(lock) { entries[id] } ?: return
         entry.bytesUp.addAndGet(up)
         entry.bytesDown.addAndGet(down)
-        entry.lastActivityMs.set(clock())
+        // accumulateAndGet(::maxOf), not set(): two concurrent addBytes calls (or one racing a
+        // lastSeenMs update) must never move lastActivityMs backwards, whichever clock() reading
+        // happens to land last.
+        entry.lastActivityMs.accumulateAndGet(clock(), ::maxOf)
     }
 
     /**

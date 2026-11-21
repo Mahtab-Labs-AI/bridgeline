@@ -422,6 +422,20 @@ class ClientRegistryTest {
     }
 
     @Test
+    fun `idleAutoSlotToEvict returns the auto slot even next to older pinned and coded slots`() {
+        var now = 1_000L
+        val r = ClientRegistry(maxClients = 3, tokens = tokens, clock = { now })
+        // Pinned and coded, both older (lower lastActivityMs) than the auto slot below.
+        r.addPinnedSlot("Laptop (USB)", ip("127.0.0.1"))
+        val coded = r.addSlot("phone")!!
+        r.onPacFetch(coded.token, ip("192.168.49.10"))
+        now = 50_000L
+        val auto = r.admitOrCreate(ip("192.168.49.20"))!!
+        now = 60_000L
+        assertEquals(auto.id, r.idleAutoSlotToEvict(5_000L))
+    }
+
+    @Test
     fun `toString never contains the token`() {
         val r = registry()
         val slot = r.addSlot("a")!!

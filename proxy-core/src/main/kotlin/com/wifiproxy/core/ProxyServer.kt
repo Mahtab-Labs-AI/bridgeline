@@ -60,6 +60,9 @@ class ProxyServer(
     private val egress: Egress,
     initialFilter: DestinationFilter,
     private val onError: (Throwable) -> Unit = {},
+    /** Called (on whichever thread triggered it) every time [admitOpen] evicts an idle auto slot.
+     *  Diagnostics only - carries no slot id, name or address. */
+    private val onEvicted: () -> Unit = {},
 ) {
     private class ProxyFailure(val response: HttpResponse) : Exception()
 
@@ -171,19 +174,40 @@ class ProxyServer(
         filter = newFilter
     }
 
+    /** Serializes only the slow (eviction) path below, so a burst of newcomers hitting a full
+     *  registry at once can't each pick the same idle victim and evict several slots for what
+     *  should cost at most one. The registry's own lock is never held while this one is: every
+     *  call into [registry] here still takes (and releases) that lock on its own. */
+    private val evictLock = Any()
+
     /**
-     * Open admission's actual admission call: [ClientRegistry.admitOrCreate], or - only when the
-     * registry is full - one on-demand eviction of the least-recently-active idle auto slot
-     * (through [revoke], which also cancels its tunnels) followed by a single retry. Nothing is
-     * evicted while there's room, and there's no background sweeper: a full registry with no idle
-     * auto slot just stays full (403/null). Never evicts a pinned or coded slot; see
-     * [ClientRegistry.idleAutoSlotToEvict].
+     * Open admission's one admission call, used on every path (manual proxy, fixed `/proxy.pac`,
+     * token-fallback): never seats [config.bindAddress] (the host phone's own apps), and is a
+     * plain [ClientRegistry.admittedSlot] lookup - never an admission, never an eviction - whenever
+     * [ProxyConfig.openAdmission] is off. Otherwise: [ClientRegistry.admitOrCreate], or - only when
+     * the registry is full - one on-demand eviction of the least-recently-active idle auto slot
+     * (through [revoke], which also cancels its tunnels) followed by a single retry inside
+     * [evictLock]. Nothing is evicted while there's room, and there's no background sweeper: a
+     * full registry with no idle auto slot just stays full (403/null). Never evicts a pinned or
+     * coded slot; see [ClientRegistry.idleAutoSlotToEvict].
+     *
+     * **Pick-to-revoke window.** [ClientRegistry.idleAutoSlotToEvict] picks its candidate and
+     * returns its id; [revoke] then removes that id a moment later. A victim that receives fresh
+     * traffic in that in-between window (microseconds, not milliseconds) is still evicted even
+     * though it's no longer idle at the instant of revocation - acceptable, since it only gets
+     * here after sitting idle for a full [ProxyConfig.idleSeatMs] (3 minutes by default).
      */
-    private fun admitOpen(peer: InetAddress): Slot? =
-        registry.admitOrCreate(peer) ?: registry.idleAutoSlotToEvict(config.idleSeatMs)?.let {
-            revoke(it)
-            registry.admitOrCreate(peer)
+    private fun admitOpen(peer: InetAddress): Slot? {
+        if (!config.openAdmission || peer == config.bindAddress) return registry.admittedSlot(peer)
+        registry.admitOrCreate(peer)?.let { return it }
+        return synchronized(evictLock) {
+            registry.admitOrCreate(peer) ?: registry.idleAutoSlotToEvict(config.idleSeatMs)?.let {
+                revoke(it)
+                onEvicted()
+                registry.admitOrCreate(peer)
+            }
         }
+    }
 
     private fun safeOnError(e: Throwable) {
         // A throwing callback must not bring down the accept loop or the Android process.
@@ -332,10 +356,10 @@ class ProxyServer(
     ) {
         // Open admission is this listener's property, not the (shared) registry's: the USB
         // listener over the same registry never auto-creates a slot. A full registry is a 403. The
-        // group owner's own address (the host phone's apps) never gets an auto slot either.
-        val open = config.openAdmission && peer != config.bindAddress
-        val admitted = if (open) admitOpen(peer) else registry.admittedSlot(peer)
-        val slot = admitted ?: return respond(r.nio, client, HttpResponse.FORBIDDEN)
+        // group owner's own address (the host phone's apps) never gets an auto slot either -
+        // admitOpen itself enforces both of those (see its KDoc), so there's exactly one place
+        // that owner/open-admission rule lives.
+        val slot = admitOpen(peer) ?: return respond(r.nio, client, HttpResponse.FORBIDDEN)
         // The peer is genuinely admitted now; it's no longer part of the pre-admission DoS surface
         // the pending-head caps exist to bound, even though its response (or tunnel) isn't done yet.
         pendingHead.release()

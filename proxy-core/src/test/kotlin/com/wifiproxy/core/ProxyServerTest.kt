@@ -337,6 +337,111 @@ class ProxyServerTest {
     }
 
     @Test
+    fun `eviction also applies to the unknown-token fallback path`() {
+        var now = 0L
+        registry = ClientRegistry(maxClients = 2, clock = { now })
+        start(openAdmission = true, idleSeatMs = 1_000)
+        registry.admitOrCreate(guest)
+        now = 10L
+        registry.admitOrCreate(guest2)
+        now = 1_005L
+        val bogusToken = "A".repeat(22)
+        val response = rawRequest("GET /$bogusToken.pac HTTP/1.1\r\nHost: x\r\n\r\n", from = guest3)
+        assertTrue(response.startsWith("HTTP/1.1 200"), response)
+        assertTrue(registry.admittedSlot(guest3)!!.auto)
+        assertTrue(registry.slots().none { it.boundIp == guest })
+        assertEquals(2, registry.slots().size)
+    }
+
+    @Test
+    fun `eviction also applies to the fixed mobileconfig path`() {
+        var now = 0L
+        registry = ClientRegistry(maxClients = 2, clock = { now })
+        start(openAdmission = true, idleSeatMs = 1_000, wifi = WifiCredentials("DIRECT-ab-Test", "password123"))
+        registry.admitOrCreate(guest)
+        now = 10L
+        registry.admitOrCreate(guest2)
+        now = 1_005L
+        val response = rawRequest("GET /proxy.mobileconfig HTTP/1.1\r\nHost: x\r\n\r\n", from = guest3)
+        assertTrue(response.startsWith("HTTP/1.1 200"), response)
+        assertTrue(registry.admittedSlot(guest3)!!.auto)
+        assertTrue(registry.slots().none { it.boundIp == guest })
+        assertEquals(2, registry.slots().size)
+    }
+
+    @Test
+    fun `the owner address evicts nothing even when full and idle, on CONNECT or the fixed pac path`() {
+        var now = 0L
+        registry = ClientRegistry(maxClients = 1, clock = { now })
+        val idleAuto = registry.admitOrCreate(guest)!!
+        start(openAdmission = true, idleSeatMs = 1_000)
+        now = 1_000_000L
+        val echo = startEcho()
+        // No `from`: connects from `loopback`, the listener's own bind (owner) address.
+        assertTrue(
+            rawRequest("CONNECT 127.0.0.1:${echo.localPort} HTTP/1.1\r\n\r\n").startsWith("HTTP/1.1 403"),
+        )
+        assertTrue(rawRequest("GET /proxy.pac HTTP/1.1\r\nHost: x\r\n\r\n").startsWith("HTTP/1.1 403"))
+        assertEquals(listOf(idleAuto.id), registry.slots().map { it.id })
+    }
+
+    @Test
+    fun `a live tunnel moving bytes keeps its slot from being evicted`() {
+        var now = 0L
+        registry = ClientRegistry(maxClients = 1, clock = { now })
+        start(openAdmission = true, idleSeatMs = 1_000)
+        val echo = startEcho()
+        val (s, head) = openConnect(echo.localPort, from = guest)
+        closeables += s
+        assertTrue(head.startsWith("HTTP/1.1 200"), head)
+        val slot = registry.slots().single()
+        now = 2_000L // long past idleSeatMs since the slot was created at 0
+        s.getOutputStream().write("ping".toByteArray())
+        // Blocks until the round trip completes, so by the time this returns, the Tunnel's onUp
+        // and onDown callbacks have already called ClientRegistry.addBytes at `now` = 2_000.
+        assertEquals("ping", String(s.getInputStream().readNBytes(4)))
+        now = 2_500L // only 500ms idle since that last byte, well under idleSeatMs (1_000)
+        assertTrue(
+            rawRequest("CONNECT 127.0.0.1:1 HTTP/1.1\r\n\r\n", from = guest2).startsWith("HTTP/1.1 403"),
+        )
+        assertEquals(listOf(slot.id), registry.slots().map { it.id })
+    }
+
+    @Test
+    fun `a connection burst from one newcomer evicts exactly one idle slot`() {
+        var now = 0L
+        registry = ClientRegistry(maxClients = 2, clock = { now })
+        registry.admitOrCreate(guest)
+        registry.admitOrCreate(guest2)
+        now = 10_000L // both idle well past idleSeatMs
+        start(openAdmission = true, idleSeatMs = 1_000)
+        val before = registry.slots().map { it.id }.toSet()
+        val burst = 16
+        val latch = java.util.concurrent.CountDownLatch(burst)
+        val errors = CopyOnWriteArrayList<Throwable>()
+        repeat(burst) {
+            thread {
+                try {
+                    val response = rawRequest("GET /proxy.pac HTTP/1.1\r\nHost: x\r\n\r\n", from = guest3)
+                    assertTrue(response.startsWith("HTTP/1.1 200"), response)
+                } catch (e: Throwable) {
+                    errors += e
+                } finally {
+                    latch.countDown()
+                }
+            }
+        }
+        assertTrue(latch.await(10, java.util.concurrent.TimeUnit.SECONDS))
+        assertTrue(errors.isEmpty(), errors.toString())
+        val after = registry.slots()
+        // Exactly one seat was needed (and freed) for the newcomer: still at the cap, exactly one
+        // of the two original idle slots survives, and guest3 now holds the other.
+        assertEquals(2, after.size)
+        assertEquals(1, before.intersect(after.map { it.id }.toSet()).size)
+        assertTrue(after.any { it.boundIp == guest3 })
+    }
+
+    @Test
     fun `a closed server never evicts even when idle and full`() {
         var now = 0L
         registry = ClientRegistry(maxClients = 1, clock = { now })
