@@ -74,10 +74,18 @@ private class FakeP2pApi : P2pApi {
         onRemoveGroup()
     }
 
-    override suspend fun groupInfo(): GroupInfo? = group
+    /** When true, groupInfo() reports nothing even though a group exists - a slow firmware whose
+     *  group report lags createGroup's success callback. */
+    var hideGroup = false
+
+    override suspend fun groupInfo(): GroupInfo? = if (hideGroup) null else group
 
     fun loseGroup() {
         group = null
+        connection.tryEmit(Unit)
+    }
+
+    fun emitConnectionChanged() {
         connection.tryEmit(Unit)
     }
 }
@@ -558,5 +566,101 @@ class P2pGroupLinkTest {
 
         link.stop()
         assertEquals(LinkState.Idle, link.state.value)
+    }
+
+    // --- Final fix round: slow group reports, adopting a group, Location mode ---
+
+    @Test
+    fun `a group reported 10 s late still goes Up, without a recreate`() = runTest {
+        val api = FakeP2pApi().apply { hideGroup = true }
+        val link = newLink(api)
+        link.start(LinkConfig(CREDS, prefer5Ghz = false))
+        runCurrent()
+        advanceTimeBy(10_000); runCurrent()
+        assertEquals(LinkState.Down(REASON_CREATING), link.state.value)
+
+        api.hideGroup = false
+        advanceTimeBy(1_000); runCurrent()
+        assertEquals(LinkState.Up(OWNER, CREDS), link.state.value)
+        assertEquals(1, api.requests.size)
+        assertEquals(1, api.removeCalls) // only the clean-slate removal before the one create
+    }
+
+    @Test
+    fun `a connection change during the wait re-queries the group at once`() = runTest {
+        val api = FakeP2pApi().apply { hideGroup = true }
+        val link = newLink(api)
+        link.start(LinkConfig(CREDS, prefer5Ghz = false))
+        runCurrent()
+        advanceTimeBy(5_500); runCurrent()
+
+        api.hideGroup = false
+        api.emitConnectionChanged()
+        runCurrent() // no time passes: the event itself triggers the query
+        assertEquals(LinkState.Up(OWNER, CREDS), link.state.value)
+        assertEquals(1, api.requests.size)
+    }
+
+    @Test
+    fun `an existing group with our exact credentials is adopted`() = runTest {
+        val api = FakeP2pApi().apply { group = GroupInfo(CREDS.ssid, CREDS.password, OWNER) }
+        val link = newLink(api)
+        link.start(LinkConfig(CREDS, prefer5Ghz = true))
+        runCurrent()
+        assertEquals(LinkState.Up(OWNER, CREDS), link.state.value)
+        assertEquals(0, api.removeCalls)
+        assertTrue(api.requests.isEmpty())
+    }
+
+    @Test
+    fun `an existing group with other credentials is removed and recreated`() = runTest {
+        val api = FakeP2pApi().apply { group = GroupInfo(CREDS2.ssid, CREDS2.password, OWNER) }
+        val link = newLink(api)
+        link.start(LinkConfig(CREDS, prefer5Ghz = false))
+        runCurrent()
+        assertEquals(LinkState.Up(OWNER, CREDS), link.state.value)
+        assertEquals(1, api.removeCalls)
+        assertEquals(listOf(GroupRequest(CREDS.ssid, CREDS.password, GroupBand.AUTO)), api.requests)
+    }
+
+    @Test
+    fun `an existing group without an owner address yet is not adopted`() = runTest {
+        val api = FakeP2pApi().apply { group = GroupInfo(CREDS.ssid, CREDS.password, null) }
+        val link = newLink(api)
+        link.start(LinkConfig(CREDS, prefer5Ghz = false))
+        runCurrent()
+        assertEquals(LinkState.Up(OWNER, CREDS), link.state.value)
+        assertEquals(1, api.removeCalls)
+        assertEquals(1, api.requests.size)
+    }
+
+    @Test
+    fun `a 5 GHz group that never reports is retried at AUTO before counting a failure`() = runTest {
+        val api = FakeP2pApi().apply {
+            // The 5 GHz group is "created" but never completes (no owner address); AUTO works.
+            report = { GroupInfo(it.ssid, it.passphrase, if (it.band == GroupBand.GHZ_5) null else OWNER) }
+        }
+        val link = newLink(api)
+        link.start(LinkConfig(CREDS, prefer5Ghz = true))
+        runCurrent()
+        assertEquals(listOf(GroupBand.GHZ_5), api.requests.map { it.band })
+
+        advanceTimeBy(30_000); runCurrent()
+        assertEquals(listOf(GroupBand.GHZ_5, GroupBand.AUTO), api.requests.map { it.band })
+        assertEquals(LinkState.Up(OWNER, CREDS), link.state.value)
+    }
+
+    @Test
+    fun `location off fails at once with the turn-on-location message and no band fallback`() = runTest {
+        val api = FakeP2pApi().apply { results += CreateResult.Failure(CreateResult.LOCATION_OFF) }
+        val link = newLink(api)
+        link.start(LinkConfig(CREDS, prefer5Ghz = true))
+        runCurrent()
+        assertEquals(LinkState.Failed(REASON_LOCATION_OFF), link.state.value)
+        assertEquals(
+            "Turn on Location (needed for Wi-Fi Direct on Android 10–12), then start sharing again.",
+            REASON_LOCATION_OFF,
+        )
+        assertEquals(1, api.requests.size)
     }
 }

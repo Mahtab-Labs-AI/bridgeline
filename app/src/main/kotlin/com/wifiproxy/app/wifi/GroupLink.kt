@@ -37,7 +37,7 @@ data class GroupInfo(val networkName: String, val passphrase: String?, val owner
 
 sealed interface CreateResult {
     data object Success : CreateResult
-    /** [reason] is a `WifiP2pManager` failure code, or [MISSING_PERMISSION]. */
+    /** [reason] is a `WifiP2pManager` failure code, [MISSING_PERMISSION] or [LOCATION_OFF]. */
     data class Failure(val reason: Int) : CreateResult
 
     companion object {
@@ -45,6 +45,8 @@ sealed interface CreateResult {
         const val P2P_UNSUPPORTED = 1  // WifiP2pManager.P2P_UNSUPPORTED
         const val BUSY = 2             // WifiP2pManager.BUSY
         const val MISSING_PERMISSION = -1
+        /** Android 10-12 (API 29-32) only: Wi-Fi Direct needs Location turned on there. */
+        const val LOCATION_OFF = -2
     }
 }
 

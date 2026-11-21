@@ -7,6 +7,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.location.LocationManager
 import android.net.wifi.WifiManager
 import android.net.wifi.p2p.WifiP2pConfig
 import android.net.wifi.p2p.WifiP2pGroup
@@ -14,6 +15,7 @@ import android.net.wifi.p2p.WifiP2pManager
 import android.os.Build
 import android.os.Looper
 import androidx.core.content.ContextCompat
+import androidx.core.location.LocationManagerCompat
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -30,7 +32,8 @@ private const val CALL_TIMEOUT_MS = 10_000L
 /**
  * [P2pApi] over [WifiP2pManager]. Callbacks arrive on the main looper. Every call checks the
  * runtime permission first (NEARBY_WIFI_DEVICES on API 33+, ACCESS_FINE_LOCATION on 29-32) and
- * reports [CreateResult.MISSING_PERMISSION] instead of throwing.
+ * reports [CreateResult.MISSING_PERMISSION] instead of throwing. On API 29-32, [createGroup] also
+ * reports [CreateResult.LOCATION_OFF] while Location mode is off.
  *
  * Every [WifiP2pManager] callback wait is bounded by [CALL_TIMEOUT_MS] via `withTimeoutOrNull`
  * (never `withTimeout`, whose `TimeoutCancellationException` would look like real cancellation to
@@ -74,11 +77,20 @@ class AndroidP2pApi(private val context: Context) : P2pApi {
         return ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
     }
 
+    /** No LocationManager at all is treated as "on": nothing to ask the user to turn on. */
+    private fun locationEnabled(): Boolean =
+        context.getSystemService(LocationManager::class.java)?.let { LocationManagerCompat.isLocationEnabled(it) } ?: true
+
     @SuppressLint("MissingPermission") // checked by hasPermission() just above every call
     override suspend fun createGroup(request: GroupRequest): CreateResult {
         val m = manager ?: return CreateResult.Failure(CreateResult.P2P_UNSUPPORTED)
         val ch = channel ?: return CreateResult.Failure(CreateResult.P2P_UNSUPPORTED)
         if (!hasPermission()) return CreateResult.Failure(CreateResult.MISSING_PERMISSION)
+        // On API 29-32 Wi-Fi Direct also needs Location mode on; the framework fails the create
+        // with a generic error otherwise, which would just be retried until the failure limit.
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU && !locationEnabled()) {
+            return CreateResult.Failure(CreateResult.LOCATION_OFF)
+        }
         val config = WifiP2pConfig.Builder()
             .setNetworkName(request.ssid)
             .setPassphrase(request.passphrase)

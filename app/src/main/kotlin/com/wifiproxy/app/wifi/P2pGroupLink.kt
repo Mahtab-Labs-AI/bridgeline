@@ -6,6 +6,7 @@ import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
@@ -21,13 +22,23 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 const val REASON_CREATING = "Creating the Wi-Fi Direct group"
 const val REASON_RETRYING = "Wi-Fi Direct group failed; retrying"
 const val REASON_WIFI_OFF = "Wi-Fi is off"
 const val REASON_LOST = "Wi-Fi Direct group lost; recreating"
+const val REASON_LOCATION_OFF = "Turn on Location (needed for Wi-Fi Direct on Android 10–12), then start sharing again."
 
 private const val MAX_BACKOFF_MS = 60_000L
+
+/** Failures that would fail the same way on another band, so a 5 GHz create doesn't retry at AUTO. */
+private val NO_BAND_FALLBACK = setOf(
+    CreateResult.BUSY,
+    CreateResult.P2P_UNSUPPORTED,
+    CreateResult.MISSING_PERMISSION,
+    CreateResult.LOCATION_OFF,
+)
 
 /**
  * Creates the autonomous Wi-Fi Direct group, verifies the firmware really used the requested SSID
@@ -46,8 +57,10 @@ class P2pGroupLink(
     private val scope: CoroutineScope,
     private val deviceModel: String,
     private val maxConsecutiveFailures: Int = 10,
-    private val infoRetryDelayMs: Long = 500L,
-    private val infoRetries: Int = 6,
+    /** How often a created group's info is polled until it is complete. */
+    private val infoRetryDelayMs: Long = 1_000L,
+    /** How many poll intervals to wait in total (30 × 1 s) before treating the create as failed. */
+    private val infoRetries: Int = 30,
 ) : LinkManager {
     private val _state = MutableStateFlow<LinkState>(LinkState.Idle)
     override val state: StateFlow<LinkState> = _state.asStateFlow()
@@ -193,22 +206,34 @@ class P2pGroupLink(
 
     private suspend fun createAndVerify(config: LinkConfig): Attempt {
         val creds = config.credentials
-        api.removeGroup()
-        var result = api.createGroup(GroupRequest(creds.ssid, creds.password, if (config.prefer5Ghz) GroupBand.GHZ_5 else GroupBand.AUTO))
-        if (config.prefer5Ghz && result is CreateResult.Failure && result.reason != CreateResult.BUSY &&
-            result.reason != CreateResult.P2P_UNSUPPORTED && result.reason != CreateResult.MISSING_PERMISSION
-        ) {
-            result = api.createGroup(GroupRequest(creds.ssid, creds.password, GroupBand.AUTO))
-        }
-        if (result is CreateResult.Failure) {
-            return when (result.reason) {
-                CreateResult.P2P_UNSUPPORTED -> Attempt.Fatal("This phone doesn't support Wi-Fi Direct.")
-                CreateResult.MISSING_PERMISSION ->
-                    Attempt.Fatal("Allow the Nearby devices permission (Location on Android 10–12), then start sharing again.")
-                else -> Attempt.Retry(result.reason)
+        // A complete group with exactly our credentials already exists (e.g. left by a process that
+        // died, or one that came up late after a previous attempt gave up on it): adopt it instead
+        // of tearing it down, so its clients stay connected.
+        api.groupInfo()?.let { existing ->
+            val owner = existing.ownerAddress
+            if (owner != null && existing.networkName == creds.ssid && existing.passphrase == creds.password) {
+                return Attempt.Up(LinkState.Up(owner, creds))
             }
         }
-        val info = awaitGroupInfo() ?: return Attempt.Retry(CreateResult.ERROR)
+        api.removeGroup()
+        var band = if (config.prefer5Ghz) GroupBand.GHZ_5 else GroupBand.AUTO
+        var result = api.createGroup(GroupRequest(creds.ssid, creds.password, band))
+        if (band == GroupBand.GHZ_5 && result is CreateResult.Failure && result.reason !in NO_BAND_FALLBACK) {
+            band = GroupBand.AUTO
+            result = api.createGroup(GroupRequest(creds.ssid, creds.password, band))
+        }
+        if (result is CreateResult.Failure) return failureAttempt(result.reason)
+        var info = awaitGroupInfo()
+        if (info == null && band == GroupBand.GHZ_5) {
+            // Some firmware accepts a 5 GHz group and then never brings it up; try AUTO once
+            // before counting this attempt as a failure.
+            api.removeGroup()
+            band = GroupBand.AUTO
+            val retry = api.createGroup(GroupRequest(creds.ssid, creds.password, band))
+            if (retry is CreateResult.Failure) return failureAttempt(retry.reason)
+            info = awaitGroupInfo()
+        }
+        if (info == null) return Attempt.Retry(CreateResult.ERROR)
         val ownerAddress = info.ownerAddress ?: return Attempt.Retry(CreateResult.ERROR)
         if (info.networkName != creds.ssid || info.passphrase != creds.password) {
             api.removeGroup()
@@ -219,14 +244,41 @@ class P2pGroupLink(
         return Attempt.Up(LinkState.Up(ownerAddress, creds))
     }
 
-    /** Group info can lag createGroup's success callback; poll briefly for a complete answer. */
-    private suspend fun awaitGroupInfo(): GroupInfo? {
-        repeat(infoRetries) { i ->
-            api.groupInfo()?.takeIf { it.ownerAddress != null }?.let { return it }
-            if (i < infoRetries - 1) delay(infoRetryDelayMs)
-        }
-        return null
+    private fun failureAttempt(reason: Int): Attempt = when (reason) {
+        CreateResult.P2P_UNSUPPORTED -> Attempt.Fatal("This phone doesn't support Wi-Fi Direct.")
+        CreateResult.MISSING_PERMISSION ->
+            Attempt.Fatal("Allow the Nearby devices permission (Location on Android 10–12), then start sharing again.")
+        CreateResult.LOCATION_OFF -> Attempt.Fatal(REASON_LOCATION_OFF)
+        else -> Attempt.Retry(reason)
     }
+
+    /**
+     * Group info can lag createGroup's success callback by many seconds on a slow device (the
+     * emulator saw ~23 s). Polls every [infoRetryDelayMs] for up to [infoRetries] × that in total,
+     * and re-queries immediately whenever [P2pApi.connectionChanged] fires meanwhile. The listener
+     * is subscribed [CoroutineStart.UNDISPATCHED] before the first query, so an event between a
+     * query and the wait is never missed (it is buffered in the conflated channel).
+     */
+    private suspend fun awaitGroupInfo(): GroupInfo? = coroutineScope {
+        val changed = Channel<Unit>(Channel.CONFLATED)
+        val listener = launch(start = CoroutineStart.UNDISPATCHED) {
+            api.connectionChanged.collect { changed.trySend(Unit) }
+        }
+        try {
+            withTimeoutOrNull(infoRetries * infoRetryDelayMs) {
+                var info = completeGroupInfo()
+                while (info == null) {
+                    withTimeoutOrNull(infoRetryDelayMs) { changed.receive() }
+                    info = completeGroupInfo()
+                }
+                info
+            }
+        } finally {
+            listener.cancel()
+        }
+    }
+
+    private suspend fun completeGroupInfo(): GroupInfo? = api.groupInfo()?.takeIf { it.ownerAddress != null }
 
     /** Suspends while the group is up. True when the group was lost; false when Wi-Fi went off
      *  (the outer loop then waits for it to come back). */
