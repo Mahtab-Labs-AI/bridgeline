@@ -58,16 +58,19 @@ fun SettingsScreen(
 ) {
     val savedSettings by repository.settings.collectAsStateWithLifecycle()
     val session by repository.session.collectAsStateWithLifecycle()
-    val initial = remember { repository.settings.value }
-    var suffix by remember { mutableStateOf(initial.ssidSuffix) }
-    var password by remember { mutableStateOf(initial.password) }
+    // The fields follow the saved settings: they start from them, and are reset to them whenever
+    // they change (the repository's first off-Main load, or a successful save). Every "changed?"
+    // test below compares against savedSettings, never a value captured once.
+    var suffix by remember(savedSettings) { mutableStateOf(savedSettings.ssidSuffix) }
+    var password by remember(savedSettings) { mutableStateOf(savedSettings.password) }
     var passwordVisible by remember { mutableStateOf(false) }
-    var maxClients by remember { mutableStateOf(initial.maxClients) }
-    var portText by remember { mutableStateOf(initial.port.toString()) }
-    var prefer5Ghz by remember { mutableStateOf(initial.prefer5Ghz) }
+    var maxClients by remember(savedSettings) { mutableStateOf(savedSettings.maxClients) }
+    var portText by remember(savedSettings) { mutableStateOf(savedSettings.port.toString()) }
+    var prefer5Ghz by remember(savedSettings) { mutableStateOf(savedSettings.prefer5Ghz) }
     var usbSharingEnabled by remember { mutableStateOf(prefs.usbSharingEnabled) }
 
     var rejectionMessage by remember { mutableStateOf<String?>(null) }
+    var portError by remember { mutableStateOf<String?>(null) }
     var savedMessage by remember { mutableStateOf(false) }
     var pendingPasswordConfirm by remember { mutableStateOf(false) }
 
@@ -85,7 +88,14 @@ fun SettingsScreen(
     val passwordError = if (password.isNotEmpty()) WifiCredentialRules.passwordError(password) else null
 
     fun applySave() {
-        val port = portText.toIntOrNull() ?: initial.port
+        // (E3.4) The port is checked here, so its error shows on the Port field itself.
+        val port = portText.toIntOrNull()
+        val portProblem = if (port == null) "Enter a port" else HostConfigSource.portError(port)
+        if (port == null || portProblem != null) {
+            savedMessage = false
+            portError = portProblem
+            return
+        }
         val ok = repository.updateSettings(
             HostSettings(
                 ssidSuffix = suffix,
@@ -105,9 +115,8 @@ fun SettingsScreen(
                 val toRevoke = activeSlots.drop(maxClients).joinToString { it.name }
                 "Revoke $toRevoke first, then lower the limit to $maxClients."
             } else {
-                "Couldn't save. Check the port (1024–65535, not 8081), the Wi-Fi name and password, and " +
-                    "that the device limit leaves room for your saved devices (plus the USB laptop if USB " +
-                    "sharing is on)."
+                "Couldn't save. Check the Wi-Fi name and password, and that the device limit leaves " +
+                    "room for your saved devices (plus the USB laptop if USB sharing is on)."
             }
         }
     }
@@ -123,9 +132,11 @@ fun SettingsScreen(
 
         Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
             // (D7) Turning the switch on is refused when the laptop's seat wouldn't fit the saved
-            // Wi-Fi devices; turning it off is always allowed while idle.
-            val usbCanTurnOn = repository.canEnableUsb()
+            // Wi-Fi devices; turning it off is always allowed while idle. A cached flow, so
+            // recomposing never decodes the slot store.
+            val usbCanTurnOn by repository.usbSwitchAllowed.collectAsStateWithLifecycle()
             val usbSwitchEnabled = !demoSwitchLocked && (usbSharingEnabled || usbCanTurnOn)
+            val usbNeedsFreeSlot = !demoSwitchLocked && !usbSharingEnabled && !usbCanTurnOn
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -144,12 +155,13 @@ fun SettingsScreen(
             Text(
                 text = when {
                     demoSwitchLocked -> "Applies the next time sharing starts. Stop sharing to change it."
-                    !usbSharingEnabled && !usbCanTurnOn ->
+                    usbNeedsFreeSlot ->
                         "Remove a Wi-Fi device or raise the device limit first: the laptop needs a free slot."
                     else -> "Start sharing, then connect a laptop over USB."
                 },
                 style = MaterialTheme.typography.bodySmall,
-                color = if (!usbSwitchEnabled) {
+                // Only the D7 refusal is an error; the "applies next start" lock is information.
+                color = if (usbNeedsFreeSlot) {
                     MaterialTheme.colorScheme.error
                 } else {
                     MaterialTheme.colorScheme.onSurfaceVariant
@@ -186,9 +198,16 @@ fun SettingsScreen(
 
         Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Text(text = "Network name", style = MaterialTheme.typography.titleMedium)
+            // (E3.5) The real saved code (it is kept when the name changes), or a placeholder
+            // until the first save picks one.
+            val ssidPrefix = if (savedSettings.password.isNotEmpty()) {
+                WifiCredentialRules.prefixOf(session.ssid)
+            } else {
+                WifiCredentialRules.PLACEHOLDER_PREFIX
+            }
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    text = "DIRECT-wp-",
+                    text = ssidPrefix,
                     style = MaterialTheme.typography.bodyLarge,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -202,11 +221,13 @@ fun SettingsScreen(
             suffixError?.let {
                 Text(text = it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
             }
-            Text(
-                text = if (suffix == savedSettings.ssidSuffix) session.ssid else "DIRECT-··-$suffix",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+            if (suffix.isNotEmpty()) {
+                Text(
+                    text = "$ssidPrefix$suffix",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         }
 
         Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -226,7 +247,9 @@ fun SettingsScreen(
                 },
                 modifier = Modifier.fillMaxWidth(),
             )
-            PasswordStrengthMeter(password)
+            // (E3.3) Empty means USB-only, which is valid: no meter, no error. A non-empty invalid
+            // password shows its one error; only a valid one gets a strength rating.
+            if (password.isNotEmpty() && passwordError == null) PasswordStrengthMeter(password)
             passwordError?.let {
                 Text(text = it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
             }
@@ -265,14 +288,24 @@ fun SettingsScreen(
             Text(text = "Port", style = MaterialTheme.typography.titleMedium)
             OutlinedTextField(
                 value = portText,
-                onValueChange = { if (it.length <= 5 && it.all(Char::isDigit)) portText = it },
+                onValueChange = {
+                    if (it.length <= 5 && it.all(Char::isDigit)) {
+                        portText = it
+                        portError = null // (E3.4) a stale error never outlives an edit
+                    }
+                },
                 singleLine = true,
+                isError = portError != null,
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                 modifier = Modifier.fillMaxWidth(),
-                supportingText = if (demoSwitchLocked) {
-                    { Text("Applies the next time sharing starts.") }
-                } else {
-                    null
+                supportingText = when {
+                    portError != null -> {
+                        { Text(portError.orEmpty()) }
+                    }
+                    demoSwitchLocked -> {
+                        { Text("Applies the next time sharing starts.") }
+                    }
+                    else -> null
                 },
             )
         }
@@ -295,7 +328,8 @@ fun SettingsScreen(
 
         Button(
             onClick = {
-                if (password != initial.password) {
+                // Only a password that really differs from the saved one deletes the devices.
+                if (password != savedSettings.password) {
                     pendingPasswordConfirm = true
                 } else {
                     applySave()

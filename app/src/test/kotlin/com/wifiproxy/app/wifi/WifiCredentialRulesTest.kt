@@ -52,4 +52,12 @@ class WifiCredentialRulesTest {
         assertEquals(32, c.ssid.toByteArray(Charsets.UTF_8).size)
         assertFalse(c.toString().contains("secret-password"))
     }
+
+    @Test
+    fun `the shown prefix is the saved code, or a placeholder when nothing is saved`() {
+        assertEquals("DIRECT-ks-", WifiCredentialRules.prefixOf("DIRECT-ks-HostPhone"))
+        assertEquals("DIRECT-··-", WifiCredentialRules.prefixOf(null))
+        assertEquals("DIRECT-··-", WifiCredentialRules.prefixOf("USB only"))
+        assertEquals("DIRECT-··-", WifiCredentialRules.prefixOf("DIRECT-K3-Upper"))
+    }
 }

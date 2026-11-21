@@ -33,4 +33,12 @@ object WifiCredentialRules {
 
     fun newSsidCode(random: Random): String =
         String(CharArray(2) { CODE_CHARS[random.nextInt(CODE_CHARS.length)] })
+
+    /** Shown while no code has been chosen yet (nothing saved). */
+    const val PLACEHOLDER_PREFIX = "DIRECT-··-"
+    private val PREFIX = Regex("^DIRECT-[$CODE_CHARS]{2}-")
+
+    /** The `DIRECT-xy-` prefix of a saved [ssid], or [PLACEHOLDER_PREFIX] when there is none
+     *  (null, or not one of ours, e.g. the "USB only" label). */
+    fun prefixOf(ssid: String?): String = ssid?.let { PREFIX.find(it)?.value } ?: PLACEHOLDER_PREFIX
 }
