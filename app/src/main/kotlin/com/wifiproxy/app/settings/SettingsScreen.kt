@@ -27,7 +27,6 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -46,6 +45,7 @@ import com.wifiproxy.app.session.SessionPhase
 import com.wifiproxy.app.session.SessionRepository
 import com.wifiproxy.app.session.passwordStrength
 import com.wifiproxy.app.ui.ScreenTitle
+import com.wifiproxy.app.wifi.WifiCredentialRules
 import kotlinx.coroutines.flow.MutableStateFlow
 
 @Composable
@@ -57,6 +57,7 @@ fun SettingsScreen(
     modifier: Modifier = Modifier,
 ) {
     val savedSettings by repository.settings.collectAsStateWithLifecycle()
+    val session by repository.session.collectAsStateWithLifecycle()
     val initial = remember { repository.settings.value }
     var suffix by remember { mutableStateOf(initial.ssidSuffix) }
     var password by remember { mutableStateOf(initial.password) }
@@ -64,6 +65,7 @@ fun SettingsScreen(
     var maxClients by remember { mutableStateOf(initial.maxClients) }
     var portText by remember { mutableStateOf(initial.port.toString()) }
     var prefer5Ghz by remember { mutableStateOf(initial.prefer5Ghz) }
+    var usbSharingEnabled by remember { mutableStateOf(prefs.usbSharingEnabled) }
 
     var rejectionMessage by remember { mutableStateOf<String?>(null) }
     var savedMessage by remember { mutableStateOf(false) }
@@ -79,9 +81,8 @@ fun SettingsScreen(
     }.collectAsStateWithLifecycle()
     val demoSwitchLocked = liveControllerPhase != SessionPhase.IDLE
 
-    // USB sharing has no real toggle in 2a; persist the always-on value so a future version that
-    // does let it vary reads a well-defined starting point.
-    LaunchedEffect(Unit) { prefs.usbSharingEnabled = true }
+    val suffixError = if (suffix.isNotEmpty()) WifiCredentialRules.suffixError(suffix) else null
+    val passwordError = if (password.isNotEmpty()) WifiCredentialRules.passwordError(password) else null
 
     fun applySave() {
         val port = portText.toIntOrNull() ?: initial.port
@@ -98,9 +99,16 @@ fun SettingsScreen(
             rejectionMessage = null
             savedMessage = true
         } else {
+            savedMessage = false
             val activeSlots = repository.session.value.slots
-            val toRevoke = activeSlots.drop(maxClients).joinToString { it.name }
-            rejectionMessage = "Revoke $toRevoke first, then lower the limit to $maxClients."
+            rejectionMessage = if (maxClients < activeSlots.size) {
+                val toRevoke = activeSlots.drop(maxClients).joinToString { it.name }
+                "Revoke $toRevoke first, then lower the limit to $maxClients."
+            } else {
+                "Couldn't save. Check the port (1024–65535, not 8081), the Wi-Fi name and password, and " +
+                    "that the device limit leaves room for your saved devices (plus the USB laptop if USB " +
+                    "sharing is on)."
+            }
         }
     }
 
@@ -114,18 +122,38 @@ fun SettingsScreen(
         ScreenTitle(text = "Settings")
 
         Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            // (D7) Turning the switch on is refused when the laptop's seat wouldn't fit the saved
+            // Wi-Fi devices; turning it off is always allowed while idle.
+            val usbCanTurnOn = repository.canEnableUsb()
+            val usbSwitchEnabled = !demoSwitchLocked && (usbSharingEnabled || usbCanTurnOn)
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(text = "USB sharing (laptop)", style = MaterialTheme.typography.titleMedium)
-                Switch(checked = true, onCheckedChange = {}, enabled = false)
+                Switch(
+                    checked = usbSharingEnabled,
+                    enabled = usbSwitchEnabled,
+                    onCheckedChange = {
+                        usbSharingEnabled = it
+                        prefs.usbSharingEnabled = it
+                    },
+                )
             }
             Text(
-                text = "Always on in this version: start sharing, then connect a laptop over USB.",
+                text = when {
+                    demoSwitchLocked -> "Applies the next time sharing starts. Stop sharing to change it."
+                    !usbSharingEnabled && !usbCanTurnOn ->
+                        "Remove a Wi-Fi device or raise the device limit first: the laptop needs a free slot."
+                    else -> "Start sharing, then connect a laptop over USB."
+                },
                 style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                color = if (!usbSwitchEnabled) {
+                    MaterialTheme.colorScheme.error
+                } else {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                },
             )
         }
 
@@ -171,6 +199,14 @@ fun SettingsScreen(
                     modifier = Modifier.weight(1f),
                 )
             }
+            suffixError?.let {
+                Text(text = it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+            }
+            Text(
+                text = if (suffix == savedSettings.ssidSuffix) session.ssid else "DIRECT-··-$suffix",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
 
         Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -191,6 +227,9 @@ fun SettingsScreen(
                 modifier = Modifier.fillMaxWidth(),
             )
             PasswordStrengthMeter(password)
+            passwordError?.let {
+                Text(text = it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+            }
             AnimatedVisibility(visible = password != savedSettings.password) {
                 Text(
                     text = "Changing the password disconnects every connected device.",
@@ -200,9 +239,8 @@ fun SettingsScreen(
             }
         }
 
-        // (I9) In real (2a/USB-sharing) mode the server is hard-wired to one pinned slot on port
-        // 8081 - these two fields don't do anything there, so they're disabled with an
-        // explanation rather than left looking editable but silently ignored.
+        // A real session reads maxClients/port once on start (SessionController), so a change made
+        // while it's running only takes effect the next time sharing starts.
         Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Text(text = "Max clients: $maxClients", style = MaterialTheme.typography.titleMedium)
             Slider(
@@ -210,11 +248,10 @@ fun SettingsScreen(
                 onValueChange = { maxClients = it.toInt() },
                 valueRange = 1f..3f,
                 steps = 1,
-                enabled = isDemoMode,
             )
-            if (!isDemoMode) {
+            if (demoSwitchLocked) {
                 Text(
-                    text = "Fixed for USB sharing (one laptop slot)",
+                    text = "Applies the next time sharing starts.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -230,11 +267,10 @@ fun SettingsScreen(
                 value = portText,
                 onValueChange = { if (it.length <= 5 && it.all(Char::isDigit)) portText = it },
                 singleLine = true,
-                enabled = isDemoMode,
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                 modifier = Modifier.fillMaxWidth(),
-                supportingText = if (!isDemoMode) {
-                    { Text("Fixed for USB sharing (port 8081)") }
+                supportingText = if (demoSwitchLocked) {
+                    { Text("Applies the next time sharing starts.") }
                 } else {
                     null
                 },
@@ -249,6 +285,13 @@ fun SettingsScreen(
             Text(text = "Prefer 5 GHz", style = MaterialTheme.typography.titleMedium)
             Switch(checked = prefer5Ghz, onCheckedChange = { prefer5Ghz = it })
         }
+        if (demoSwitchLocked) {
+            Text(
+                text = "Applies the next time sharing starts.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
 
         Button(
             onClick = {
@@ -258,6 +301,7 @@ fun SettingsScreen(
                     applySave()
                 }
             },
+            enabled = suffixError == null && passwordError == null,
             modifier = Modifier.fillMaxWidth(),
         ) {
             Text("Save")

@@ -79,7 +79,13 @@ fun AppRoot(
             modifier = Modifier.padding(innerPadding),
         ) {
             composable(Tab.Home.route) { HomeScreen(repository, onBeforeStart = onBeforeStart) }
-            composable(Tab.Devices.route) { AddDeviceScreen(repository, isDemoMode = isDemoMode) }
+            composable(Tab.Devices.route) {
+                AddDeviceScreen(
+                    repository,
+                    isDemoMode = isDemoMode,
+                    usbSharingEnabled = prefs.usbSharingEnabled,
+                )
+            }
             composable(Tab.Settings.route) {
                 SettingsScreen(
                     repository = repository,

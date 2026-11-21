@@ -47,9 +47,14 @@ class MainActivity : ComponentActivity() {
                     val repository by provider.repository.collectAsState()
                     var demoMode by remember { mutableStateOf(prefs.demoMode) }
 
-                    val notificationPermissionLauncher = rememberLauncherForActivityResult(
-                        ActivityResultContracts.RequestPermission(),
-                    ) { /* No-op either way: the FGS notification just won't show if denied. */ }
+                    val permissionsLauncher = rememberLauncherForActivityResult(
+                        ActivityResultContracts.RequestMultiplePermissions(),
+                    ) {
+                        // No-op either way: a denied notification permission just means the FGS
+                        // notification won't show, and a denied Wi-Fi Direct permission surfaces
+                        // on its own as the link's "Allow the Nearby devices permission…"
+                        // degraded reason (P2pGroupLink) once sharing is started.
+                    }
 
                     AppRoot(
                         repository = repository,
@@ -61,13 +66,34 @@ class MainActivity : ComponentActivity() {
                             provider.setDemoMode(newValue)
                         },
                         onBeforeStart = {
-                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-                                ContextCompat.checkSelfPermission(
-                                    this@MainActivity,
-                                    Manifest.permission.POST_NOTIFICATIONS,
-                                ) != PackageManager.PERMISSION_GRANTED
-                            ) {
-                                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                            // Wi-Fi Direct's own permission is only requested when a password is
+                            // set (plan decision 2: no password means USB-only, no P2P group).
+                            val wifiDirectNeeded = repository.settings.value.password.isNotEmpty()
+                            val wanted = buildList {
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                    add(Manifest.permission.POST_NOTIFICATIONS)
+                                }
+                                if (wifiDirectNeeded) {
+                                    when {
+                                        Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU ->
+                                            add(Manifest.permission.NEARBY_WIFI_DEVICES)
+                                        // Android 12 (API 31-32) requires both location permissions.
+                                        Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> {
+                                            add(Manifest.permission.ACCESS_FINE_LOCATION)
+                                            add(Manifest.permission.ACCESS_COARSE_LOCATION)
+                                        }
+                                        else -> add(Manifest.permission.ACCESS_FINE_LOCATION)
+                                    }
+                                }
+                            }
+                            val missing = wanted.filter {
+                                ContextCompat.checkSelfPermission(this@MainActivity, it) !=
+                                    PackageManager.PERMISSION_GRANTED
+                            }
+                            // Start proceeds either way; a still-missing permission shows up as a
+                            // degraded reason rather than blocking Start.
+                            if (missing.isNotEmpty()) {
+                                permissionsLauncher.launch(missing.toTypedArray())
                             }
                         },
                     )

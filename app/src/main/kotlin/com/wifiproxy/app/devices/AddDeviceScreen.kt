@@ -34,6 +34,9 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.SegmentedButton
 import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.SingleChoiceSegmentedButtonRow
+import androidx.compose.material3.Snackbar
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
@@ -56,6 +59,7 @@ import com.wifiproxy.app.kit.KitProgress
 import com.wifiproxy.app.kit.LaptopKitBuilder
 import com.wifiproxy.app.session.ClientPlatform
 import com.wifiproxy.app.session.DeviceInvite
+import com.wifiproxy.app.session.SessionPhase
 import com.wifiproxy.app.session.SessionRepository
 import com.wifiproxy.app.session.SlotUi
 import com.wifiproxy.app.ui.QrCode
@@ -67,15 +71,22 @@ import kotlinx.coroutines.launch
 
 private data class ActiveInvite(val invite: DeviceInvite, val platform: ClientPlatform, val name: String)
 
-/** `isDemoMode` picks between the demo invite flow (QR codes, Add device) and the 2a real-mode
- *  content: a static "Laptop (USB)" card, since the pinned USB slot needs no QR/invite at all. */
+/** `isDemoMode` picks between the demo invite flow (QR codes, Add device) and the real-mode
+ *  content: a "Laptop (USB)" card (the pinned USB slot needs no QR/invite of its own) plus real
+ *  Wi-Fi devices, added and invited through the same [AddDeviceDialog]/[InviteSheetContent] flow
+ *  as demo mode. [usbSharingEnabled] decides whether the laptop card shows with no slot yet. */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun AddDeviceScreen(repository: SessionRepository, modifier: Modifier = Modifier, isDemoMode: Boolean = true) {
+fun AddDeviceScreen(
+    repository: SessionRepository,
+    modifier: Modifier = Modifier,
+    isDemoMode: Boolean = true,
+    usbSharingEnabled: Boolean = true,
+) {
     if (isDemoMode) {
         DemoDevicesContent(repository, modifier)
     } else {
-        UsbDevicesContent(repository, modifier)
+        RealDevicesContent(repository, modifier, usbSharingEnabled)
     }
 }
 
@@ -158,33 +169,115 @@ private fun DemoDevicesContent(repository: SessionRepository, modifier: Modifier
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun UsbDevicesContent(repository: SessionRepository, modifier: Modifier) {
+private fun RealDevicesContent(repository: SessionRepository, modifier: Modifier, usbSharingEnabled: Boolean) {
     val session by repository.session.collectAsStateWithLifecycle()
-    val laptopSlot = session.slots.firstOrNull()
+    val snackbarHostState = remember { SnackbarHostState() }
+    val scope = rememberCoroutineScope()
 
-    Column(
-        modifier = modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(16.dp),
-    ) {
-        ScreenTitle(text = "Devices")
+    var showAddDialog by remember { mutableStateOf(false) }
+    var activeInvite by remember { mutableStateOf<ActiveInvite?>(null) }
 
-        LaptopUsbCard(slot = laptopSlot)
-        LaptopKitCard()
+    val laptopSlot = session.slots.firstOrNull { it.platform == ClientPlatform.LAPTOP }
+    val wifiSlots = session.slots.filter { it.platform != ClientPlatform.LAPTOP }
+    val full = session.slots.size >= session.maxClients
+    val canAdd = session.wifiUp && session.slots.size < session.maxClients
 
-        Button(onClick = {}, enabled = false, modifier = Modifier.fillMaxWidth()) {
-            Icon(Icons.Filled.Add, contentDescription = null)
-            Spacer(modifier = Modifier.width(8.dp))
-            Text("Add device")
+    Box(modifier = modifier.fillMaxSize()) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            ScreenTitle(text = "Devices", trailing = "${session.slots.size}/${session.maxClients}")
+
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                if (laptopSlot != null || usbSharingEnabled) {
+                    LaptopUsbCard(slot = laptopSlot)
+                }
+
+                wifiSlots.forEach { slot ->
+                    DeviceRow(
+                        slot = slot,
+                        onClick = {
+                            val invite = repository.inviteFor(slot.id)
+                            if (invite != null) {
+                                activeInvite = ActiveInvite(invite, slot.platform, slot.name)
+                            } else {
+                                scope.launch {
+                                    snackbarHostState.showSnackbar(
+                                        "Start sharing and wait for the Wi-Fi Direct group to show this device's codes",
+                                    )
+                                }
+                            }
+                        },
+                    )
+                }
+            }
+
+            Button(
+                onClick = { showAddDialog = true },
+                enabled = canAdd,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Icon(Icons.Filled.Add, contentDescription = null)
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("Add device")
+            }
+
+            // First applicable reason the Add button is (or soon will be) disabled.
+            val belowButtonText = when {
+                session.phase == SessionPhase.IDLE -> "Start sharing to add Wi-Fi devices"
+                !session.wifiUp -> session.degradedReason ?: "Waiting for the Wi-Fi Direct group…"
+                full -> "All ${session.maxClients} slots are in use. Revoke a device first, or raise the " +
+                    "limit in Settings."
+                else -> null
+            }
+            belowButtonText?.let {
+                Text(
+                    text = it,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (full) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(vertical = 8.dp),
+                )
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+            LaptopKitCard()
         }
-        Text(
-            text = "Wi-Fi devices arrive in the next version",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
+
+        SnackbarHost(
+            hostState = snackbarHostState,
+            modifier = Modifier.align(Alignment.BottomCenter),
+        ) { Snackbar(it) }
+    }
+
+    if (showAddDialog) {
+        AddDeviceDialog(
+            onDismiss = { showAddDialog = false },
+            onConfirm = { name, platform ->
+                showAddDialog = false
+                repository.addDevice(name, platform)?.let { invite ->
+                    activeInvite = ActiveInvite(invite, platform, name)
+                }
+            },
         )
+    }
+
+    activeInvite?.let { active ->
+        ModalBottomSheet(
+            onDismissRequest = { activeInvite = null },
+            sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+        ) {
+            InviteSheetContent(active = active)
+        }
     }
 }
 
