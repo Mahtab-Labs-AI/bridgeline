@@ -323,14 +323,13 @@ class UsbSessionController(
     }
 
     private suspend fun doStop() {
-        // Only IDLE means there is nothing left to do here: a concurrent doStart() may already
-        // have rolled itself back to IDLE after noticing this stop() (see
-        // checkNotInterruptedByStop/rollbackStart), in which case the server/egress it started are
-        // already torn down. Returning only on IDLE - rather than the old `!= STOPPING` check (R2)
-        // - means this never again skips a real teardown just because the phase isn't exactly
-        // STOPPING any more; the old check was exactly how "doStart writes RUNNING, doStop finds
-        // the phase isn't STOPPING and returns" lost a stop.
-        if (_state.value == SessionPhase.IDLE) return
+        // Anything but STOPPING means this stop() has already been honoured: a concurrent doStart()
+        // noticed it and rolled itself back to IDLE (see checkNotInterruptedByStop/rollbackStart).
+        // The phase may even have moved on to STARTING again by now, for a *new* session whose
+        // doStart is queued behind this doStop - tearing down here would kill that session. Since
+        // every serial-side transition is a CAS (R2), nothing but teardown() can move the phase
+        // off STOPPING, so this check can no longer lose a stop the way it did before R2.
+        if (_state.value != SessionPhase.STOPPING) return
         try {
             runCatching { activeServer?.stop() }
             runCatching { egress.stop() }

@@ -530,6 +530,38 @@ class UsbSessionControllerTest {
         assertEquals(1, egress.stopCalls)
     }
 
+    // A stop() landing mid-start is honoured by doStart's rollback, but its doStop is still queued.
+    // If a new start() (e.g. the service's pending-start restart from onIdle) gets in before that
+    // queued doStop runs, the stale doStop must leave the new session alone.
+    @Test
+    fun `a stale doStop does not tear down a session restarted behind it`() = runTest {
+        lateinit var c: UsbSessionController
+        var firstStart = true
+        val egress = FakeSessionEgress()
+        val server = FakeUsbProxyServer(onStart = {
+            if (firstStart) {
+                firstStart = false
+                c.stop()
+            }
+        })
+        c = controller(egress = egress, server = server, scope = backgroundScope)
+        var restarted = false
+        c.onIdle = {
+            if (!restarted) {
+                restarted = true
+                c.start()
+            }
+        }
+
+        c.start()
+        runCurrent()
+
+        assertEquals(SessionPhase.RUNNING, c.state.value)
+        assertEquals(2, server.startCalls)
+        assertEquals(1, server.stopCalls)
+        assertEquals(1, egress.stopCalls)
+    }
+
     @Test
     fun `stop during a real concurrent start leaves no server running`() {
         val startedLatch = CountDownLatch(1)

@@ -131,14 +131,25 @@ class ProxySessionService : Service() {
         // - a previous session reaching IDLE called stopForeground(STOP_FOREGROUND_REMOVE) (see
         // removeNotification), so a later start on this same (still-alive) service instance needs
         // its own startForeground() again, exactly like a fresh instance's onCreate.
-        startForeground(NOTIFICATION_ID, buildNotification(SessionPhase.STARTING, null, 0, 0))
-        when (c.state.value) {
+        //
+        // Built from the current phase, so a Start tap on a RUNNING/DEGRADED session doesn't flash
+        // "Starting…" over the live counters until the next refresh tick.
+        val phase = c.state.value
+        val notification = if (phase == SessionPhase.IDLE) {
+            buildNotification(SessionPhase.STARTING, null, 0, 0)
+        } else {
+            currentNotification(phase, c.degradedReason.value)
+        }
+        startForeground(NOTIFICATION_ID, notification)
+        when (phase) {
             SessionPhase.IDLE -> {
                 // (R3c) Restarted next to c.start(), not left to whatever buildController wired up
                 // on first build: a session that is starting again after reaching IDLE needs its
-                // own fresh notificationJob too, or its notification never updates again.
-                startNotificationUpdates(c)
+                // own fresh notificationJob too, or its notification never updates again. After
+                // c.start(), not before, so the updater's first value is STARTING rather than the
+                // IDLE it would otherwise treat as "remove the notification" (stopForeground).
                 c.start()
+                startNotificationUpdates(c)
             }
             SessionPhase.STOPPING -> {
                 // c.start() is a documented no-op while STOPPING; recorded instead so the onIdle
@@ -183,8 +194,8 @@ class ProxySessionService : Service() {
                         // rather than letting the service stop.
                         pendingStart = false
                         startForeground(NOTIFICATION_ID, buildNotification(SessionPhase.STARTING, null, 0, 0))
-                        startNotificationUpdates(newController)
                         newController.start()
+                        startNotificationUpdates(newController)
                     } else {
                         removeNotification()
                         stopSelf(currentStartId)
@@ -282,10 +293,16 @@ class ProxySessionService : Service() {
      *  Reaching IDLE here removes the notification instead of re-posting it; this is belt-and-
      *  braces alongside `onIdle`'s synchronous removal above (collecting `c.state` asynchronously
      *  means this could in principle lag behind an `onIdle` that already fired, which is exactly
-     *  why `onIdle` doesn't rely on this path to begin with). */
+     *  why `onIdle` doesn't rely on this path to begin with).
+     *
+     *  Runs on Main, like the wake-lock job: every other notification/foreground call (onIdle's
+     *  hand-off, onStartCommand, onDestroy) is Main-confined, so cancelling this job there always
+     *  lands while it is suspended. On the serial worker, a stale job could be mid-way through
+     *  removeNotification() - i.e. stopForeground() - right as Main re-enters the foreground for a
+     *  restarted session, leaving that session running without foreground status. */
     private fun startNotificationUpdates(c: UsbSessionController) {
         notificationJob?.cancel()
-        notificationJob = serviceScope.launch {
+        notificationJob = serviceScope.launch(Dispatchers.Main) {
             combine(c.state, c.degradedReason) { phase, reason -> phase to reason }.collectLatest { (phase, reason) ->
                 if (phase == SessionPhase.IDLE) {
                     removeNotification()
@@ -307,11 +324,14 @@ class ProxySessionService : Service() {
      *  resurrect a notification that was just removed. */
     private fun updateNotification(phase: SessionPhase, reason: String?) {
         if (serviceStopping || controller?.state?.value == SessionPhase.IDLE) return
-        val slots = controller?.registry?.slots().orEmpty()
-        val bytesUp = slots.sumOf { it.bytesUp }
-        val bytesDown = slots.sumOf { it.bytesDown }
         val manager = getSystemService(NotificationManager::class.java)
-        manager.notify(NOTIFICATION_ID, buildNotification(phase, reason, bytesUp, bytesDown))
+        manager.notify(NOTIFICATION_ID, currentNotification(phase, reason))
+    }
+
+    /** [buildNotification] with the live session's byte counters. */
+    private fun currentNotification(phase: SessionPhase, reason: String?): Notification {
+        val slots = controller?.registry?.slots().orEmpty()
+        return buildNotification(phase, reason, slots.sumOf { it.bytesUp }, slots.sumOf { it.bytesDown })
     }
 
     /** Removes the foreground notification on every path to IDLE (a clean stop, a failed start,
