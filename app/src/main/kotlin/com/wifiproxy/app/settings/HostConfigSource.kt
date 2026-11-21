@@ -62,8 +62,6 @@ class HostConfigSource(
     private val prefs: HostPrefs,
     private val credentials: CredentialStore,
 ) {
-    fun hostSettings(): HostSettings = snapshot().settings
-
     /** "Require a code for each device" (D8), off by default; read by [sessionConfig], so a change
      *  applies the next time sharing starts. */
     var requireDeviceCodes: Boolean

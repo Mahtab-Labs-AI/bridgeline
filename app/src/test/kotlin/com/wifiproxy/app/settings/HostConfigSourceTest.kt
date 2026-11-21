@@ -50,7 +50,7 @@ class HostConfigSourceTest {
         assertTrue(cfg.usbEnabled)
         assertNull(cfg.wifi)
         assertEquals(1, cfg.maxClients)
-        assertEquals("", source.hostSettings().password)
+        assertEquals("", source.snapshot().settings.password)
     }
 
     @Test
@@ -85,7 +85,7 @@ class HostConfigSourceTest {
         for (bad in listOf(valid.copy(password = "short"), valid.copy(port = 8081), valid.copy(port = 80), valid.copy(maxClients = 4), valid.copy(ssidSuffix = "has space"))) {
             assertEquals(SaveResult.INVALID, source.save(bad))
         }
-        assertEquals(valid, source.hostSettings())
+        assertEquals(valid, source.snapshot().settings)
     }
 
     @Test
@@ -131,7 +131,7 @@ class HostConfigSourceTest {
         assertEquals(SaveResult.INVALID, source.update(valid.copy(maxClients = 1)) { changed -> seen += changed; false }.result)
         assertEquals(SaveResult.INVALID, source.update(valid.copy(password = "brand new secret")) { changed -> seen += changed; false }.result)
         assertEquals(listOf(false, true), seen)
-        assertEquals(valid, source.hostSettings())
+        assertEquals(valid, source.snapshot().settings)
     }
 
     @Test

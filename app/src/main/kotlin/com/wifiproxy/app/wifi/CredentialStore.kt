@@ -66,10 +66,6 @@ class CredentialStore(
         return CredentialsRead.Present(StoredCredentials(ssidCode = fields[1], suffix = fields[2], password = fields[3]))
     }
 
-    /** The credentials when [read] finds them; null when unset *or* unreadable - use [read] where
-     *  the difference matters. */
-    fun get(): StoredCredentials? = (read() as? CredentialsRead.Present)?.credentials
-
     /** Whether a credentials blob is stored, without decrypting it (so no Keystore call): true
      *  for an unreadable blob too. */
     fun isSet(): Boolean = store.getString(KEY) != null

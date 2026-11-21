@@ -21,6 +21,10 @@ private class MapStore : KeyValueStore {
     }
 }
 
+/** The credentials when [CredentialStore.read] finds them; null when unset or unreadable. Tests
+ *  only: production code must tell those two apart. */
+private fun CredentialStore.get(): StoredCredentials? = (read() as? CredentialsRead.Present)?.credentials
+
 class CredentialStoreTest {
     private val key = KeyGenerator.getInstance("AES").apply { init(256) }.generateKey()
     private fun box() = AesGcmSecretBox { key }

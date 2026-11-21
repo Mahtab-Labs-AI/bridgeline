@@ -70,7 +70,7 @@ class SettingsSaverTest {
         assertEquals(2, slotStore.load().size)
         // A name-only change keeps the devices, so they still count.
         assertNull(saved(valid.copy(ssidSuffix = "OtherName", maxClients = 2)))
-        assertEquals("HostPhone", hostConfig.hostSettings().ssidSuffix)
+        assertEquals("HostPhone", hostConfig.snapshot().settings.ssidSuffix)
         // With USB off the Wi-Fi devices may use every seat.
         prefs.usbSharingEnabled = false
         assertNotNull(saved(valid.copy(maxClients = 2)))

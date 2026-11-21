@@ -28,6 +28,7 @@ import com.wifiproxy.app.settings.SaveResult
 import com.wifiproxy.app.wifi.LinkState
 import com.wifiproxy.app.wifi.SlotStore
 import com.wifiproxy.core.clients.Slot
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -58,6 +59,7 @@ private const val TAG = "ServiceSessionRepo"
  *  the group isn't Up. */
 private const val DEFAULT_GROUP_OWNER = "192.168.49.1"
 private const val NO_WIFI_SSID = "USB only"
+private const val WIFI_UNREADABLE_SSID = "Wi-Fi settings unreadable"
 
 /** The USB listener as a laptop reaches it (through `adb forward tcp:8081 tcp:8081`). */
 private const val USB_PROXY_ADDRESS = "127.0.0.1:8081 (USB)"
@@ -127,8 +129,9 @@ class ServiceSessionRepository(
     private val _vpnActive = MutableStateFlow(false)
     private val vpnNetworks: MutableSet<Network> = ConcurrentHashMap.newKeySet()
 
-    private val host = combine(_settings, configuredSsid, _requireDeviceCodes, _vpnActive) { settings, ssid, requireCodes, vpn ->
-        HostView(settings, ssid, requireCodes, vpn)
+    private val host = combine(_settings, configuredSsid, _requireDeviceCodes, _vpnActive, _settingsStatus) {
+            settings, ssid, requireCodes, vpn, status ->
+        HostView(settings, ssid, requireCodes, vpn, status)
     }
 
     private val _checks = MutableStateFlow<List<SetupCheck>>(emptyList())
@@ -143,7 +146,12 @@ class ServiceSessionRepository(
 
     /** Re-derives [usbSwitchAllowed] off Main (it decodes the slot store); requested on every
      *  save, add, revoke and session phase change instead of on every recomposition. */
-    private val requestUsbSwitchAllowed = offMainWorker(Dispatchers.IO) {
+    private val requestUsbSwitchAllowed = offMainWorker(
+        Dispatchers.IO,
+        // (B4e) An answer must always arrive, or the switch stays disabled for good: a failure
+        // refuses (D7 can't be checked) rather than leaving it unknown.
+        onFailure = { _usbSwitchAllowed.value = false },
+    ) {
         _usbSwitchAllowed.value = SeatRules.canEnableUsb(slotStore.load().size, prefs.maxClients)
     }
 
@@ -217,6 +225,9 @@ class ServiceSessionRepository(
             val epoch = settingsEpoch.get()
             val snapshot = try {
                 withContext(Dispatchers.IO) { hostConfig.snapshot() }
+            } catch (e: CancellationException) {
+                // (B4d) The repository is closing: not a failed load.
+                throw e
             } catch (e: Exception) {
                 Log.w(TAG, "Couldn't load the settings: ${e::class.simpleName}")
                 null
@@ -247,9 +258,13 @@ class ServiceSessionRepository(
      * A conflated background job: the returned function requests one run of [work] on
      * [dispatcher]. Requests arriving while it runs merge into one more run after it, so the
      * published result always reflects the latest request. A failing run is logged (class name
-     * only) and never ends the worker.
+     * only), then [onFailure] runs, and it never ends the worker.
      */
-    private fun offMainWorker(dispatcher: CoroutineDispatcher, work: () -> Unit): () -> Unit {
+    private fun offMainWorker(
+        dispatcher: CoroutineDispatcher,
+        onFailure: () -> Unit = {},
+        work: () -> Unit,
+    ): () -> Unit {
         val requests = Channel<Unit>(Channel.CONFLATED)
         repositoryScope.launch(dispatcher) {
             for (request in requests) {
@@ -257,6 +272,7 @@ class ServiceSessionRepository(
                     work()
                 } catch (e: Exception) {
                     Log.w(TAG, "Background refresh failed: ${e::class.simpleName}")
+                    onFailure()
                 }
             }
         }
@@ -279,7 +295,7 @@ class ServiceSessionRepository(
         .stateIn(
             repositoryScope,
             SharingStarted.WhileSubscribed(5_000),
-            idleUi(HostView(_settings.value, configuredSsid.value, _requireDeviceCodes.value, _vpnActive.value)),
+            idleUi(HostView(_settings.value, configuredSsid.value, _requireDeviceCodes.value, _vpnActive.value, _settingsStatus.value)),
         )
 
     override val log: StateFlow<List<LogEntry>> = SessionHolder.controller
@@ -321,6 +337,7 @@ class ServiceSessionRepository(
         val ssid: String?,
         val requireDeviceCodes: Boolean,
         val vpnActive: Boolean,
+        val settingsStatus: SettingsStatus,
     )
 
     private fun buildUi(live: Live, host: HostView, controller: SessionController?): SessionUi {
@@ -338,7 +355,9 @@ class ServiceSessionRepository(
             phase = live.phase,
             degradedReason = live.reason,
             cellularUp = live.cellularUp,
-            ssid = up?.credentials?.ssid ?: host.ssid ?: NO_WIFI_SSID,
+            // (B4b) Unreadable credentials are not "no credentials": never claim USB only then.
+            ssid = up?.credentials?.ssid ?: host.ssid
+                ?: if (host.settingsStatus == SettingsStatus.UNREADABLE) WIFI_UNREADABLE_SSID else NO_WIFI_SSID,
             proxyHost = up?.ownerAddress?.hostAddress ?: DEFAULT_GROUP_OWNER,
             port = controller?.wifiPort ?: host.settings.port,
             slots = controller?.registry?.slots().orEmpty().map { it.toSlotUi(controller?.platformOf(it.id)) },
