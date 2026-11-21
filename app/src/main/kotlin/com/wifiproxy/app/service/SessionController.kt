@@ -58,6 +58,9 @@ data class SessionConfig(
     val maxClients: Int,
 )
 
+/** See [SessionController.wifiEndpoint]. */
+data class WifiEndpoint(val group: LinkState.Up, val port: Int)
+
 /**
  * What [SessionController] needs from the HTTP proxy, abstracted so a JVM test can fake
  * [isAccepting] instead of standing up (and killing) a real NIO accept loop to exercise the
@@ -211,6 +214,23 @@ class SessionController(
             val cfg = sessionConfig ?: return null
             return if (cfg.wifi != null) cfg.wifiPort else null
         }
+
+    /** The group the Wi-Fi listener is serving and its port, while one really runs; null while the
+     *  link isn't Up or the listener couldn't start. This, not the link state alone, is what a
+     *  device invite may point at. */
+    val wifiEndpoint: WifiEndpoint?
+        get() {
+            if (wifiServer == null) return null
+            val up = wifiServerFor ?: return null
+            val port = wifiPort ?: return null
+            return WifiEndpoint(up, port)
+        }
+
+    /** True while this session's USB (loopback) listener exists. */
+    val usbListening: Boolean get() = usbServer != null
+
+    /** Whether the current session has Wi-Fi Direct configured; false while idle. */
+    val wifiConfigured: Boolean get() = sessionConfig?.wifi != null
 
     private var availabilityJob: Job? = null
     private var networkGenerationJob: Job? = null
@@ -415,9 +435,12 @@ class SessionController(
      *  everything; a Wi-Fi session is also degraded whenever its link isn't Up. */
     private fun healthReason(): String? {
         if (!egress.available.value) return REASON_NO_MOBILE_DATA
-        if (sessionConfig?.wifi == null) return null
+        val cfg = sessionConfig
+        if (cfg?.wifi == null) return null
         return when (val s = link.state.value) {
-            is LinkState.Up -> null
+            // The group is up but its listener couldn't start (startWifiServer failed): invites
+            // would point at a dead port, so this is degraded until the watchdog's retry works.
+            is LinkState.Up -> if (wifiServer == null) "Wi-Fi listener failed (port ${cfg.wifiPort} in use?)" else null
             is LinkState.Down -> s.reason
             is LinkState.Failed -> s.message
             LinkState.Idle -> REASON_CREATING
@@ -605,13 +628,24 @@ class SessionController(
 
     /**
      * Adds a Wi-Fi device slot and persists it. Null when the session isn't RUNNING/DEGRADED, the
-     * link isn't Up (an invite needs the group-owner address) or there's no room.
+     * link isn't Up (an invite needs the group-owner address), the Wi-Fi listener isn't running
+     * (the invite would point at a dead port) or there's no seat.
+     *
+     * (D7) The seats are counted against every saved Wi-Fi device, inactive ones included, plus
+     * the laptop's seat while USB is on - not just the registry's free room, which a revoke can
+     * open up while saved devices are still waiting for a seat.
      */
     fun addDevice(name: String, platform: ClientPlatform): Slot? {
         val phase = _state.value
         if (phase != SessionPhase.RUNNING && phase != SessionPhase.DEGRADED) return null
         val snap = captureSeats() ?: return null
+        val cfg = sessionConfig ?: return null
         if (link.state.value !is LinkState.Up) return null
+        if (wifiServer == null) return null
+        val maxClients = cfg.maxClients.coerceIn(1, ClientRegistry.MAX_CLIENTS_LIMIT)
+        val wifiSeats = maxClients - (if (cfg.usbEnabled) 1 else 0)
+        val savedWifi = snap.registry.slots().count { !it.pinned } + snap.inactive.size
+        if (savedWifi >= wifiSeats) return null
         val slot = snap.registry.addSlot(name) ?: return null
         platforms[slot.id] = platform
         persist(snap.registry, snap.inactive, snap.platforms + (slot.id to platform))
@@ -633,6 +667,9 @@ class SessionController(
      *  A saved device that is inactive this session (no free seat, so never in the registry and
      *  without tunnels) is simply dropped from the inactive list and from storage.
      *
+     *  (D7) The pinned USB laptop slot can't be revoked: it always keeps its seat while USB
+     *  sharing is on. Returns false for it.
+     *
      *  Racing teardown: the registry, the inactive list and the platforms are captured together
      *  at the top ([captureSeats]) and that capture is what gets persisted, so a teardown landing
      *  mid-revoke can't make the persist drop the inactive devices or forget their platforms. */
@@ -647,7 +684,7 @@ class SessionController(
             appendLog("Inactive device removed")
             return true
         }
-        if (registry.slots().any { it.id == slotId && it.pinned }) return usbServer?.revoke(slotId) ?: false
+        if (registry.slots().any { it.id == slotId && it.pinned }) return false
         // The never-started server's filter is never consulted, so it gets the static default
         // rather than buildFilter(), which does IPC on this (caller's) thread.
         val server = wifiServer ?: lastWifiServer ?: usbServer
@@ -724,6 +761,8 @@ class SessionController(
         if (up != null && (wifi == null || !wifi.isAccepting)) {
             appendLog("Watchdog: rebuilding the Wi-Fi listener")
             startWifiServer(up, clearBindings = wifiServerFor != up)
+            // A listener that failed (or now works again) changes healthReason().
+            refreshHealth()
         }
 
         if (usb != null && !usb.isAccepting) {

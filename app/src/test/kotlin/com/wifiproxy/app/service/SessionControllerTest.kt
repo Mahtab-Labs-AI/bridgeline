@@ -11,6 +11,7 @@ import com.wifiproxy.app.wifi.REASON_CREATING
 import com.wifiproxy.app.wifi.REASON_LOST
 import com.wifiproxy.app.wifi.SlotPersistence
 import com.wifiproxy.core.ProxyConfig
+import com.wifiproxy.core.ProxyServer
 import com.wifiproxy.core.WifiCredentials
 import com.wifiproxy.core.clients.SlotRecord
 import com.wifiproxy.core.net.Cidr
@@ -25,6 +26,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.currentTime
 import kotlinx.coroutines.test.runCurrent
@@ -1063,5 +1065,107 @@ class SessionControllerTest {
         assertTrue(c.revoke("id-1"))
         assertEquals(SessionPhase.IDLE, c.state.value)
         assertTrue(slots.saved.any { it.record.id == "id-4" })
+    }
+
+    // --- Final fix round: D7 holes, a dead Wi-Fi listener -----------------------------------------
+
+    /** Revokes for real, through an unstarted real ProxyServer (ClientRegistry.revoke is internal
+     *  to :proxy-core); start/stop only flip [isAccepting], nothing binds. */
+    private class RegistryRevokingServer(private val delegate: ProxyServer) : SessionServer {
+        override var isAccepting = false
+            private set
+        override fun start() { isAccepting = true }
+        override fun stop() { isAccepting = false }
+        override fun revoke(slotId: String) = delegate.revoke(slotId)
+        override fun updateFilter(filter: DestinationFilter) = Unit
+    }
+
+    private fun TestScope.revokingController(link: FakeLink, slots: MemorySlots, config: SessionConfig, created: MutableList<ProxyConfig>) =
+        SessionController(
+            egress = FakeSessionEgress(),
+            link = link,
+            slots = slots,
+            config = { config },
+            serverFactory = SessionServerFactory { cfg, registry, egress, filter, _ ->
+                created += cfg
+                RegistryRevokingServer(ProxyServer(cfg, registry, egress, filter))
+            },
+            scope = backgroundScope,
+            now = { 0L },
+        )
+
+    @Test
+    fun `the pinned USB laptop slot can't be revoked`() = runTest {
+        val link = FakeLink()
+        val servers = mutableListOf<Pair<ProxyConfig, FakeSessionServer>>()
+        val c = controller(scope = backgroundScope, link = link, config = BOTH, servers = servers)
+        c.start(); runCurrent(); link.up(); runCurrent()
+        val pinned = c.registry!!.slots().single { it.pinned }
+
+        assertFalse(c.revoke(pinned.id))
+        assertTrue(c.registry!!.slots().any { it.id == pinned.id && it.pinned })
+        assertTrue(servers.all { it.second.revokedIds.isEmpty() })
+    }
+
+    @Test
+    fun `addDevice counts inactive saved devices, so a revoke can't hand their seat to a new one`() = runTest {
+        val link = FakeLink()
+        val slots = MemorySlots(storedSlots(3))
+        val c = revokingController(link, slots, BOTH, mutableListOf())
+        c.start(); runCurrent(); link.up(); runCurrent()
+        // Laptop + id-1 + id-2 hold the three seats; id-3 is saved but inactive.
+        assertTrue(c.revoke("id-2"))
+        assertEquals(listOf("id-1"), c.registry!!.slots().filterNot { it.pinned }.map { it.id })
+
+        // The registry has a free seat again, but id-3 is still waiting for it.
+        assertNull(c.addDevice("New phone", ClientPlatform.ANDROID))
+        assertEquals(listOf("id-1", "id-3"), slots.saved.map { it.record.id })
+    }
+
+    @Test
+    fun `revoking a Wi-Fi slot with no server ever started still works`() = runTest {
+        val link = FakeLink() // never goes Up: no Wi-Fi server, and USB is off
+        val slots = MemorySlots(storedSlots(1))
+        val created = mutableListOf<ProxyConfig>()
+        val c = revokingController(link, slots, WIFI_ONLY, created)
+        c.start(); runCurrent()
+        assertTrue(created.isEmpty())
+
+        assertTrue(c.revoke("id-1"))
+        assertEquals(1, created.size) // the never-started fallback server
+        assertTrue(c.registry!!.slots().isEmpty())
+        assertTrue(slots.saved.isEmpty())
+    }
+
+    @Test
+    fun `a Wi-Fi listener that can't start degrades the session and blocks invites until it recovers`() = runTest {
+        val link = FakeLink()
+        var portInUse = true
+        val c = SessionController(
+            egress = FakeSessionEgress(),
+            link = link,
+            slots = MemorySlots(),
+            config = { WIFI_ONLY },
+            serverFactory = SessionServerFactory { cfg, _, _, _, _ ->
+                FakeSessionServer().also {
+                    if (!cfg.bindAddress.isLoopbackAddress && portInUse) it.startThrows = java.net.BindException("in use")
+                }
+            },
+            scope = backgroundScope,
+            now = { 0L },
+        )
+        c.start(); runCurrent(); link.up(); runCurrent()
+
+        assertEquals(SessionPhase.DEGRADED, c.state.value)
+        assertEquals("Wi-Fi listener failed (port 8080 in use?)", c.degradedReason.value)
+        assertNull(c.wifiEndpoint)
+        assertNull(c.addDevice("Pixel", ClientPlatform.ANDROID))
+
+        // The watchdog retries the listener; once the port is free the session recovers.
+        portInUse = false
+        advanceTimeBy(30_000); runCurrent()
+        assertEquals(SessionPhase.RUNNING, c.state.value)
+        assertEquals(8080, c.wifiEndpoint?.port)
+        assertNotNull(c.addDevice("Pixel", ClientPlatform.ANDROID))
     }
 }
