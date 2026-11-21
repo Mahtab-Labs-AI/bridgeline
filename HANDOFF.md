@@ -19,10 +19,10 @@ An Android app that shares a phone's **cellular data** with other devices **with
 | `tools/usb-client/README.md` | Laptop-side usage (Windows script, macOS/Linux manual steps) |
 
 ## Branches (no remote; there is a git bundle)
-`main` (head `f0bca8c`) now contains Plans 1, 2a (USB) and 2b (Wi-Fi Direct, including open
-admission), merged from the old `feature/wifi-direct`. **`feature/idle-seat-eviction`** (off `main`
-at `f0bca8c`) is the open branch, adding on-demand idle seat eviction on top. Not yet merged into
-`main`. The backup is the git bundle in the handoff folder.
+`main` contains Plans 1, 2a (USB) and 2b (Wi-Fi Direct, including open admission and on-demand idle
+seat eviction), merged from `feature/wifi-direct` and `feature/idle-seat-eviction`. There is no open
+branch. Start new work on a branch off `main`. The backup is the newest git bundle in the handoff
+folder (`android-wifi-proxy-2026-11-21b.bundle`).
 
 ## State
 - **`:proxy-core`** (pure Kotlin/JVM, **187 tests**): the slot registry with pinned slots and unpersisted per-IP auto slots for open admission, a strict parser, PAC/mobileconfig/probes (including the fixed `/proxy.pac` and `/proxy.mobileconfig` paths), a post-DNS destination filter, a happy-eyeballs dialer, the NIO selector loop, a per-direction tunnel failure policy, and a ProxyServer with pre-admission caps and per-run state.
