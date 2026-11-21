@@ -125,7 +125,7 @@ private fun SetupCheckCard(check: SetupCheck, onFixClick: () -> Unit) {
                 .padding(16.dp),
             verticalAlignment = Alignment.Top,
         ) {
-            Icon(imageVector = icon, contentDescription = check.status.name, tint = tint)
+            Icon(imageVector = icon, contentDescription = check.status.spokenLabel(), tint = tint)
             Spacer(modifier = Modifier.width(12.dp))
             Column(modifier = Modifier.weight(1f)) {
                 Text(text = check.title, style = MaterialTheme.typography.titleSmall)
@@ -141,6 +141,13 @@ private fun SetupCheckCard(check: SetupCheck, onFixClick: () -> Unit) {
             }
         }
     }
+}
+
+/** (E3.8) What TalkBack reads for the status icon: human text, not the enum name. */
+private fun CheckStatus.spokenLabel(): String = when (this) {
+    CheckStatus.OK -> "OK"
+    CheckStatus.ACTION_NEEDED -> "Action needed"
+    CheckStatus.NOT_APPLICABLE -> "Not applicable"
 }
 
 @Composable

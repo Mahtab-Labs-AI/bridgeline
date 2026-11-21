@@ -264,8 +264,17 @@ private fun RealDevicesContent(repository: SessionRepository, modifier: Modifier
             onDismiss = { showAddDialog = false },
             onConfirm = { name, platform ->
                 showAddDialog = false
-                repository.addDevice(name, platform)?.let { invite ->
+                val invite = repository.addDevice(name, platform)
+                if (invite != null) {
                     activeInvite = ActiveInvite(invite, platform, name)
+                } else {
+                    // E.g. (D7) saved devices inactive this session still hold the free seat, or
+                    // the Wi-Fi listener stopped between the tap and the add.
+                    scope.launch {
+                        snackbarHostState.showSnackbar(
+                            "Couldn't add the device: no free slot for it, or Wi-Fi sharing isn't ready",
+                        )
+                    }
                 }
             },
         )
@@ -340,7 +349,7 @@ private fun LaptopUsbCard(slot: SlotUi?) {
  * a verified `platform-tools` plus the bundled scripts to this phone's `Download/WiFiProxy-LaptopKit/`,
  * for a laptop with no internet of its own. Independent of demo/real mode and of the "Laptop (USB)"
  * slot above - it's a real download either way, so it's shown in both [DemoDevicesContent] and
- * [UsbDevicesContent].
+ * [RealDevicesContent].
  */
 @Composable
 private fun LaptopKitCard() {
