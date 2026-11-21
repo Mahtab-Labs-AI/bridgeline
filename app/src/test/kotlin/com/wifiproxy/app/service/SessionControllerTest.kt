@@ -212,7 +212,7 @@ class SessionControllerTest {
         link = link,
         slots = slots,
         config = { config },
-        serverFactory = SessionServerFactory { cfg, _, _, _, _ ->
+        serverFactory = SessionServerFactory { cfg, _, _, _, _, _ ->
             if (servers == null) server else FakeSessionServer().also { servers += cfg to it }
         },
         scope = scope,
@@ -523,7 +523,7 @@ class SessionControllerTest {
             link = FakeLink(),
             slots = MemorySlots(),
             config = { USB_ONLY },
-            serverFactory = SessionServerFactory { _, _, _, _, _ -> FakeSessionServer() },
+            serverFactory = SessionServerFactory { _, _, _, _, _, _ -> FakeSessionServer() },
             scope = backgroundScope,
         )
 
@@ -600,7 +600,7 @@ class SessionControllerTest {
             link = FakeLink(),
             slots = MemorySlots(),
             config = { USB_ONLY },
-            serverFactory = SessionServerFactory { _, _, _, _, _ -> server },
+            serverFactory = SessionServerFactory { _, _, _, _, _, _ -> server },
             scope = backgroundScope,
         )
 
@@ -663,7 +663,7 @@ class SessionControllerTest {
                 link = FakeLink(),
                 slots = MemorySlots(),
                 config = { USB_ONLY },
-                serverFactory = SessionServerFactory { _, _, _, _, _ -> server },
+                serverFactory = SessionServerFactory { _, _, _, _, _, _ -> server },
                 scope = realScope,
             )
 
@@ -951,7 +951,7 @@ class SessionControllerTest {
             link = link,
             slots = slots,
             config = { config },
-            serverFactory = SessionServerFactory { cfg, _, _, _, _ -> FakeSessionServer().also { servers += cfg to it } },
+            serverFactory = SessionServerFactory { cfg, _, _, _, _, _ -> FakeSessionServer().also { servers += cfg to it } },
             scope = backgroundScope,
             now = { 0L },
         )
@@ -1052,7 +1052,7 @@ class SessionControllerTest {
             link = link,
             slots = slots,
             config = { CODED_WIFI_ONLY },
-            serverFactory = SessionServerFactory { _, _, _, _, _ ->
+            serverFactory = SessionServerFactory { _, _, _, _, _, _ ->
                 FakeSessionServer(onRevoke = {
                     if (stopDuringRevoke) {
                         c.stop()
@@ -1090,7 +1090,7 @@ class SessionControllerTest {
             link = link,
             slots = slots,
             config = { config },
-            serverFactory = SessionServerFactory { cfg, registry, egress, filter, _ ->
+            serverFactory = SessionServerFactory { cfg, registry, egress, filter, _, _ ->
                 created += cfg
                 RegistryRevokingServer(ProxyServer(cfg, registry, egress, filter))
             },
@@ -1202,7 +1202,7 @@ class SessionControllerTest {
             link = link,
             slots = slots,
             config = { config },
-            serverFactory = SessionServerFactory { cfg, registry, egress, filter, _ ->
+            serverFactory = SessionServerFactory { cfg, registry, egress, filter, _, _ ->
                 RegistryRevokingServer(ProxyServer(cfg, registry, egress, filter))
             },
             scope = backgroundScope,
@@ -1239,7 +1239,7 @@ class SessionControllerTest {
             link = link,
             slots = MemorySlots(),
             config = { WIFI_ONLY },
-            serverFactory = SessionServerFactory { cfg, _, _, _, _ ->
+            serverFactory = SessionServerFactory { cfg, _, _, _, _, _ ->
                 FakeSessionServer().also {
                     if (!cfg.bindAddress.isLoopbackAddress && portInUse) it.startThrows = java.net.BindException("in use")
                 }

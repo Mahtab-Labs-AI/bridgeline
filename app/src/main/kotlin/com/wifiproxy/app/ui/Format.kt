@@ -13,8 +13,13 @@ fun formatBytes(bytes: Long): String {
 }
 
 /** An auto device's activity under open admission: "Active now" for the first minute since
- *  [lastActivityMs], else "Idle N min" (floored, never negative even if the clocks disagree). */
+ *  [lastActivityMs], then "Idle N min" (floored, never negative even if the clocks disagree),
+ *  switching to whole hours ("Idle N h") past 60 minutes. */
 fun formatActivity(nowMs: Long, lastActivityMs: Long): String {
     val idleMin = ((nowMs - lastActivityMs) / 60_000L).coerceAtLeast(0L)
-    return if (idleMin < 1) "Active now" else "Idle $idleMin min"
+    return when {
+        idleMin < 1 -> "Active now"
+        idleMin < 60 -> "Idle $idleMin min"
+        else -> "Idle ${idleMin / 60} h"
+    }
 }

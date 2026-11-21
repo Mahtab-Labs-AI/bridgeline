@@ -71,6 +71,7 @@ import com.wifiproxy.app.ui.ScreenTitle
 import com.wifiproxy.app.ui.formatActivity
 import com.wifiproxy.app.ui.formatBytes
 import com.wifiproxy.app.ui.icon
+import com.wifiproxy.core.ProxyConfig
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 
@@ -241,8 +242,8 @@ private fun OpenDevicesContent(repository: SessionRepository, modifier: Modifier
         }
         if (full) {
             Text(
-                text = "All ${session.maxClients} slots are in use. Idle devices free their seat " +
-                    "automatically for a new one; active devices need Disconnect, or raise the limit in Settings.",
+                text = "Idle devices give up their seat to a new one automatically. To make room now, " +
+                    "disconnect a device or raise the limit in Settings.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.error,
             )
@@ -333,8 +334,11 @@ private fun OpenSetupCard(invite: OpenInvite, ssid: String) {
             CopyableCommand(label = "Profile link", command = invite.mobileConfigUrl, context = context)
 
             HorizontalDivider()
+            // Built from the core's own default, not a hard-coded "3": ProxyConfig.idleSeatMs is
+            // the one place that number is defined.
+            val idleMinutes = ProxyConfig.DEFAULT_IDLE_SEAT_MS / 60_000L
             Text(
-                text = "Devices idle for 3 minutes give up their seat when a new device needs it.",
+                text = "Devices idle for $idleMinutes minutes give up their seat when a new device needs it.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )

@@ -97,11 +97,14 @@ fun interface SessionServerFactory {
         egress: Egress,
         filter: DestinationFilter,
         onError: (Throwable) -> Unit,
+        /** `ProxyServer.onEvicted` (Diagnostics): fires whenever open admission frees an idle
+         *  auto slot's seat for a newcomer. No slot id, name or address - just that it happened. */
+        onEvicted: () -> Unit,
     ): SessionServer
 }
 
-private val defaultServerFactory = SessionServerFactory { config, registry, egress, filter, onError ->
-    RealSessionServer(ProxyServer(config, registry, egress, filter, onError))
+private val defaultServerFactory = SessionServerFactory { config, registry, egress, filter, onError, onEvicted ->
+    RealSessionServer(ProxyServer(config, registry, egress, filter, onError, onEvicted))
 }
 
 /** Raised internally when [SessionController] notices, after a blocking/suspending start step,
@@ -318,7 +321,7 @@ class SessionController(
                         appendLog("Could not pin the USB slot (no room)")
                     }
                     val usbConfig = ProxyConfig(bindAddress = usbBindAddress, port = usbPort, peerSubnet = USB_PEER_SUBNET)
-                    val newServer = serverFactory.create(usbConfig, registry, egress, buildFilter(), ::onServerError)
+                    val newServer = serverFactory.create(usbConfig, registry, egress, buildFilter(), ::onServerError, ::logEviction)
                     usb = newServer
                     newServer.start()
                     checkNotInterruptedByStop()
@@ -533,7 +536,7 @@ class SessionController(
         )
         var server: SessionServer? = null
         try {
-            val newServer = serverFactory.create(proxyConfig, registry, egress, buildFilter(), ::onServerError)
+            val newServer = serverFactory.create(proxyConfig, registry, egress, buildFilter(), ::onServerError, ::logEviction)
             server = newServer
             newServer.start()
             wifiServer = newServer
@@ -726,7 +729,9 @@ class SessionController(
                 registry,
                 egress,
                 DestinationFilter.default(DEFAULT_WIFI_DIRECT_SUBNET),
-            ) {}
+                onError = {},
+                onEvicted = {},
+            )
         val revoked = server.revoke(slotId)
         if (revoked) {
             platforms.remove(slotId)
@@ -824,6 +829,13 @@ class SessionController(
         // Non-I/O bugs and accept-loop failures only (see ProxyServer's onError contract) - never
         // a hostname or URL, so the exception's class name is all that goes in the log.
         appendLog("Proxy error: ${e::class.simpleName}")
+    }
+
+    /** `ProxyServer.onEvicted` (Diagnostics): an idle auto slot was just freed for a newcomer.
+     *  Like [onServerError], this can run on whichever thread triggered it (a connection handler
+     *  coroutine, never [scope]) - [appendLog] is itself thread-safe. No names or IPs. */
+    private fun logEviction() {
+        appendLog("Idle device freed its seat for a new one")
     }
 
     private fun appendLog(message: String) {
