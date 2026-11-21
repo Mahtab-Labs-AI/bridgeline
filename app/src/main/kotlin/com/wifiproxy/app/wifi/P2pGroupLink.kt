@@ -1,13 +1,12 @@
 package com.wifiproxy.app.wifi
 
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
-import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -17,7 +16,10 @@ import kotlinx.coroutines.flow.channelFlow
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.receiveAsFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 const val REASON_CREATING = "Creating the Wi-Fi Direct group"
@@ -33,22 +35,11 @@ private const val MAX_BACKOFF_MS = 60_000L
  * whenever it is lost (spec §6), backing off 1 s → 2 s → … → 60 s. Every Android call goes
  * through [api], so all of this runs on the JVM under virtual time.
  *
- * [start], [stop] and the internal re-creates never race each other: every state change is a
- * [Command] processed, one at a time and strictly in order, by a single supervisor coroutine (see
- * [commands]). Before it acts on a command - starting a new run, or tearing down with
- * `removeGroup` + `Idle` - the supervisor always cancels and *fully, non-cancellably* joins
- * whatever run came before, even one stuck inside an uncancellable Android call. That means an
- * earlier run can never act after a later command has started being processed, and there is never
- * a window where two runs are both live, or where a run and a teardown are both in flight.
- *
- * None of that matters if [stop] can hang forever, though, and the supervisor is not guaranteed to
- * outlive the object: [scope] can be cancelled (e.g. a service's `onDestroy`) out from under a
- * pending [stop] call, or even before the supervisor ever got to run at all. [stop] therefore falls
- * back to tearing down inline whenever it can tell nobody is left to process its command (see
- * [stop]'s body), and the supervisor itself always closes [commands] - draining and completing any
- * already-queued [Command.Stop] - no matter how it ends, including never having started. A bug
- * inside a run is also never allowed to propagate out and take the supervisor down with it: see
- * [run]'s `try`/`catch`.
+ * Lifecycle: [start] and [stop] are serialized by one FIFO [Mutex] ([lifecycle]), in call order.
+ * Each first cancels the current run and joins it non-cancellably (even one stuck in an
+ * uncancellable Android call), so an old run can never act after a later start/stop. [stop] runs
+ * entirely in its caller's coroutine and never needs [scope] to be alive, so it always ends with
+ * `removeGroup` + [LinkState.Idle], even after [scope] is cancelled.
  */
 class P2pGroupLink(
     private val api: P2pApi,
@@ -63,103 +54,67 @@ class P2pGroupLink(
 
     private val healthChecks = Channel<Unit>(Channel.CONFLATED)
 
-    private sealed interface Command {
-        data class Start(val config: LinkConfig) : Command
-        data class Stop(val done: CompletableDeferred<Unit>) : Command
-    }
+    /** Serializes [start] and [stop]; FIFO-fair, so they take effect in call order. */
+    private val lifecycle = Mutex()
 
-    /** Every start()/stop() is a [Command] sent here; [UNLIMITED][Channel.UNLIMITED] because
-     *  [start] must not suspend or drop a request. A single long-lived coroutine (below) drains
-     *  this strictly in order, which is what makes start/stop/recreate race-free. Closed once the
-     *  supervisor is gone for any reason - see the class KDoc. */
-    private val commands = Channel<Command>(Channel.UNLIMITED)
-
-    /** The currently active run, if any. Normally touched only by the supervisor coroutine; also
-     *  read and written by [stop]'s inline-teardown fallback, but only once [commands] is known to
-     *  be closed, i.e. only after the supervisor is confirmed gone - so there is never genuine
-     *  concurrent access, just a value that must be visible across whichever threads are involved. */
+    /** The current run, if any. Written only while holding [lifecycle]. */
     @Volatile
     private var job: Job? = null
 
-    init {
-        val supervisor = scope.launch {
-            try {
-                for (command in commands) {
-                    // Whatever run is current is no longer wanted as of this command; wait for it
-                    // to actually finish - uncancellably, since it might itself be stuck inside an
-                    // uncancellable Android call - before acting on the command. This is the one
-                    // rule that makes the whole class race-free: nothing below ever runs while an
-                    // old run might still touch the API.
-                    cancelCurrentRun()
-                    when (command) {
-                        is Command.Start -> job = scope.launch { run(command.config) }
-                        is Command.Stop -> finishStopCommand(command)
-                    }
+    override fun start(config: LinkConfig) {
+        // UNDISPATCHED: queue on the mutex *now*, in the caller's thread, so a stop() called right
+        // after start() returns always runs after this start (Mutex waiters are FIFO).
+        scope.launch(start = CoroutineStart.UNDISPATCHED) {
+            lifecycle.withLock {
+                cancelRunAndWait()
+                job = scope.launch {
+                    // Barrier: wait for any start/stop queued behind this one, so a run that is
+                    // already superseded never touches the API. Can't deadlock: whoever holds the
+                    // lock and joins this run cancels it first, and a waiting lock() is cancellable.
+                    lifecycle.withLock { }
+                    run(config)
                 }
-            } finally {
-                closeAndDrainCommands()
             }
         }
-        // Belt and suspenders for the case the body above never even started (scope already
-        // cancelled when this object was constructed): invokeOnCompletion fires for that too.
-        supervisor.invokeOnCompletion { closeAndDrainCommands() }
-    }
-
-    private suspend fun cancelCurrentRun() {
-        job?.let { withContext(NonCancellable) { it.cancelAndJoin() } }
-        job = null
-    }
-
-    /** Tears down for a [Command.Stop]: always reaches [LinkState.Idle] and always completes
-     *  [Command.Stop.done], even if [P2pApi.removeGroup] throws or this coroutine is cancelled
-     *  partway through (the `finally` still runs; completing an already-completed `done` is a
-     *  no-op). */
-    private suspend fun finishStopCommand(command: Command.Stop) {
-        try {
-            removeGroupQuietly()
-            _state.value = LinkState.Idle
-        } finally {
-            command.done.complete(Unit)
-        }
-    }
-
-    /** [P2pApi.removeGroup] is documented to never throw, but [stop] must not hang or blow up on a
-     *  misbehaving implementation. A genuine cancellation is never swallowed. */
-    private suspend fun removeGroupQuietly() {
-        try {
-            api.removeGroup()
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            // Swallow: reaching Idle (and completing stop()'s caller) matters more than this.
-        }
-    }
-
-    private fun closeAndDrainCommands() {
-        commands.close()
-        while (true) {
-            val leftover = commands.tryReceive().getOrNull() ?: break
-            if (leftover is Command.Stop) leftover.done.complete(Unit)
-        }
-    }
-
-    override fun start(config: LinkConfig) {
-        // A no-op if the supervisor is gone: commands is closed, so this trySend simply fails.
-        commands.trySend(Command.Start(config))
     }
 
     override suspend fun stop() {
-        val done = CompletableDeferred<Unit>()
-        if (commands.trySend(Command.Stop(done)).isSuccess) {
-            done.await()
-            return
+        lifecycle.withLock {
+            cancelRunAndWait()
+            job = null
+            withContext(NonCancellable) {
+                removeGroupSafely()
+                _state.value = LinkState.Idle
+            }
         }
-        // The supervisor is gone - scope was cancelled (possibly before it ever got to run at
-        // all) - so there is nobody left to process a Stop command. Tear down inline instead of
-        // awaiting a done that would otherwise never complete.
-        cancelCurrentRun()
-        removeGroupQuietly()
-        _state.value = LinkState.Idle
+    }
+
+    /** Cancels the current run and waits, non-cancellably, until it has really finished - even one
+     *  stuck in an uncancellable API call - so it can never act after a later start/stop. */
+    private suspend fun cancelRunAndWait() {
+        job?.let {
+            it.cancel()
+            withContext(NonCancellable) { it.join() }
+        }
+    }
+
+    /** [P2pApi.removeGroup] is documented to never throw, but a teardown must always reach Idle:
+     *  the group may already be gone, or the implementation may misbehave. */
+    private suspend fun removeGroupSafely() {
+        try {
+            api.removeGroup()
+        } catch (e: CancellationException) {
+            rethrowIfCancelled(e)
+        } catch (e: Exception) {
+            // Swallow: reaching Idle matters more than this.
+        }
+    }
+
+    /** A [CancellationException] is real cancellation only if this coroutine is itself cancelled;
+     *  otherwise (e.g. a `TimeoutCancellationException` leaking out of an API implementation's
+     *  `withTimeout`) it is an ordinary failure and the caller handles it as one. */
+    private suspend fun rethrowIfCancelled(e: CancellationException) {
+        if (!currentCoroutineContext().isActive) throw e
     }
 
     override fun checkHealth() {
@@ -172,17 +127,16 @@ class P2pGroupLink(
         data class Retry(val reason: Int) : Attempt
     }
 
-    /** Runs [config] until stopped or fatally failed. A bug here must never kill the supervisor
-     *  coroutine - and so never leave [stop] hanging - so anything but [CancellationException] is
-     *  caught and turned into [LinkState.Failed] instead of propagating. Only the exception's
-     *  class name is used: the message could carry network details (spec's logging constraint). */
+    /** Runs [config] until stopped or fatally failed. An exception from the run - including a
+     *  stray [CancellationException] while the run itself is not cancelled - becomes
+     *  [LinkState.Failed] instead of propagating. Only the exception's class name is used: the
+     *  message could carry network details (spec's logging constraint). */
     private suspend fun run(config: LinkConfig) {
         try {
             runUntilStoppedOrFatal(config)
-        } catch (e: CancellationException) {
-            throw e
         } catch (e: Exception) {
-            _state.value = LinkState.Failed("Wi-Fi Direct error: ${e::class.simpleName}")
+            if (e is CancellationException) rethrowIfCancelled(e)
+            _state.value = LinkState.Failed("Wi-Fi Direct error: ${e::class.simpleName ?: "unknown"}")
         }
     }
 

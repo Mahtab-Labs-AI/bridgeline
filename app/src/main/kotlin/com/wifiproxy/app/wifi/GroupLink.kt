@@ -51,12 +51,14 @@ sealed interface CreateResult {
 /**
  * The thin Android seam; [AndroidP2pApi] is the only real implementation.
  *
- * [P2pGroupLink] drives all three suspend functions from a single serialized command queue with
- * nothing else running concurrently: a call that never returns stalls that queue - and so every
- * later [P2pGroupLink.start]/[P2pGroupLink.stop] - forever. Implementations of [createGroup],
- * [removeGroup] and [groupInfo] must therefore be cancellable (respond to coroutine cancellation
- * promptly, the way suspend functions built on cancellable Android callbacks naturally are) or
- * otherwise time-bounded (e.g. with an internal timeout); never a call that can simply hang.
+ * [P2pGroupLink.start] and [P2pGroupLink.stop] wait, non-cancellably, for the current run to
+ * finish, including any API call it is in: a call that never returns stalls every later
+ * start/stop forever. Implementations of [createGroup], [removeGroup] and [groupInfo] must
+ * therefore be cancellable (respond to coroutine cancellation promptly, the way suspend functions
+ * built on cancellable Android callbacks naturally are) or otherwise time-bounded; never a call
+ * that can simply hang. Bound them with `withTimeoutOrNull`, not `withTimeout`: the latter's
+ * `TimeoutCancellationException` looks like cancellation, and [P2pGroupLink] treats it as a
+ * failure only because it checks whether its own coroutine was really cancelled.
  *
  * [connectionChanged] must be hot: it has to support being subscribed to at any time and start
  * delivering events from that point on, synchronously from the subscriber's point of view (the way
