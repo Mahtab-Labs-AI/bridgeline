@@ -31,6 +31,8 @@ data class SessionUi(
     /** Set when the last `start()` itself failed and the session fell back to IDLE (C1); cleared
      *  by the next successful start. Null for the fake, which never fails to start. */
     val lastError: String? = null,
+    /** True while the Wi-Fi Direct group is Up, i.e. devices can be invited. */
+    val wifiUp: Boolean = false,
 )
 
 data class HostSettings(
@@ -84,8 +86,13 @@ interface SessionRepository {
 
     fun revoke(slotId: String)
 
-    /** Returns false (and rejects the change) if [HostSettings.maxClients] would drop below the active slot count. */
+    /** Returns false (and rejects the change) if [HostSettings.maxClients] would drop below the
+     *  slot count, or if the settings are invalid. */
     fun updateSettings(settings: HostSettings): Boolean
+
+    /** Whether the "USB sharing (laptop)" switch may be turned on (user decision D7: the laptop
+     *  needs a free seat next to every saved Wi-Fi device). Always true for the fake. */
+    fun canEnableUsb(): Boolean = true
 
     /** Re-runs the setup checks. A no-op for the fake, which has no real permissions/exemptions
      *  to re-check; [ServiceSessionRepository] rebuilds [checks] from the live Android state.

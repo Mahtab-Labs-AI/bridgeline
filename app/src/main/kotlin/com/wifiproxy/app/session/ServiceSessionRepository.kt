@@ -1,16 +1,27 @@
 package com.wifiproxy.app.session
 
+import android.Manifest
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.Uri
+import android.net.wifi.WifiManager
+import android.os.Build
 import android.os.PowerManager
 import android.provider.Settings
 import androidx.core.app.NotificationManagerCompat
+import androidx.core.content.ContextCompat
+import androidx.core.net.toUri
 import com.wifiproxy.app.service.ProxySessionService
 import com.wifiproxy.app.service.SessionHolder
 import com.wifiproxy.app.service.SessionController
+import com.wifiproxy.app.settings.AppPreferences
+import com.wifiproxy.app.settings.HostConfigSource
+import com.wifiproxy.app.settings.SaveResult
+import com.wifiproxy.app.wifi.LinkState
+import com.wifiproxy.app.wifi.SlotStore
 import com.wifiproxy.core.clients.Slot
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -25,19 +36,24 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 
 private const val POLL_INTERVAL_MS = 1_000L
-private const val PROXY_PORT = 8081
+
+/** Android's Wi-Fi Direct group-owner address, shown while the group isn't Up. */
+private const val DEFAULT_GROUP_OWNER = "192.168.49.1"
+private const val NO_WIFI_SSID = "USB only"
 
 /**
  * The real [SessionRepository]: `start`/`stop` drive [ProxySessionService], and [session]/[log]
  * read the live [SessionController] through [SessionHolder] (there's no controller - and so no
  * slots - until the service has actually been started once).
  *
- * `addDevice`/`inviteFor` return null: Wi-Fi Direct devices are Plan 2b. [checks] and [settings]
- * are plain in-memory state; [refreshChecks] re-runs the real Android checks, since permissions
- * and the battery exemption can change outside the app (call it on resume).
+ * [settings] are the persisted host settings ([HostConfigSource]); device invites need a running
+ * session with the Wi-Fi Direct group Up (plan decision 4). [refreshChecks] re-runs the real
+ * Android checks, since permissions, Wi-Fi and the battery exemption can change outside the app
+ * (call it on resume).
  */
 @OptIn(ExperimentalCoroutinesApi::class)
 class ServiceSessionRepository(
@@ -51,10 +67,17 @@ class ServiceSessionRepository(
     private val repositoryJob = Job(scope.coroutineContext[Job])
     private val repositoryScope = CoroutineScope(scope.coroutineContext + repositoryJob)
 
-    private val _settings = MutableStateFlow(
-        HostSettings(ssidSuffix = "", password = "", maxClients = 1, port = PROXY_PORT, prefer5Ghz = false),
-    )
+    private val prefs = AppPreferences(context)
+    private val hostConfig = HostConfigSource.forContext(context)
+    private val slotStore = SlotStore(HostConfigSource.secureStore(context))
+
+    private val _settings = MutableStateFlow(hostConfig.hostSettings())
     override val settings: StateFlow<HostSettings> = _settings.asStateFlow()
+
+    /** The stored credentials' full SSID (`DIRECT-xy-<suffix>`), or null when none are set. */
+    private val configuredSsid = MutableStateFlow(storedSsid())
+
+    private val host = combine(_settings, configuredSsid) { settings, ssid -> HostView(settings, ssid) }
 
     private val _checks = MutableStateFlow(buildChecks())
     override val checks: StateFlow<List<SetupCheck>> = _checks.asStateFlow()
@@ -71,8 +94,8 @@ class ServiceSessionRepository(
     // observing this has gone away (e.g. the app backgrounded with the session idle), and the
     // 5s grace period means a quick tab switch doesn't restart the ticker from scratch.
     override val session: StateFlow<SessionUi> = SessionHolder.controller
-        .flatMapLatest { controller -> controller?.let(::sessionFlowFor) ?: flowOf(idleUi()) }
-        .stateIn(repositoryScope, SharingStarted.WhileSubscribed(5_000), idleUi())
+        .flatMapLatest { controller -> controller?.let(::sessionFlowFor) ?: host.map(::idleUi) }
+        .stateIn(repositoryScope, SharingStarted.WhileSubscribed(5_000), idleUi(HostView(_settings.value, configuredSsid.value)))
 
     override val log: StateFlow<List<LogEntry>> = SessionHolder.controller
         .flatMapLatest { it?.log ?: flowOf(emptyList()) }
@@ -84,47 +107,58 @@ class ServiceSessionRepository(
     private fun tickerForPhase(phase: SessionPhase): Flow<Unit> =
         if (phase == SessionPhase.IDLE) flowOf(Unit) else ticker
 
+    // Six inputs: the five controller flows are combined first, then with the host settings and
+    // the ticker (kotlinx's typed combine overloads stop at five).
     private fun sessionFlowFor(controller: SessionController) =
         combine(
-            controller.state,
-            controller.degradedReason,
-            controller.cellularAvailable,
-            controller.lastError,
+            combine(
+                controller.state,
+                controller.degradedReason,
+                controller.cellularAvailable,
+                controller.lastError,
+                controller.linkState,
+            ) { phase, reason, cellular, lastError, link -> Live(phase, reason, cellular, lastError, link) },
+            host,
             controller.state.flatMapLatest(::tickerForPhase),
-        ) { phase, reason, cellular, lastError, _ ->
-            buildUi(phase, reason, cellular, lastError, controller.registry?.slots().orEmpty())
-        }
+        ) { live, hostView, _ -> buildUi(live, hostView, controller) }
 
-    private fun buildUi(
-        phase: SessionPhase,
-        reason: String?,
-        cellularUp: Boolean,
-        lastError: String?,
-        slots: List<Slot>,
-    ) = SessionUi(
-        phase = phase,
-        degradedReason = reason,
-        cellularUp = cellularUp,
-        ssid = "USB (adb forward)",
-        proxyHost = "127.0.0.1",
-        port = _settings.value.port,
-        slots = slots.map { it.toSlotUi() },
-        maxClients = _settings.value.maxClients,
-        lastError = lastError,
+    /** The controller's state, as one value for [buildUi]. */
+    private data class Live(
+        val phase: SessionPhase,
+        val reason: String?,
+        val cellularUp: Boolean,
+        val lastError: String?,
+        val link: LinkState,
     )
 
-    private fun idleUi() = buildUi(
-        phase = SessionPhase.IDLE,
-        reason = null,
-        cellularUp = false,
-        lastError = null,
-        slots = emptyList(),
+    private data class HostView(val settings: HostSettings, val ssid: String?)
+
+    private fun buildUi(live: Live, host: HostView, controller: SessionController?): SessionUi {
+        val up = live.link as? LinkState.Up
+        return SessionUi(
+            phase = live.phase,
+            degradedReason = live.reason,
+            cellularUp = live.cellularUp,
+            ssid = up?.credentials?.ssid ?: host.ssid ?: NO_WIFI_SSID,
+            proxyHost = up?.ownerAddress?.hostAddress ?: DEFAULT_GROUP_OWNER,
+            port = controller?.wifiPort ?: host.settings.port,
+            slots = controller?.registry?.slots().orEmpty().map { it.toSlotUi(controller?.platformOf(it.id)) },
+            maxClients = host.settings.maxClients,
+            lastError = live.lastError,
+            wifiUp = up != null,
+        )
+    }
+
+    private fun idleUi(host: HostView) = buildUi(
+        Live(phase = SessionPhase.IDLE, reason = null, cellularUp = false, lastError = null, link = LinkState.Idle),
+        host,
+        controller = null,
     )
 
-    private fun Slot.toSlotUi() = SlotUi(
+    private fun Slot.toSlotUi(platform: ClientPlatform?) = SlotUi(
         id = id,
         name = name,
-        platform = ClientPlatform.LAPTOP,
+        platform = platform ?: ClientPlatform.ANDROID,
         ip = boundIp?.hostAddress,
         bytesUp = bytesUp,
         bytesDown = bytesDown,
@@ -139,19 +173,71 @@ class ServiceSessionRepository(
         context.startService(ProxySessionService.stopIntent(context))
     }
 
-    override fun addDevice(name: String, platform: ClientPlatform): DeviceInvite? = null
+    /** LAPTOP is only ever the pinned USB slot (and the slot codec drops it on load), so it can't
+     *  be added as a Wi-Fi device. */
+    override fun addDevice(name: String, platform: ClientPlatform): DeviceInvite? {
+        if (platform == ClientPlatform.LAPTOP) return null
+        val controller = SessionHolder.controller.value ?: return null
+        return controller.addDevice(name, platform)?.let { inviteFor(it.id) }
+    }
 
-    override fun inviteFor(slotId: String): DeviceInvite? = null
+    /** Null unless the group is Up (the PAC URL needs the group-owner address) and [slotId] is a
+     *  live, non-pinned slot. */
+    override fun inviteFor(slotId: String): DeviceInvite? {
+        val controller = SessionHolder.controller.value ?: return null
+        val up = controller.linkState.value as? LinkState.Up ?: return null
+        val slot = controller.registry?.slots()?.firstOrNull { it.id == slotId && !it.pinned } ?: return null
+        val port = controller.wifiPort ?: return null
+        val owner = up.ownerAddress.hostAddress ?: return null
+        return DeviceInvite(
+            slotId = slotId,
+            wifiQr = QrPayloads.wifiQr(up.credentials.ssid, up.credentials.password),
+            pacUrl = QrPayloads.pacUrl(owner, port, slot.token),
+            mobileConfigUrl = QrPayloads.mobileConfigUrl(owner, port, slot.token),
+        )
+    }
 
     /** Goes through the controller, which only ever revokes via `ProxyServer.revoke`. */
     override fun revoke(slotId: String) {
         SessionHolder.controller.value?.revoke(slotId)
     }
 
+    /**
+     * (D7) Refused when the saved Wi-Fi devices (active and inactive alike) plus the USB laptop's
+     * seat wouldn't fit the new `maxClients`, counted from storage whether or not a session is
+     * running. A changed Wi-Fi name or password deletes every saved device (plan decision 5) and,
+     * if a session is running, restarts it with the new credentials: the Stop then Start become a
+     * restart through the service's pending-start path (M-b).
+     */
     override fun updateSettings(settings: HostSettings): Boolean {
-        _settings.value = settings
+        if (!SeatRules.fits(slotStore.load().size, prefs.usbSharingEnabled, settings.maxClients)) return false
+        when (hostConfig.save(settings)) {
+            SaveResult.INVALID -> return false
+            SaveResult.SAVED -> Unit
+            SaveResult.SAVED_CREDENTIALS_CHANGED -> {
+                slotStore.clear()
+                if (sessionActive()) {
+                    stop()
+                    start()
+                }
+            }
+        }
+        _settings.value = hostConfig.hostSettings()
+        configuredSsid.value = storedSsid()
+        refreshChecks()
         return true
     }
+
+    /** (D7) Whether the USB switch may be turned on: every saved Wi-Fi device plus the laptop's
+     *  seat must fit `maxClients`. */
+    override fun canEnableUsb(): Boolean = SeatRules.canEnableUsb(slotStore.load().size, prefs.maxClients)
+
+    private fun sessionActive(): Boolean = when (SessionHolder.controller.value?.state?.value) {
+        SessionPhase.STARTING, SessionPhase.RUNNING, SessionPhase.DEGRADED -> true
+        else -> false
+    }
+
+    private fun storedSsid(): String? = hostConfig.sessionConfig().wifi?.credentials?.ssid
 
     override fun refreshChecks() {
         _checks.value = buildChecks()
@@ -163,16 +249,56 @@ class ServiceSessionRepository(
 
     private fun buildChecks(): List<SetupCheck> = listOf(
         notificationCheck(),
+        wifiPasswordCheck(),
+        p2pPermissionCheck(),
+        wifiOnCheck(),
         cellularCheck(),
         usbDebuggingCheck(),
         batteryOptimisationCheck(),
     )
 
+    /** No fix intent: the password is set on the Settings tab. */
+    private fun wifiPasswordCheck(): SetupCheck {
+        val set = _settings.value.password.isNotEmpty()
+        return SetupCheck(
+            title = "Wi-Fi password set",
+            detail = "Needed for Wi-Fi Direct sharing",
+            status = if (set) CheckStatus.OK else CheckStatus.ACTION_NEEDED,
+        )
+    }
+
+    /** NEARBY_WIFI_DEVICES on API 33+, ACCESS_FINE_LOCATION on 29-32 (what AndroidP2pApi checks). */
+    private fun p2pPermissionCheck(): SetupCheck {
+        val nearby = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+        val permission = if (nearby) Manifest.permission.NEARBY_WIFI_DEVICES else Manifest.permission.ACCESS_FINE_LOCATION
+        val granted = ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
+        return SetupCheck(
+            title = if (nearby) "Nearby devices permission" else "Location permission",
+            detail = "Wi-Fi Direct needs it to create the sharing group.",
+            status = if (granted) CheckStatus.OK else CheckStatus.ACTION_NEEDED,
+            fixIntent = if (granted) {
+                null
+            } else {
+                Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, "package:${context.packageName}".toUri())
+            },
+        )
+    }
+
+    private fun wifiOnCheck(): SetupCheck {
+        val on = context.getSystemService(WifiManager::class.java)?.isWifiEnabled == true
+        return SetupCheck(
+            title = "Wi-Fi on",
+            detail = "Wi-Fi Direct sharing needs Wi-Fi turned on (it doesn't need a Wi-Fi network).",
+            status = if (on) CheckStatus.OK else CheckStatus.ACTION_NEEDED,
+            fixIntent = if (on) null else Intent(Settings.Panel.ACTION_WIFI),
+        )
+    }
+
     private fun notificationCheck(): SetupCheck {
         val enabled = NotificationManagerCompat.from(context).areNotificationsEnabled()
         return SetupCheck(
             title = "Notifications allowed",
-            detail = "The ongoing \"Sharing over USB\" notification needs notification permission.",
+            detail = "The ongoing \"Sharing mobile data\" notification needs notification permission.",
             status = if (enabled) CheckStatus.OK else CheckStatus.ACTION_NEEDED,
             fixIntent = if (enabled) {
                 null

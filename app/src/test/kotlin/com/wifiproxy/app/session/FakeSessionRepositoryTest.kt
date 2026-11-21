@@ -29,6 +29,28 @@ class FakeSessionRepositoryTest {
     }
 
     @Test
+    fun `wifiUp follows RUNNING and DEGRADED only`() = runTest {
+        val repo = FakeSessionRepository(scope = backgroundScope, now = { currentTime })
+        assertFalse(repo.session.value.wifiUp)
+
+        repo.start(); runCurrent()
+        assertFalse(repo.session.value.wifiUp) // STARTING
+
+        advanceTimeBy(1_500); runCurrent()
+        assertTrue(repo.session.value.wifiUp) // RUNNING
+
+        advanceTimeBy(30_000); runCurrent()
+        assertEquals(SessionPhase.DEGRADED, repo.session.value.phase)
+        assertTrue(repo.session.value.wifiUp)
+
+        repo.stop(); runCurrent()
+        assertFalse(repo.session.value.wifiUp) // STOPPING
+        advanceTimeBy(500); runCurrent()
+        assertEquals(SessionPhase.IDLE, repo.session.value.phase)
+        assertFalse(repo.session.value.wifiUp)
+    }
+
+    @Test
     fun `counters grow while running`() = runTest {
         val repo = FakeSessionRepository(scope = backgroundScope, now = { currentTime })
         repo.start()

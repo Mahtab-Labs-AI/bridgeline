@@ -140,7 +140,7 @@ class FakeSessionRepository(
             _session.update { it.copy(phase = SessionPhase.STARTING) }
             appendLog("Starting session")
             delayMs(STARTING_DELAY_MS)
-            _session.update { it.copy(phase = SessionPhase.RUNNING, degradedReason = null) }
+            _session.update { it.copy(phase = SessionPhase.RUNNING, degradedReason = null, wifiUp = true) }
             appendLog("Session running: ${_session.value.ssid}")
             runLoop()
         }
@@ -182,7 +182,7 @@ class FakeSessionRepository(
         if (_session.value.phase == SessionPhase.IDLE) return
         runJob?.cancel()
         runJob = repositoryScope.launch {
-            _session.update { it.copy(phase = SessionPhase.STOPPING) }
+            _session.update { it.copy(phase = SessionPhase.STOPPING, wifiUp = false) }
             appendLog("Stopping session")
             delayMs(STOPPING_DELAY_MS)
             _session.update {
