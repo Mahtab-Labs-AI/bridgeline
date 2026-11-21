@@ -22,6 +22,7 @@ import com.wifiproxy.app.service.SessionHolder
 import com.wifiproxy.app.service.SessionController
 import com.wifiproxy.app.settings.AppPreferences
 import com.wifiproxy.app.settings.HostConfigSource
+import com.wifiproxy.app.settings.SaveResult
 import com.wifiproxy.app.wifi.LinkState
 import com.wifiproxy.app.wifi.SlotStore
 import com.wifiproxy.core.clients.Slot
@@ -89,12 +90,15 @@ class ServiceSessionRepository(
     private val hostConfig = HostConfigSource.forContext(context)
     private val slotStore = SlotStore(HostConfigSource.secureStore(context))
 
-    // The plain prefs only, until the init block's off-Main snapshot (a Keystore decrypt) has
-    // filled in the stored name and password.
+    // The plain prefs only, until loadSettings()'s off-Main snapshot (a Keystore decrypt) has
+    // filled in the stored name and password; settingsStatus says LOADING until then.
     private val _settings = MutableStateFlow(
         HostSettings(ssidSuffix = "", password = "", maxClients = prefs.maxClients, port = prefs.wifiPort, prefer5Ghz = prefs.prefer5Ghz),
     )
     override val settings: StateFlow<HostSettings> = _settings.asStateFlow()
+
+    private val _settingsStatus = MutableStateFlow(SettingsStatus.LOADING)
+    override val settingsStatus: StateFlow<SettingsStatus> = _settingsStatus.asStateFlow()
 
     /** The stored credentials' full SSID (`DIRECT-xy-<suffix>`), or null when none are set. */
     private val configuredSsid = MutableStateFlow<String?>(null)
@@ -107,8 +111,9 @@ class ServiceSessionRepository(
     private val _checks = MutableStateFlow<List<SetupCheck>>(emptyList())
     override val checks: StateFlow<List<SetupCheck>> = _checks.asStateFlow()
 
-    private val _usbSwitchAllowed = MutableStateFlow(true)
-    override val usbSwitchAllowed: StateFlow<Boolean> = _usbSwitchAllowed.asStateFlow()
+    // Unknown (null) until first computed: the USB switch stays disabled until then.
+    private val _usbSwitchAllowed = MutableStateFlow<Boolean?>(null)
+    override val usbSwitchAllowed: StateFlow<Boolean?> = _usbSwitchAllowed.asStateFlow()
 
     /** Rebuilds [checks] off Main (they do Binder calls into several system services). */
     private val requestChecks = offMainWorker(Dispatchers.Default) { _checks.value = buildChecks() }
@@ -120,22 +125,52 @@ class ServiceSessionRepository(
     }
 
     init {
-        repositoryScope.launch {
-            val epoch = settingsEpoch.get()
-            // One decrypt (a Keystore round trip) for both the settings and the SSID, off Main.
-            val snapshot = withContext(Dispatchers.IO) { hostConfig.snapshot() }
-            if (settingsEpoch.get() == epoch) {
-                _settings.value = snapshot.settings
-                configuredSsid.value = snapshot.ssid
-            }
-            requestChecks()
-        }
+        loadSettings()
         repositoryScope.launch {
             SessionHolder.controller
                 .flatMapLatest { it?.state ?: flowOf(SessionPhase.IDLE) }
                 .collect { requestUsbSwitchAllowed() }
         }
     }
+
+    /**
+     * Reads the saved settings off Main - one decrypt (a Keystore round trip) for both the
+     * settings and the SSID - and publishes them with [SettingsStatus.READY]. Credentials that
+     * are stored but unreadable right now give [SettingsStatus.UNREADABLE] instead, leaving the
+     * blank name and password unpublished as real values (the Settings screen then disables Save
+     * and offers [reloadSettings]).
+     */
+    private fun loadSettings() {
+        _settingsStatus.value = SettingsStatus.LOADING
+        repositoryScope.launch {
+            val epoch = settingsEpoch.get()
+            val snapshot = try {
+                withContext(Dispatchers.IO) { hostConfig.snapshot() }
+            } catch (e: Exception) {
+                Log.w(TAG, "Couldn't load the settings: ${e::class.simpleName}")
+                null
+            }
+            // A save that landed meanwhile already published newer settings (and READY).
+            if (settingsEpoch.get() == epoch) {
+                if (snapshot == null || snapshot.credentialsUnreadable) {
+                    _settingsStatus.value = SettingsStatus.UNREADABLE
+                } else {
+                    _settings.value = snapshot.settings
+                    configuredSsid.value = snapshot.ssid
+                    _settingsStatus.value = SettingsStatus.READY
+                }
+            }
+            requestChecks()
+        }
+    }
+
+    override fun reloadSettings() {
+        if (_settingsStatus.value != SettingsStatus.LOADING) loadSettings()
+    }
+
+    /** From whether a credentials blob is stored: no decrypt, so it is right before [settings]
+     *  has loaded and while the credentials are unreadable. */
+    override fun isWifiConfigured(): Boolean = hostConfig.isCredentialsSet()
 
     /**
      * A conflated background job: the returned function requests one run of [work] on
@@ -309,14 +344,20 @@ class ServiceSessionRepository(
      * Applies [settings] through [saver]. At most one decrypt and one encrypt (Keystore round
      * trips): [HostConfigSource.update] returns the new state instead of it being read back.
      */
-    override fun updateSettings(settings: HostSettings): Boolean {
-        val snapshot = saver.save(settings) ?: return false
+    override fun updateSettings(settings: HostSettings): SettingsUpdate {
+        val outcome = saver.save(settings)
+        val snapshot = outcome.snapshot ?: return if (outcome.result == SaveResult.UNAVAILABLE) {
+            SettingsUpdate.CREDENTIALS_UNREADABLE
+        } else {
+            SettingsUpdate.REJECTED
+        }
         settingsEpoch.incrementAndGet()
         _settings.value = snapshot.settings
         configuredSsid.value = snapshot.ssid
+        _settingsStatus.value = SettingsStatus.READY
         refreshChecks()
         requestUsbSwitchAllowed()
-        return true
+        return SettingsUpdate.SAVED
     }
 
     private fun sessionActive(): Boolean = when (SessionHolder.controller.value?.state?.value) {
@@ -359,7 +400,8 @@ class ServiceSessionRepository(
 
     /** No fix intent: the password is set on the Settings tab. */
     private fun wifiPasswordCheck(): SetupCheck {
-        val set = _settings.value.password.isNotEmpty()
+        // From the stored blob, not the loaded settings: right before the load, and while unreadable.
+        val set = hostConfig.isCredentialsSet()
         return SetupCheck(
             title = "Wi-Fi password set",
             detail = "Needed for Wi-Fi Direct sharing",

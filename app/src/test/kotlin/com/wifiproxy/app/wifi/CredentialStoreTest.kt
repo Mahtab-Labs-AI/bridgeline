@@ -79,6 +79,21 @@ class CredentialStoreTest {
     }
 
     @Test
+    fun `an unreadable blob reads as Unreadable, never Unset, and still counts as set`() {
+        val kv = MapStore()
+        val store = CredentialStore(kv, box())
+        assertFalse(store.isSet())
+        store.set("HostPhone", "password-one")
+        val flaky = CredentialStore(kv, ThrowingBox(GeneralSecurityException("busy")))
+        assertEquals(CredentialsRead.Unreadable, flaky.read())
+        assertTrue(flaky.isSet())
+        // set() with the default code refuses rather than pick a new SSID code over the old blob.
+        kotlin.test.assertFailsWith<CredentialsUnavailableException> { flaky.set("HostPhone", "password-two") }
+        assertEquals("password-one", store.get()?.password)
+        assertEquals(CREDENTIALS_UNREADABLE_MESSAGE, CredentialsUnavailableException().message)
+    }
+
+    @Test
     fun `a permanently unopenable blob is wiped`() {
         for (error in listOf(AEADBadTagException(), UnrecoverableKeyException(), IllegalArgumentException())) {
             val kv = MapStore()

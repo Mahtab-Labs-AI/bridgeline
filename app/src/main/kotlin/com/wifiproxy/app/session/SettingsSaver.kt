@@ -1,7 +1,7 @@
 package com.wifiproxy.app.session
 
 import com.wifiproxy.app.settings.HostConfigSource
-import com.wifiproxy.app.settings.HostSnapshot
+import com.wifiproxy.app.settings.SaveOutcome
 import com.wifiproxy.app.settings.SaveResult
 import com.wifiproxy.app.wifi.SlotStore
 
@@ -22,20 +22,22 @@ internal class SettingsSaver(
     private val sessionActive: () -> Boolean,
     private val restart: () -> Unit,
 ) {
-    /** The saved state, or null when the save was refused (invalid, or D7). */
-    fun save(settings: HostSettings): HostSnapshot? {
+    /** What the save did. Its snapshot is null when it was refused: [SaveResult.INVALID] (invalid,
+     *  or D7) or [SaveResult.UNAVAILABLE] (the stored credentials can't be read right now); either
+     *  way nothing changed - no slot is deleted and nothing restarts. */
+    fun save(settings: HostSettings): SaveOutcome {
         val outcome = hostConfig.update(settings) { passwordChanged ->
             SeatRules.fitsAfterSave(slotStore.load().size, passwordChanged, usbEnabled(), settings.maxClients)
         }
-        val snapshot = outcome.snapshot ?: return null
+        if (outcome.snapshot == null) return outcome
         when (outcome.result) {
             SaveResult.SAVED_PASSWORD_CHANGED -> {
                 slotStore.clear()
                 if (sessionActive()) restart()
             }
             SaveResult.SAVED_SSID_CHANGED -> if (sessionActive()) restart()
-            SaveResult.SAVED, SaveResult.INVALID -> Unit
+            SaveResult.SAVED, SaveResult.INVALID, SaveResult.UNAVAILABLE -> Unit
         }
-        return snapshot
+        return outcome
     }
 }

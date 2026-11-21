@@ -5,7 +5,14 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
-private val ALWAYS_ALLOWED: StateFlow<Boolean> = MutableStateFlow(true).asStateFlow()
+private val ALWAYS_ALLOWED: StateFlow<Boolean?> = MutableStateFlow<Boolean?>(true).asStateFlow()
+private val ALWAYS_READY: StateFlow<SettingsStatus> = MutableStateFlow(SettingsStatus.READY).asStateFlow()
+
+/** See [SessionRepository.settingsStatus]. */
+enum class SettingsStatus { LOADING, READY, UNREADABLE }
+
+/** What [SessionRepository.updateSettings] did. */
+enum class SettingsUpdate { SAVED, REJECTED, CREDENTIALS_UNREADABLE }
 
 /** Lifecycle of the shared-proxy session. Mirrors the real session state machine (design spec §3). */
 enum class SessionPhase { IDLE, STARTING, RUNNING, DEGRADED, STOPPING }
@@ -100,17 +107,31 @@ interface SessionRepository {
 
     fun revoke(slotId: String)
 
-    /** Returns false (and rejects the change) if [HostSettings.maxClients] would drop below the
-     *  slot count, or if the settings are invalid. */
-    fun updateSettings(settings: HostSettings): Boolean
+    /** [SettingsUpdate.REJECTED] (changing nothing) if [HostSettings.maxClients] would drop below
+     *  the slot count, or if the settings are invalid; [SettingsUpdate.CREDENTIALS_UNREADABLE]
+     *  (changing nothing) if the stored Wi-Fi settings can't be read right now. */
+    fun updateSettings(settings: HostSettings): SettingsUpdate
+
+    /** Whether [settings] holds the real saved values yet. Until [SettingsStatus.READY], its name
+     *  and password are blanks that mean nothing, and must not be edited from or saved back.
+     *  Always READY for the fake. */
+    val settingsStatus: StateFlow<SettingsStatus> get() = ALWAYS_READY
+
+    /** Re-reads the saved settings, e.g. after [SettingsStatus.UNREADABLE]. A no-op for the fake. */
+    fun reloadSettings() {}
+
+    /** Whether Wi-Fi Direct credentials are saved, so a Start needs the Wi-Fi Direct permission.
+     *  Answered without decrypting (so it is right even before [settings] has loaded, and while
+     *  the credentials are unreadable). */
+    fun isWifiConfigured(): Boolean = settings.value.password.isNotEmpty()
 
     /** Whether the "USB sharing (laptop)" switch may be turned on (user decision D7: the laptop
-     *  needs a free seat next to every saved Wi-Fi device). A cached value, cheap to read from
-     *  composition; always true for the fake. */
-    val usbSwitchAllowed: StateFlow<Boolean> get() = ALWAYS_ALLOWED
+     *  needs a free seat next to every saved Wi-Fi device); null until it has been computed. A
+     *  cached value, cheap to read from composition; always true for the fake. */
+    val usbSwitchAllowed: StateFlow<Boolean?> get() = ALWAYS_ALLOWED
 
-    /** [usbSwitchAllowed]'s current value. */
-    fun canEnableUsb(): Boolean = usbSwitchAllowed.value
+    /** [usbSwitchAllowed]'s current value; false while it is still unknown. */
+    fun canEnableUsb(): Boolean = usbSwitchAllowed.value == true
 
     /** Re-runs the setup checks. A no-op for the fake, which has no real permissions/exemptions
      *  to re-check; [ServiceSessionRepository] rebuilds [checks] from the live Android state.

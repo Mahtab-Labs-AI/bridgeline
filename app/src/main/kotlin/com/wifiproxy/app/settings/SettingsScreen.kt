@@ -27,6 +27,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -43,8 +44,11 @@ import com.wifiproxy.app.session.HostSettings
 import com.wifiproxy.app.session.PasswordStrength
 import com.wifiproxy.app.session.SessionPhase
 import com.wifiproxy.app.session.SessionRepository
+import com.wifiproxy.app.session.SettingsStatus
+import com.wifiproxy.app.session.SettingsUpdate
 import com.wifiproxy.app.session.passwordStrength
 import com.wifiproxy.app.ui.ScreenTitle
+import com.wifiproxy.app.wifi.CREDENTIALS_UNREADABLE_MESSAGE
 import com.wifiproxy.app.wifi.WifiCredentialRules
 import kotlinx.coroutines.flow.MutableStateFlow
 
@@ -58,16 +62,34 @@ fun SettingsScreen(
 ) {
     val savedSettings by repository.settings.collectAsStateWithLifecycle()
     val session by repository.session.collectAsStateWithLifecycle()
-    // The fields follow the saved settings: they start from them, and are reset to them whenever
-    // they change (the repository's first off-Main load, or a successful save). Every "changed?"
-    // test below compares against savedSettings, never a value captured once.
-    var suffix by remember(savedSettings) { mutableStateOf(savedSettings.ssidSuffix) }
-    var password by remember(savedSettings) { mutableStateOf(savedSettings.password) }
+    val settingsStatus by repository.settingsStatus.collectAsStateWithLifecycle()
+    // The fields are initialised exactly once, from the saved settings, as soon as those are READY
+    // (at once if they already are; else when the repository's off-Main load lands) - and never
+    // reset afterwards, so nothing overwrites what the user is typing. They stay disabled until
+    // then: before the load, `settings` holds blanks that mean nothing. Every "changed?" test
+    // below compares against the live savedSettings, never a value captured once.
+    val readyAtStart = remember(repository) { repository.settingsStatus.value == SettingsStatus.READY }
+    val startValues = remember(repository) { repository.settings.value }
+    var fieldsInitialised by remember(repository) { mutableStateOf(readyAtStart) }
+    var suffix by remember(repository) { mutableStateOf(if (readyAtStart) startValues.ssidSuffix else "") }
+    var password by remember(repository) { mutableStateOf(if (readyAtStart) startValues.password else "") }
     var passwordVisible by remember { mutableStateOf(false) }
-    var maxClients by remember(savedSettings) { mutableStateOf(savedSettings.maxClients) }
-    var portText by remember(savedSettings) { mutableStateOf(savedSettings.port.toString()) }
-    var prefer5Ghz by remember(savedSettings) { mutableStateOf(savedSettings.prefer5Ghz) }
+    var maxClients by remember(repository) { mutableStateOf(startValues.maxClients) }
+    var portText by remember(repository) { mutableStateOf(startValues.port.toString()) }
+    var prefer5Ghz by remember(repository) { mutableStateOf(startValues.prefer5Ghz) }
     var usbSharingEnabled by remember { mutableStateOf(prefs.usbSharingEnabled) }
+    LaunchedEffect(repository, settingsStatus) {
+        if (!fieldsInitialised && settingsStatus == SettingsStatus.READY) {
+            val loaded = repository.settings.value
+            suffix = loaded.ssidSuffix
+            password = loaded.password
+            maxClients = loaded.maxClients
+            portText = loaded.port.toString()
+            prefer5Ghz = loaded.prefer5Ghz
+            fieldsInitialised = true
+        }
+    }
+    val editable = fieldsInitialised && settingsStatus == SettingsStatus.READY
 
     var rejectionMessage by remember { mutableStateOf<String?>(null) }
     var portError by remember { mutableStateOf<String?>(null) }
@@ -96,7 +118,7 @@ fun SettingsScreen(
             portError = portProblem
             return
         }
-        val ok = repository.updateSettings(
+        val result = repository.updateSettings(
             HostSettings(
                 ssidSuffix = suffix,
                 password = password,
@@ -105,9 +127,13 @@ fun SettingsScreen(
                 prefer5Ghz = prefer5Ghz,
             ),
         )
-        if (ok) {
+        if (result == SettingsUpdate.SAVED) {
             rejectionMessage = null
             savedMessage = true
+        } else if (result == SettingsUpdate.CREDENTIALS_UNREADABLE) {
+            // Nothing was changed; the user's edits stay in the fields for another try.
+            savedMessage = false
+            rejectionMessage = CREDENTIALS_UNREADABLE_MESSAGE
         } else {
             savedMessage = false
             val activeSlots = repository.session.value.slots
@@ -134,9 +160,10 @@ fun SettingsScreen(
             // (D7) Turning the switch on is refused when the laptop's seat wouldn't fit the saved
             // Wi-Fi devices; turning it off is always allowed while idle. A cached flow, so
             // recomposing never decodes the slot store.
+            // Null until first computed: the switch stays disabled until the answer is known.
             val usbCanTurnOn by repository.usbSwitchAllowed.collectAsStateWithLifecycle()
-            val usbSwitchEnabled = !demoSwitchLocked && (usbSharingEnabled || usbCanTurnOn)
-            val usbNeedsFreeSlot = !demoSwitchLocked && !usbSharingEnabled && !usbCanTurnOn
+            val usbSwitchEnabled = !demoSwitchLocked && usbCanTurnOn != null && (usbSharingEnabled || usbCanTurnOn == true)
+            val usbNeedsFreeSlot = !demoSwitchLocked && !usbSharingEnabled && usbCanTurnOn == false
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -215,6 +242,7 @@ fun SettingsScreen(
                     value = suffix,
                     onValueChange = { suffix = it },
                     singleLine = true,
+                    enabled = editable,
                     modifier = Modifier.weight(1f),
                 )
             }
@@ -236,6 +264,7 @@ fun SettingsScreen(
                 value = password,
                 onValueChange = { password = it },
                 singleLine = true,
+                enabled = editable,
                 visualTransformation = if (passwordVisible) VisualTransformation.None else PasswordVisualTransformation(),
                 trailingIcon = {
                     IconButton(onClick = { passwordVisible = !passwordVisible }) {
@@ -269,6 +298,7 @@ fun SettingsScreen(
             Slider(
                 value = maxClients.toFloat(),
                 onValueChange = { maxClients = it.toInt() },
+                enabled = editable,
                 valueRange = 1f..3f,
                 steps = 1,
             )
@@ -295,6 +325,7 @@ fun SettingsScreen(
                     }
                 },
                 singleLine = true,
+                enabled = editable,
                 isError = portError != null,
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                 modifier = Modifier.fillMaxWidth(),
@@ -316,7 +347,7 @@ fun SettingsScreen(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Text(text = "Prefer 5 GHz", style = MaterialTheme.typography.titleMedium)
-            Switch(checked = prefer5Ghz, onCheckedChange = { prefer5Ghz = it })
+            Switch(checked = prefer5Ghz, enabled = editable, onCheckedChange = { prefer5Ghz = it })
         }
         if (demoSwitchLocked) {
             Text(
@@ -324,6 +355,26 @@ fun SettingsScreen(
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+        }
+
+        when (settingsStatus) {
+            SettingsStatus.LOADING -> Text(
+                text = "Loading the saved settings…",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            // The stored credentials exist but can't be read: saving now would be judged against
+            // blanks, so Save stays disabled until a retry reads them.
+            SettingsStatus.UNREADABLE -> Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = CREDENTIALS_UNREADABLE_MESSAGE,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.weight(1f),
+                )
+                TextButton(onClick = { repository.reloadSettings() }) { Text("Try again") }
+            }
+            SettingsStatus.READY -> Unit
         }
 
         Button(
@@ -335,7 +386,7 @@ fun SettingsScreen(
                     applySave()
                 }
             },
-            enabled = suffixError == null && passwordError == null,
+            enabled = editable && suffixError == null && passwordError == null,
             modifier = Modifier.fillMaxWidth(),
         ) {
             Text("Save")

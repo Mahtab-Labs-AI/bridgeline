@@ -237,9 +237,9 @@ class FakeSessionRepository(
         appendLog("Revoked device: ${slot.name}")
     }
 
-    override fun updateSettings(settings: HostSettings): Boolean {
+    override fun updateSettings(settings: HostSettings): SettingsUpdate {
         val activeCount = _session.value.slots.size
-        if (settings.maxClients < activeCount) return false
+        if (settings.maxClients < activeCount) return SettingsUpdate.REJECTED
 
         val passwordChanged = settings.password != _settings.value.password
         _settings.value = settings
@@ -257,7 +257,7 @@ class FakeSessionRepository(
             appendLog("Password changed: all devices dropped")
         }
         appendLog("Settings updated")
-        return true
+        return SettingsUpdate.SAVED
     }
 
     override fun close() {

@@ -3,11 +3,14 @@ package com.wifiproxy.app.settings
 import com.wifiproxy.app.session.HostSettings
 import com.wifiproxy.app.wifi.AesGcmSecretBox
 import com.wifiproxy.app.wifi.CredentialStore
+import com.wifiproxy.app.wifi.CredentialsUnavailableException
 import com.wifiproxy.app.wifi.SecretBox
+import java.security.ProviderException
 import java.util.Random
 import javax.crypto.KeyGenerator
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
@@ -153,5 +156,61 @@ class HostConfigSourceTest {
         assertNotNull(HostConfigSource.portError(8081))
         assertNotNull(HostConfigSource.portError(1023))
         assertNotNull(HostConfigSource.portError(65536))
+    }
+
+    // --- Round 2: unreadable credentials are not "unset" ------------------------------------------
+
+    private class SwitchableBox(private val inner: SecretBox) : SecretBox {
+        var failing = false
+        override fun seal(plain: ByteArray) = inner.seal(plain)
+        override fun open(sealed: ByteArray): ByteArray = if (failing) throw ProviderException("busy") else inner.open(sealed)
+    }
+
+    private val switchable = SwitchableBox(AesGcmSecretBox { key })
+    private val flakyKv = MapKv()
+    private val flakyPrefs = MemoryPrefs()
+    private val flaky = HostConfigSource(flakyPrefs, CredentialStore(flakyKv, switchable, Random(7)))
+
+    @Test
+    fun `unreadable credentials make sessionConfig throw, never a silent USB-only session`() {
+        flaky.save(valid)
+        switchable.failing = true
+        val e = assertFailsWith<CredentialsUnavailableException> { flaky.sessionConfig() }
+        assertFalse("correct horse" in e.message.orEmpty())
+        assertTrue(flaky.isCredentialsSet())
+    }
+
+    @Test
+    fun `an unreadable snapshot says so, and an update then changes nothing`() {
+        val before = flaky.update(valid).snapshot!!
+        val blob = flakyKv.map.toMap()
+        switchable.failing = true
+
+        val snapshot = flaky.snapshot()
+        assertTrue(snapshot.credentialsUnreadable)
+        assertEquals("", snapshot.settings.password)
+
+        val outcome = flaky.update(valid.copy(maxClients = 2, port = 9090, prefer5Ghz = true))
+        assertEquals(SaveOutcome(SaveResult.UNAVAILABLE, null), outcome)
+        assertEquals(3, flakyPrefs.maxClients)
+        assertEquals(8080, flakyPrefs.wifiPort)
+        assertEquals(false, flakyPrefs.prefer5Ghz)
+        assertEquals(blob, flakyKv.map)
+
+        switchable.failing = false
+        assertEquals(before.ssid, flaky.snapshot().ssid)
+        assertFalse(flaky.snapshot().credentialsUnreadable)
+    }
+
+    @Test
+    fun `isCredentialsSet follows the stored blob without decrypting`() {
+        val counting = CountingBox(AesGcmSecretBox { key })
+        val kv = MapKv()
+        val source = HostConfigSource(MemoryPrefs(), CredentialStore(kv, counting, Random(7)))
+        assertFalse(source.isCredentialsSet())
+        source.save(valid)
+        counting.opens = 0
+        assertTrue(source.isCredentialsSet())
+        assertEquals(0, counting.opens)
     }
 }

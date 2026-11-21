@@ -118,8 +118,8 @@ class FakeSessionRepositoryTest {
         val current = repo.settings.value
         assertEquals(2, repo.session.value.slots.size)
 
-        val ok = repo.updateSettings(current.copy(maxClients = 1))
-        assertFalse(ok)
+        val result = repo.updateSettings(current.copy(maxClients = 1))
+        assertEquals(SettingsUpdate.REJECTED, result)
         assertEquals(current, repo.settings.value)
     }
 

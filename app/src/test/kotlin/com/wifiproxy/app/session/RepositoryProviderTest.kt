@@ -38,7 +38,7 @@ private class TrackingRepository(val label: String) : SessionRepository {
     override fun addDevice(name: String, platform: ClientPlatform): DeviceInvite? = null
     override fun inviteFor(slotId: String): DeviceInvite? = null
     override fun revoke(slotId: String) {}
-    override fun updateSettings(settings: HostSettings): Boolean = true
+    override fun updateSettings(settings: HostSettings): SettingsUpdate = SettingsUpdate.SAVED
     override fun close() {
         closed = true
     }

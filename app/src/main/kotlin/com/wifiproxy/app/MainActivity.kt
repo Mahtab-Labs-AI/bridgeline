@@ -73,7 +73,9 @@ class MainActivity : ComponentActivity() {
                         onStartSharing = {
                             // Wi-Fi Direct's own permission is only requested when a password is
                             // set (plan decision 2: no password means USB-only, no P2P group).
-                            val wifiDirectNeeded = repository.settings.value.password.isNotEmpty()
+                            // Asked of the stored blob, so it is right before the settings have
+                            // loaded and while the credentials are unreadable.
+                            val wifiDirectNeeded = repository.isWifiConfigured()
                             val wanted = buildList {
                                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                                     add(Manifest.permission.POST_NOTIFICATIONS)
