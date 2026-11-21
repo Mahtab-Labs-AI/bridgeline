@@ -124,6 +124,12 @@ class ProxySessionService : Service() {
      *  notification for a tick that was already in flight when teardown started. */
     @Volatile private var serviceStopping = false
 
+    /** Set on Main by [onForegroundRefused]. The refusal typically hits a sticky restart after
+     *  process death, which never started a session and so never runs `link.stop()`; a group the
+     *  dead process left behind would otherwise linger (and keep advertising) until Wi-Fi goes
+     *  off. [onDestroy] then does a best-effort `removeGroup()` on `serial` before closing the API. */
+    private var removeStaleGroupOnClose = false
+
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
@@ -218,6 +224,7 @@ class ProxySessionService : Service() {
      *  resume. Any session still running is shut down by [onDestroy], like on any other stop. */
     private fun onForegroundRefused() {
         pendingStart = false
+        removeStaleGroupOnClose = true
         prefs.sessionDesired = false
         notificationJob?.cancel()
         removeNotification()
@@ -340,7 +347,17 @@ class ProxySessionService : Service() {
                 }
             }
         } else if (api != null) {
-            CoroutineScope(serial + Job()).launch { api.close() }
+            // Fire-and-forget, like the shutdown above: never waited on from Main.
+            val removeStaleGroup = removeStaleGroupOnClose
+            CoroutineScope(serial + Job()).launch {
+                try {
+                    // Best effort: removeGroup() is documented never to throw and is time-bounded,
+                    // but nothing here may stop the close below.
+                    if (removeStaleGroup) runCatching { api.removeGroup() }
+                } finally {
+                    api.close()
+                }
+            }
         }
         // (R6) After scheduling the shutdown above, not before: a destroyed service must not stay
         // reachable through a controller/egress this onIdle closure keeps alive, and nothing past

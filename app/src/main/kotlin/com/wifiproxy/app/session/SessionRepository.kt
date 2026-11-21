@@ -1,7 +1,11 @@
 package com.wifiproxy.app.session
 
 import android.content.Intent
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+
+private val ALWAYS_ALLOWED: StateFlow<Boolean> = MutableStateFlow(true).asStateFlow()
 
 /** Lifecycle of the shared-proxy session. Mirrors the real session state machine (design spec §3). */
 enum class SessionPhase { IDLE, STARTING, RUNNING, DEGRADED, STOPPING }
@@ -31,8 +35,11 @@ data class SessionUi(
     /** Set when the last `start()` itself failed and the session fell back to IDLE (C1); cleared
      *  by the next successful start. Null for the fake, which never fails to start. */
     val lastError: String? = null,
-    /** True while the Wi-Fi Direct group is Up, i.e. devices can be invited. */
+    /** True while the Wi-Fi Direct group is Up and its listener runs, i.e. devices can be invited. */
     val wifiUp: Boolean = false,
+    /** Where devices reach the proxy right now: the Wi-Fi listener while it serves, the USB one
+     *  (`127.0.0.1:8081 (USB)`) for a USB-only session, else null (idle, or Wi-Fi not up yet). */
+    val proxyAddress: String? = null,
 )
 
 data class HostSettings(
@@ -98,8 +105,12 @@ interface SessionRepository {
     fun updateSettings(settings: HostSettings): Boolean
 
     /** Whether the "USB sharing (laptop)" switch may be turned on (user decision D7: the laptop
-     *  needs a free seat next to every saved Wi-Fi device). Always true for the fake. */
-    fun canEnableUsb(): Boolean = true
+     *  needs a free seat next to every saved Wi-Fi device). A cached value, cheap to read from
+     *  composition; always true for the fake. */
+    val usbSwitchAllowed: StateFlow<Boolean> get() = ALWAYS_ALLOWED
+
+    /** [usbSwitchAllowed]'s current value. */
+    fun canEnableUsb(): Boolean = usbSwitchAllowed.value
 
     /** Re-runs the setup checks. A no-op for the fake, which has no real permissions/exemptions
      *  to re-check; [ServiceSessionRepository] rebuilds [checks] from the live Android state.

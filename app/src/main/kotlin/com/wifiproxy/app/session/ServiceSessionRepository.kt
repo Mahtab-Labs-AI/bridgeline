@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.location.LocationManager
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.Uri
@@ -11,8 +12,10 @@ import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.PowerManager
 import android.provider.Settings
+import android.util.Log
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
+import androidx.core.location.LocationManagerCompat
 import androidx.core.net.toUri
 import com.wifiproxy.app.service.ProxySessionService
 import com.wifiproxy.app.service.SessionHolder
@@ -22,9 +25,12 @@ import com.wifiproxy.app.settings.HostConfigSource
 import com.wifiproxy.app.wifi.LinkState
 import com.wifiproxy.app.wifi.SlotStore
 import com.wifiproxy.core.clients.Slot
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -37,12 +43,20 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.util.concurrent.atomic.AtomicInteger
 
 private const val POLL_INTERVAL_MS = 1_000L
+private const val TAG = "ServiceSessionRepo"
 
-/** Android's Wi-Fi Direct group-owner address, shown while the group isn't Up. */
+/** Android's Wi-Fi Direct group-owner address, the fake-compatible [SessionUi.proxyHost] while
+ *  the group isn't Up. */
 private const val DEFAULT_GROUP_OWNER = "192.168.49.1"
 private const val NO_WIFI_SSID = "USB only"
+
+/** The USB listener as a laptop reaches it (through `adb forward tcp:8081 tcp:8081`). */
+private const val USB_PROXY_ADDRESS = "127.0.0.1:8081 (USB)"
 
 /**
  * The real [SessionRepository]: `start`/`stop` drive [ProxySessionService], and [session]/[log]
@@ -50,9 +64,14 @@ private const val NO_WIFI_SSID = "USB only"
  * slots - until the service has actually been started once).
  *
  * [settings] are the persisted host settings ([HostConfigSource]); device invites need a running
- * session with the Wi-Fi Direct group Up (plan decision 4). [refreshChecks] re-runs the real
- * Android checks, since permissions, Wi-Fi and the battery exemption can change outside the app
- * (call it on resume).
+ * session with the Wi-Fi Direct group Up and its listener running (plan decision 4).
+ * [refreshChecks] re-runs the real Android checks, since permissions, Wi-Fi and the battery
+ * exemption can change outside the app (call it on resume).
+ *
+ * Nothing slow runs on Main: the initial settings snapshot (a Keystore decrypt), the checks
+ * (Binder calls) and [usbSwitchAllowed] (decoding the slot store) are computed in the background
+ * and published to their StateFlows. [updateSettings] stays synchronous, since its caller needs
+ * the result.
  */
 @OptIn(ExperimentalCoroutinesApi::class)
 class ServiceSessionRepository(
@@ -70,19 +89,73 @@ class ServiceSessionRepository(
     private val hostConfig = HostConfigSource.forContext(context)
     private val slotStore = SlotStore(HostConfigSource.secureStore(context))
 
-    // One decrypt (a Keystore round trip, on Main) for both the settings and the SSID.
-    private val initial = hostConfig.snapshot()
-
-    private val _settings = MutableStateFlow(initial.settings)
+    // The plain prefs only, until the init block's off-Main snapshot (a Keystore decrypt) has
+    // filled in the stored name and password.
+    private val _settings = MutableStateFlow(
+        HostSettings(ssidSuffix = "", password = "", maxClients = prefs.maxClients, port = prefs.wifiPort, prefer5Ghz = prefs.prefer5Ghz),
+    )
     override val settings: StateFlow<HostSettings> = _settings.asStateFlow()
 
     /** The stored credentials' full SSID (`DIRECT-xy-<suffix>`), or null when none are set. */
-    private val configuredSsid = MutableStateFlow(initial.ssid)
+    private val configuredSsid = MutableStateFlow<String?>(null)
+
+    /** Bumped by every [updateSettings], so the initial snapshot never overwrites a newer save. */
+    private val settingsEpoch = AtomicInteger()
 
     private val host = combine(_settings, configuredSsid) { settings, ssid -> HostView(settings, ssid) }
 
-    private val _checks = MutableStateFlow(buildChecks())
+    private val _checks = MutableStateFlow<List<SetupCheck>>(emptyList())
     override val checks: StateFlow<List<SetupCheck>> = _checks.asStateFlow()
+
+    private val _usbSwitchAllowed = MutableStateFlow(true)
+    override val usbSwitchAllowed: StateFlow<Boolean> = _usbSwitchAllowed.asStateFlow()
+
+    /** Rebuilds [checks] off Main (they do Binder calls into several system services). */
+    private val requestChecks = offMainWorker(Dispatchers.Default) { _checks.value = buildChecks() }
+
+    /** Re-derives [usbSwitchAllowed] off Main (it decodes the slot store); requested on every
+     *  save, add, revoke and session phase change instead of on every recomposition. */
+    private val requestUsbSwitchAllowed = offMainWorker(Dispatchers.IO) {
+        _usbSwitchAllowed.value = SeatRules.canEnableUsb(slotStore.load().size, prefs.maxClients)
+    }
+
+    init {
+        repositoryScope.launch {
+            val epoch = settingsEpoch.get()
+            // One decrypt (a Keystore round trip) for both the settings and the SSID, off Main.
+            val snapshot = withContext(Dispatchers.IO) { hostConfig.snapshot() }
+            if (settingsEpoch.get() == epoch) {
+                _settings.value = snapshot.settings
+                configuredSsid.value = snapshot.ssid
+            }
+            requestChecks()
+        }
+        repositoryScope.launch {
+            SessionHolder.controller
+                .flatMapLatest { it?.state ?: flowOf(SessionPhase.IDLE) }
+                .collect { requestUsbSwitchAllowed() }
+        }
+    }
+
+    /**
+     * A conflated background job: the returned function requests one run of [work] on
+     * [dispatcher]. Requests arriving while it runs merge into one more run after it, so the
+     * published result always reflects the latest request. A failing run is logged (class name
+     * only) and never ends the worker.
+     */
+    private fun offMainWorker(dispatcher: CoroutineDispatcher, work: () -> Unit): () -> Unit {
+        val requests = Channel<Unit>(Channel.CONFLATED)
+        repositoryScope.launch(dispatcher) {
+            for (request in requests) {
+                try {
+                    work()
+                } catch (e: Exception) {
+                    Log.w(TAG, "Background refresh failed: ${e::class.simpleName}")
+                }
+            }
+        }
+        return { requests.trySend(Unit) }
+    }
 
     // Counters live on ClientRegistry, not a Flow (design spec §6: "stats by polling registry.slots()").
     private val ticker = flow {
@@ -137,6 +210,14 @@ class ServiceSessionRepository(
 
     private fun buildUi(live: Live, host: HostView, controller: SessionController?): SessionUi {
         val up = live.link as? LinkState.Up
+        val sharing = live.phase == SessionPhase.RUNNING || live.phase == SessionPhase.DEGRADED
+        // Only a listener that really runs is shown (and invitable): the link being Up isn't enough.
+        val endpoint = if (sharing) controller?.wifiEndpoint else null
+        val proxyAddress = when {
+            endpoint != null -> "${endpoint.group.ownerAddress.hostAddress}:${endpoint.port}"
+            sharing && controller?.wifiConfigured == false && controller.usbListening -> USB_PROXY_ADDRESS
+            else -> null
+        }
         return SessionUi(
             phase = live.phase,
             degradedReason = live.reason,
@@ -147,7 +228,8 @@ class ServiceSessionRepository(
             slots = controller?.registry?.slots().orEmpty().map { it.toSlotUi(controller?.platformOf(it.id)) },
             maxClients = host.settings.maxClients,
             lastError = live.lastError,
-            wifiUp = up != null,
+            wifiUp = endpoint != null,
+            proxyAddress = proxyAddress,
         )
     }
 
@@ -180,16 +262,20 @@ class ServiceSessionRepository(
     override fun addDevice(name: String, platform: ClientPlatform): DeviceInvite? {
         if (platform == ClientPlatform.LAPTOP) return null
         val controller = SessionHolder.controller.value ?: return null
-        return controller.addDevice(name, platform)?.let { inviteFor(it.id) }
+        val slot = controller.addDevice(name, platform)
+        requestUsbSwitchAllowed()
+        return slot?.let { inviteFor(it.id) }
     }
 
-    /** Null unless the group is Up (the PAC URL needs the group-owner address) and [slotId] is a
-     *  live, non-pinned slot. */
+    /** Null unless the Wi-Fi listener is really serving the group (the PAC URL needs the
+     *  group-owner address and a live port; see [SessionController.wifiEndpoint]) and [slotId] is
+     *  a live, non-pinned slot. */
     override fun inviteFor(slotId: String): DeviceInvite? {
         val controller = SessionHolder.controller.value ?: return null
-        val up = controller.linkState.value as? LinkState.Up ?: return null
+        val endpoint = controller.wifiEndpoint ?: return null
+        val up = endpoint.group
         val slot = controller.registry?.slots()?.firstOrNull { it.id == slotId && !it.pinned } ?: return null
-        val port = controller.wifiPort ?: return null
+        val port = endpoint.port
         val owner = up.ownerAddress.hostAddress ?: return null
         return DeviceInvite(
             slotId = slotId,
@@ -202,6 +288,7 @@ class ServiceSessionRepository(
     /** Goes through the controller, which only ever revokes via `ProxyServer.revoke`. */
     override fun revoke(slotId: String) {
         SessionHolder.controller.value?.revoke(slotId)
+        requestUsbSwitchAllowed()
     }
 
     /** See [SettingsSaver]: D7 against the stored devices, a password change deletes them, and a
@@ -224,38 +311,51 @@ class ServiceSessionRepository(
      */
     override fun updateSettings(settings: HostSettings): Boolean {
         val snapshot = saver.save(settings) ?: return false
+        settingsEpoch.incrementAndGet()
         _settings.value = snapshot.settings
         configuredSsid.value = snapshot.ssid
         refreshChecks()
+        requestUsbSwitchAllowed()
         return true
     }
-
-    /** (D7) Whether the USB switch may be turned on: every saved Wi-Fi device plus the laptop's
-     *  seat must fit `maxClients`. */
-    override fun canEnableUsb(): Boolean = SeatRules.canEnableUsb(slotStore.load().size, prefs.maxClients)
 
     private fun sessionActive(): Boolean = when (SessionHolder.controller.value?.state?.value) {
         SessionPhase.STARTING, SessionPhase.RUNNING, SessionPhase.DEGRADED -> true
         else -> false
     }
 
+    /** Off Main; [checks] updates once the rebuild is done. */
     override fun refreshChecks() {
-        _checks.value = buildChecks()
+        requestChecks()
     }
 
     override fun close() {
         repositoryJob.cancel()
     }
 
-    private fun buildChecks(): List<SetupCheck> = listOf(
+    private fun buildChecks(): List<SetupCheck> = listOfNotNull(
         notificationCheck(),
         wifiPasswordCheck(),
         p2pPermissionCheck(),
+        locationOnCheck(),
         wifiOnCheck(),
         cellularCheck(),
         usbDebuggingCheck(),
         batteryOptimisationCheck(),
     )
+
+    /** API 29-32 only (null, so omitted, on 33+): Wi-Fi Direct there also needs Location mode on,
+     *  which AndroidP2pApi reports as the link's "Turn on Location…" failure. */
+    private fun locationOnCheck(): SetupCheck? {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) return null
+        val on = context.getSystemService(LocationManager::class.java)?.let { LocationManagerCompat.isLocationEnabled(it) } ?: true
+        return SetupCheck(
+            title = "Location on",
+            detail = "On Android 10–12, Wi-Fi Direct sharing needs Location turned on.",
+            status = if (on) CheckStatus.OK else CheckStatus.ACTION_NEEDED,
+            fixIntent = if (on) null else Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS),
+        )
+    }
 
     /** No fix intent: the password is set on the Settings tab. */
     private fun wifiPasswordCheck(): SetupCheck {

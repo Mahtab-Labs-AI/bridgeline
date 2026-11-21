@@ -140,7 +140,9 @@ class FakeSessionRepository(
             _session.update { it.copy(phase = SessionPhase.STARTING) }
             appendLog("Starting session")
             delayMs(STARTING_DELAY_MS)
-            _session.update { it.copy(phase = SessionPhase.RUNNING, degradedReason = null, wifiUp = true) }
+            _session.update {
+                it.copy(phase = SessionPhase.RUNNING, degradedReason = null, wifiUp = true, proxyAddress = "${it.proxyHost}:${it.port}")
+            }
             appendLog("Session running: ${_session.value.ssid}")
             runLoop()
         }
@@ -182,7 +184,7 @@ class FakeSessionRepository(
         if (_session.value.phase == SessionPhase.IDLE) return
         runJob?.cancel()
         runJob = repositoryScope.launch {
-            _session.update { it.copy(phase = SessionPhase.STOPPING, wifiUp = false) }
+            _session.update { it.copy(phase = SessionPhase.STOPPING, wifiUp = false, proxyAddress = null) }
             appendLog("Stopping session")
             delayMs(STOPPING_DELAY_MS)
             _session.update {
@@ -245,6 +247,7 @@ class FakeSessionRepository(
             it.copy(
                 ssid = ssidFor(settings.ssidSuffix),
                 port = settings.port,
+                proxyAddress = if (it.wifiUp) "${it.proxyHost}:${settings.port}" else null,
                 maxClients = settings.maxClients,
                 slots = if (passwordChanged) emptyList() else it.slots,
             )

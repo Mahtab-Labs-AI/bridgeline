@@ -51,6 +51,18 @@ class FakeSessionRepositoryTest {
     }
 
     @Test
+    fun `the proxy address shows only while Wi-Fi is up`() = runTest {
+        val repo = FakeSessionRepository(scope = backgroundScope, now = { currentTime })
+        assertNull(repo.session.value.proxyAddress)
+
+        repo.start(); advanceTimeBy(1_500); runCurrent()
+        assertEquals("192.168.49.1:8080", repo.session.value.proxyAddress)
+
+        repo.stop(); runCurrent()
+        assertNull(repo.session.value.proxyAddress)
+    }
+
+    @Test
     fun `counters grow while running`() = runTest {
         val repo = FakeSessionRepository(scope = backgroundScope, now = { currentTime })
         repo.start()
