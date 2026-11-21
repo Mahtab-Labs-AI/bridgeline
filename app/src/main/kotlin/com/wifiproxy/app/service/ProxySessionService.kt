@@ -18,6 +18,11 @@ import com.wifiproxy.app.MainActivity
 import com.wifiproxy.app.egress.CellularEgress
 import com.wifiproxy.app.session.SessionPhase
 import com.wifiproxy.app.ui.formatBytes
+import com.wifiproxy.app.wifi.LinkConfig
+import com.wifiproxy.app.wifi.LinkManager
+import com.wifiproxy.app.wifi.LinkState
+import com.wifiproxy.app.wifi.PersistedSlot
+import com.wifiproxy.app.wifi.SlotPersistence
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -25,6 +30,9 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.isActive
@@ -169,7 +177,15 @@ class ProxySessionService : Service() {
         // keeping the Service alive) risks retaining a destroyed service.
         val connectivityManager = applicationContext.getSystemService(ConnectivityManager::class.java)
         val egress = CellularEgress(connectivityManager)
-        val newController = SessionController(egress = egress, scope = serviceScope)
+        // Interim (Plan 2b Task 6): USB-only with one client, exactly as before. Task 7 wires in
+        // P2pGroupLink, SlotStore and the host settings.
+        val newController = SessionController(
+            egress = egress,
+            link = InterimNoLink,
+            slots = InterimNoSlots,
+            config = { SessionConfig(usbEnabled = true, wifi = null, wifiPort = 8080, maxClients = 1) },
+            scope = serviceScope,
+        )
         // (C1) Set before this controller's start() is ever called: see the kdoc on
         // SessionController.onIdle for why this must be a direct callback, not something this
         // service subscribes to by collecting controller.state.
@@ -236,7 +252,7 @@ class ProxySessionService : Service() {
         // (not `serial` itself) is what gets cancelled. Still never blocks Main: `serial` is
         // backed by Dispatchers.Default, so shutdownBlocking() runs on one of its worker threads.
         if (c != null && c.state.value != SessionPhase.IDLE) {
-            CoroutineScope(serial + Job()).launch { c.shutdownBlocking() }
+            CoroutineScope(serial + Job()).launch { c.shutdown() }
         }
         // (R6) After scheduling the shutdown above, not before: a destroyed service must not stay
         // reachable through a controller/egress this onIdle closure keeps alive, and nothing past
@@ -392,4 +408,19 @@ class ProxySessionService : Service() {
         fun stopIntent(context: Context): Intent =
             Intent(context, ProxySessionService::class.java).setAction(ACTION_STOP)
     }
+}
+
+/** Interim (Plan 2b Task 6, replaced in Task 7): a link that never starts, for the USB-only
+ *  config above. */
+private object InterimNoLink : LinkManager {
+    override val state: StateFlow<LinkState> = MutableStateFlow<LinkState>(LinkState.Idle).asStateFlow()
+    override fun start(config: LinkConfig) = Unit
+    override suspend fun stop() = Unit
+    override fun checkHealth() = Unit
+}
+
+/** Interim (Plan 2b Task 6, replaced in Task 7): USB-only sessions have no Wi-Fi slots to keep. */
+private object InterimNoSlots : SlotPersistence {
+    override fun load(): List<PersistedSlot> = emptyList()
+    override fun save(slots: List<PersistedSlot>) = Unit
 }

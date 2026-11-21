@@ -1,16 +1,25 @@
 package com.wifiproxy.app.service
 
 import com.wifiproxy.app.egress.SessionEgress
+import com.wifiproxy.app.session.ClientPlatform
 import com.wifiproxy.app.session.LogEntry
 import com.wifiproxy.app.session.SessionPhase
+import com.wifiproxy.app.wifi.LinkConfig
+import com.wifiproxy.app.wifi.LinkManager
+import com.wifiproxy.app.wifi.LinkState
+import com.wifiproxy.app.wifi.PersistedSlot
+import com.wifiproxy.app.wifi.REASON_CREATING
+import com.wifiproxy.app.wifi.SlotPersistence
 import com.wifiproxy.core.ProxyConfig
 import com.wifiproxy.core.ProxyServer
 import com.wifiproxy.core.clients.ClientRegistry
+import com.wifiproxy.core.clients.Slot
 import com.wifiproxy.core.egress.Egress
 import com.wifiproxy.core.net.Cidr
 import com.wifiproxy.core.net.DestinationFilter
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -19,12 +28,35 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import java.net.Inet4Address
 import java.net.InetAddress
+import java.util.concurrent.ConcurrentHashMap
 
 private const val LOG_CAPACITY = 500
 private const val PINNED_SLOT_NAME = "Laptop (USB)"
 private const val DEFAULT_WATCHDOG_INTERVAL_MS = 30_000L
 private const val DEFAULT_PORT = 8081
+private const val REASON_NO_MOBILE_DATA = "No mobile data"
+private const val NO_LISTENER_MESSAGE = "Set a Wi-Fi password in Settings or turn on USB sharing"
+
+/** Who may reach the USB listener: it binds loopback, reached through `adb forward`. */
+private val USB_PEER_SUBNET = Cidr.parse("127.0.0.0/8")
+
+/** The subnet Android uses for Wi-Fi Direct groups; blocked as a destination while the group's
+ *  real subnet isn't known (the link isn't Up). */
+private val DEFAULT_WIFI_DIRECT_SUBNET = Cidr.parse("192.168.49.0/24")
+
+/** What one session runs with; [SessionController] reads it once per start. */
+data class SessionConfig(
+    val usbEnabled: Boolean,
+    /** null = no Wi-Fi credentials set: the session is USB-only. */
+    val wifi: LinkConfig?,
+    val wifiPort: Int,
+    val maxClients: Int,
+)
 
 /**
  * What [SessionController] needs from the HTTP proxy, abstracted so a JVM test can fake
@@ -71,31 +103,42 @@ private val defaultServerFactory = SessionServerFactory { config, registry, egre
 private class StartInterruptedByStopException : Exception()
 
 /**
- * Owns the session state machine for the USB (`adb forward`) path (design spec §8a):
- * `Idle -> Starting -> Running <-> Degraded(no mobile data) -> Stopping -> Idle`.
+ * Owns the session state machine (design spec §8a):
+ * `Idle -> Starting -> Running <-> Degraded -> Stopping -> Idle`.
  *
- * [egress], [maxClients], [serverFactory], [now] and [scope] are all injected so the state
- * transitions, the degraded/recover path and the watchdog rebuild can be unit-tested on the JVM
- * with fakes; [ProxySessionService] supplies the real [com.wifiproxy.app.egress.CellularEgress]
- * and [defaultServerFactory].
+ * A session runs up to two [ProxyServer]s over one [ClientRegistry]: a loopback listener for a
+ * laptop over USB (`adb forward`, with a pinned slot) when [SessionConfig.usbEnabled], and a
+ * Wi-Fi Direct listener on the group-owner address whenever [link] is [LinkState.Up], when
+ * [SessionConfig.wifi] is set. Degraded means no mobile data, or (Wi-Fi sessions) a link that
+ * isn't Up; [degradedReason] says which.
  *
- * **Serialization (C2):** [start], [stop], the watchdog body, the network-generation rebuild and
- * `onLinkChange`'s filter refresh all run as coroutines launched on [scope] and nowhere else, never
- * synchronously on a caller's thread. In production, [ProxySessionService] builds [scope] on
- * `Dispatchers.Default.limitedParallelism(1)`, so those coroutines are strictly serialized against
- * each other - the watchdog can never rebuild a server that a concurrent `stop()` just tore down,
- * and a `stop()` that arrives mid-`start()` is never lost, only queued or (if `start()` is already
- * blocked inside a synchronous call like `ProxyServer.start()`) observed by `doStart()` re-checking
- * [state] once that call returns. A JVM test can pass a non-serial scope (e.g. `backgroundScope`
- * from `runTest`) since the virtual-time test dispatcher is itself effectively single-threaded.
+ * [egress], [link], [slots], [config], [serverFactory], [now] and [scope] are all injected so the
+ * state transitions, the degraded/recover path and the watchdog rebuild can be unit-tested on the
+ * JVM with fakes; [ProxySessionService] supplies the real ones.
+ *
+ * **Serialization (C2):** [start], [stop], the watchdog body, the network-generation rebuild,
+ * `onLinkChange`'s filter refresh and the link-state collector all run as coroutines launched on
+ * [scope] and nowhere else, never synchronously on a caller's thread. In production,
+ * [ProxySessionService] builds [scope] on `Dispatchers.Default.limitedParallelism(1)`, so those
+ * coroutines are strictly serialized against each other - the watchdog can never rebuild a server
+ * that a concurrent `stop()` just tore down, and a `stop()` that arrives mid-`start()` is never
+ * lost, only queued or (if `start()` is already blocked inside a synchronous call like
+ * `ProxyServer.start()`) observed by `doStart()` re-checking [state] once that call returns. A JVM
+ * test can pass a non-serial scope (e.g. `backgroundScope` from `runTest`) since the virtual-time
+ * test dispatcher is itself effectively single-threaded.
+ *
+ * Teardown suspends in [LinkManager.stop], and a serial dispatcher only serializes coroutines
+ * between suspension points, so [doStart] (including its rollback), [doStop] and [shutdown] also
+ * hold [lifecycle] for their whole run: a queued `doStop` can never run in the middle of a
+ * suspended rollback (and tear down twice, or kill the session a rollback's `onIdle` restarted).
  */
 class SessionController(
     private val egress: SessionEgress,
-    private val maxClients: () -> Int = { 1 },
-    private val bindAddress: InetAddress = InetAddress.getByName("127.0.0.1"),
-    private val port: Int = DEFAULT_PORT,
-    private val peerSubnet: Cidr = Cidr.parse("127.0.0.0/8"),
-    private val wifiDirectSubnet: Cidr = Cidr.parse("192.168.49.0/24"),
+    private val link: LinkManager,
+    private val slots: SlotPersistence,
+    private val config: () -> SessionConfig,
+    private val usbBindAddress: InetAddress = InetAddress.getByName("127.0.0.1"),
+    private val usbPort: Int = DEFAULT_PORT,
     private val serverFactory: SessionServerFactory = defaultServerFactory,
     private val now: () -> Long = System::currentTimeMillis,
     private val scope: CoroutineScope,
@@ -117,19 +160,51 @@ class SessionController(
      *  [SessionPhase.STARTING] or [SessionPhase.STOPPING]). */
     val cellularAvailable: StateFlow<Boolean> get() = egress.available
 
+    /** The Wi-Fi Direct link's own state, independent of [state]. */
+    val linkState: StateFlow<LinkState> get() = link.state
+
     private val _log = MutableStateFlow<List<LogEntry>>(emptyList())
     val log: StateFlow<List<LogEntry>> = _log.asStateFlow()
 
-    @Volatile private var activeServer: SessionServer? = null
+    @Volatile private var usbServer: SessionServer? = null
+
+    @Volatile private var wifiServer: SessionServer? = null
+
+    /** The Wi-Fi server most recently stopped this session, kept so [revoke] still goes through a
+     *  `ProxyServer` while the group is down. */
+    @Volatile private var lastWifiServer: SessionServer? = null
+
+    /** The exact group [wifiServer] serves; null while no Wi-Fi server is running. */
+    @Volatile private var wifiServerFor: LinkState.Up? = null
 
     @Volatile private var activeRegistry: ClientRegistry? = null
+
+    /** [config] as read once by [doStart]; null while idle. */
+    @Volatile private var sessionConfig: SessionConfig? = null
+
+    /** Platform per non-pinned slot id, for persistence and [platformOf]. Written from both
+     *  [scope] ([doStart]/[teardown]) and the caller's thread ([addDevice]/[revoke]). */
+    private val platforms: MutableMap<String, ClientPlatform> = ConcurrentHashMap()
+
+    /** Held by [doStart], [doStop] and [shutdown] for their whole run; see the class KDoc. */
+    private val lifecycle = Mutex()
 
     /** The registry backing the live session, or null while not running. [ServiceSessionRepository]
      *  polls [ClientRegistry.slots] on this for live per-device counters. */
     val registry: ClientRegistry? get() = activeRegistry
 
+    /** The Wi-Fi listener's port while a session with Wi-Fi Direct runs, else null. */
+    val wifiPort: Int?
+        get() {
+            val phase = _state.value
+            if (phase != SessionPhase.RUNNING && phase != SessionPhase.DEGRADED) return null
+            val cfg = sessionConfig ?: return null
+            return if (cfg.wifi != null) cfg.wifiPort else null
+        }
+
     private var availabilityJob: Job? = null
     private var networkGenerationJob: Job? = null
+    private var linkJob: Job? = null
     private var watchdogStarted = false
 
     /**
@@ -157,62 +232,81 @@ class SessionController(
      *  concurrent callers can never both schedule a [doStart]. */
     fun start() {
         if (!_state.compareAndSet(SessionPhase.IDLE, SessionPhase.STARTING)) return
-        appendLog("Starting USB session")
+        appendLog("Starting session")
         ensureWatchdog()
         scope.launch { doStart() }
     }
 
     private suspend fun doStart() {
-        var server: SessionServer? = null
-        try {
-            egress.start()
-            checkNotInterruptedByStop()
+        lifecycle.withLock {
+            var usb: SessionServer? = null
+            try {
+                val cfg = config()
+                sessionConfig = cfg
+                val wifi = cfg.wifi
+                check(cfg.usbEnabled || wifi != null) { NO_LISTENER_MESSAGE }
 
-            val registry = ClientRegistry(maxClients = maxClients().coerceIn(1, ClientRegistry.MAX_CLIENTS_LIMIT))
-            if (registry.addPinnedSlot(PINNED_SLOT_NAME, bindAddress) == null) {
-                appendLog("Could not pin the USB slot (no room)")
+                egress.start()
+                checkNotInterruptedByStop()
+
+                val maxClients = cfg.maxClients.coerceIn(1, ClientRegistry.MAX_CLIENTS_LIMIT)
+                val restored = slots.load().take(maxClients)
+                platforms.clear()
+                restored.forEach { platforms[it.record.id] = it.platform }
+                val registry = ClientRegistry(maxClients = maxClients, initial = restored.map { it.record })
+
+                if (cfg.usbEnabled) {
+                    if (registry.addPinnedSlot(PINNED_SLOT_NAME, usbBindAddress) == null) {
+                        appendLog("Could not pin the USB slot (no room)")
+                    }
+                    val usbConfig = ProxyConfig(bindAddress = usbBindAddress, port = usbPort, peerSubnet = USB_PEER_SUBNET)
+                    val newServer = serverFactory.create(usbConfig, registry, egress, buildFilter(), ::onServerError)
+                    usb = newServer
+                    newServer.start()
+                    checkNotInterruptedByStop()
+                }
+
+                usbServer = usb
+                activeRegistry = registry
+                // Returns immediately; the link-state collector below follows it from here.
+                if (wifi != null) link.start(wifi)
+
+                // Set the initial Running/Degraded phase directly from the current health, rather
+                // than through refreshHealth's RUNNING/DEGRADED-only transitions below: at this
+                // point the phase is still (expected to be) STARTING, which neither of those
+                // transitions matches.
+                //
+                // CAS rather than a plain write (R2): a concurrent stop() can move the phase to
+                // STOPPING in the gap between the checkNotInterruptedByStop() above and this line
+                // (no suspension point separates them, but healthReason() reads
+                // egress.available.value, a plain property read on a StateFlow backed by another
+                // thread, so nothing prevents a real stop() landing here). A plain
+                // `_state.value = target` would silently clobber that STOPPING back to
+                // RUNNING/DEGRADED; doStop would then see a phase that isn't what it set, return
+                // early without tearing anything down, and the stop would be lost for good. CAS
+                // instead leaves STOPPING alone and routes this exactly like any other interrupted
+                // start.
+                val reason = healthReason()
+                val target = if (reason == null) SessionPhase.RUNNING else SessionPhase.DEGRADED
+                if (!_state.compareAndSet(SessionPhase.STARTING, target)) throw StartInterruptedByStopException()
+                if (reason == null) {
+                    appendLog("Session running")
+                } else {
+                    _degradedReason.value = reason
+                    appendLog("Degraded: $reason")
+                }
+                _lastError.value = null
+                observeAvailability()
+                observeNetworkGeneration()
+                if (wifi != null) observeLink()
+            } catch (e: StartInterruptedByStopException) {
+                appendLog("Stop arrived while starting; rolling back")
+                rollbackStart(usb)
+            } catch (e: Exception) {
+                appendLog("Start failed: ${e::class.simpleName}")
+                _lastError.value = e.message ?: e::class.simpleName ?: "Start failed"
+                rollbackStart(usb)
             }
-            val config = ProxyConfig(bindAddress = bindAddress, port = port, peerSubnet = peerSubnet)
-            val newServer = serverFactory.create(config, registry, egress, buildFilter(), ::onServerError)
-            server = newServer
-            newServer.start()
-            checkNotInterruptedByStop()
-
-            activeServer = newServer
-            activeRegistry = registry
-
-            // Set the initial Running/Degraded phase directly from the current value, rather than
-            // through applyAvailability's RUNNING/DEGRADED-only transitions below: at this point
-            // the phase is still (expected to be) STARTING, which neither of those transitions
-            // matches.
-            //
-            // CAS rather than a plain write (R2): a concurrent stop() can move the phase to
-            // STOPPING in the gap between the checkNotInterruptedByStop() above and this line (no
-            // suspension point separates them, but egress.available.value is a plain property read
-            // on a StateFlow backed by another thread, so nothing prevents a real stop() landing
-            // here). A plain `_state.value = target` would silently clobber that STOPPING back to
-            // RUNNING/DEGRADED; doStop would then see a phase that isn't what it set, return early
-            // without tearing anything down, and the stop would be lost for good. CAS instead
-            // leaves STOPPING alone and routes this exactly like any other interrupted start.
-            val available = egress.available.value
-            val target = if (available) SessionPhase.RUNNING else SessionPhase.DEGRADED
-            if (!_state.compareAndSet(SessionPhase.STARTING, target)) throw StartInterruptedByStopException()
-            if (available) {
-                appendLog("USB session running")
-            } else {
-                _degradedReason.value = "No mobile data"
-                appendLog("Degraded: no mobile data")
-            }
-            _lastError.value = null
-            observeAvailability()
-            observeNetworkGeneration()
-        } catch (e: StartInterruptedByStopException) {
-            appendLog("Stop arrived while starting; rolling back")
-            rollbackStart(server)
-        } catch (e: Exception) {
-            appendLog("Start failed: ${e::class.simpleName}")
-            _lastError.value = e.message ?: e::class.simpleName ?: "Start failed"
-            rollbackStart(server)
         }
     }
 
@@ -224,22 +318,37 @@ class SessionController(
     }
 
     /** (C1) Rolls back whatever [doStart] managed to start before it failed or was interrupted by
-     *  a concurrent [stop]: the server first (never leave a listener bound), then the egress, each
-     *  tolerant of throwing, then back to IDLE. */
-    private fun rollbackStart(server: SessionServer?) {
-        runCatching { server?.stop() }
+     *  a concurrent [stop]: the servers first (never leave a listener bound), then the link, then
+     *  the egress, each tolerant of throwing, then back to IDLE. [usb] is passed in because a
+     *  server whose start failed was never published to [usbServer]. */
+    private suspend fun rollbackStart(usb: SessionServer?) {
+        stopAll(usb)
         runCatching { egress.stop() }
         teardown()
+    }
+
+    /** Shared by [rollbackStart], [doStop] and [shutdown]: stops the link collector (so nothing
+     *  reacts to the link going down below), both servers, then the link. [LinkManager.stop] runs
+     *  under [NonCancellable]: a teardown that has begun must finish even if [scope] is cancelled
+     *  meanwhile (e.g. by the service's onDestroy). */
+    private suspend fun stopAll(usb: SessionServer?) {
+        linkJob?.cancel()
+        linkJob = null
+        runCatching { usb?.stop() }
+        stopWifiServer()
+        withContext(NonCancellable) {
+            runCatching { link.stop() }
+        }
     }
 
     private fun observeAvailability() {
         availabilityJob?.cancel()
         availabilityJob = scope.launch {
-            egress.available.collect(::applyAvailability)
+            egress.available.collect { refreshHealth() }
         }
     }
 
-    /** (I5) Rebuilds the proxy server once per *distinct* cellular network, skipping the first
+    /** (I5) Rebuilds the proxy servers once per *distinct* cellular network, skipping the first
      *  value this collector ever sees (that one is just the network already in place when we
      *  subscribed, not a change). */
     private fun observeNetworkGeneration() {
@@ -256,42 +365,124 @@ class SessionController(
         }
     }
 
+    /** Follows the Wi-Fi Direct link: starts, rebuilds or stops the Wi-Fi listener to match it,
+     *  then re-derives the Running/Degraded phase. */
+    private fun observeLink() {
+        linkJob?.cancel()
+        linkJob = scope.launch {
+            link.state.collect { state ->
+                onLinkState(state)
+                refreshHealth()
+            }
+        }
+    }
+
     private fun rebuildForNetworkChange() {
         val phase = _state.value
         if (phase != SessionPhase.RUNNING && phase != SessionPhase.DEGRADED) return
-        val server = activeServer ?: return
-        appendLog("Cellular network changed; rebuilding the proxy server")
+        val servers = listOfNotNull(usbServer, wifiServer)
+        if (servers.isEmpty()) return
+        appendLog("Cellular network changed; rebuilding the proxy listeners")
         try {
-            server.stop()
-            server.updateFilter(buildFilter())
-            server.start()
+            for (server in servers) {
+                server.stop()
+                server.updateFilter(buildFilter())
+                server.start()
+            }
         } catch (e: Exception) {
             handleRecoveryFailure("Network rebuild failed: ${e::class.simpleName}", e)
         }
     }
 
+    /** Why the session is degraded right now, or null when it's healthy. No mobile data outranks
+     *  everything; a Wi-Fi session is also degraded whenever its link isn't Up. */
+    private fun healthReason(): String? {
+        if (!egress.available.value) return REASON_NO_MOBILE_DATA
+        if (sessionConfig?.wifi == null) return null
+        return when (val s = link.state.value) {
+            is LinkState.Up -> null
+            is LinkState.Down -> s.reason
+            is LinkState.Failed -> s.message
+            LinkState.Idle -> REASON_CREATING
+        }
+    }
+
     /** Only switches Running <-> Degraded; a no-op in every other phase (including the replayed
-     *  value a freshly-collected [StateFlow] always delivers immediately on subscribe). CAS rather
-     *  than a plain write (R2): guards against a concurrent [stop] having already moved the phase
-     *  on (e.g. to STOPPING) between the `when`'s `current` read and the write below - a plain
-     *  write would otherwise clobber that transition and lose the stop. */
-    private fun applyAvailability(available: Boolean) {
+     *  value a freshly-collected [StateFlow] always delivers immediately on subscribe). While
+     *  DEGRADED, [degradedReason] follows [healthReason] even if the phase stays put (e.g. "Wi-Fi
+     *  is off" -> "recreating"). CAS rather than a plain write (R2): guards against a concurrent
+     *  [stop] having already moved the phase on (e.g. to STOPPING) between the `current` read and
+     *  the write below - a plain write would otherwise clobber that transition and lose the stop. */
+    private fun refreshHealth() {
         val current = _state.value
+        if (current != SessionPhase.RUNNING && current != SessionPhase.DEGRADED) return
+        val reason = healthReason()
         when {
-            current == SessionPhase.RUNNING && !available -> {
-                if (_state.compareAndSet(SessionPhase.RUNNING, SessionPhase.DEGRADED)) {
-                    _degradedReason.value = "No mobile data"
-                    appendLog("Degraded: no mobile data")
+            reason == null && current == SessionPhase.DEGRADED -> {
+                if (_state.compareAndSet(SessionPhase.DEGRADED, SessionPhase.RUNNING)) {
+                    _degradedReason.value = null
+                    appendLog("Recovered: session running")
                 }
             }
 
-            current == SessionPhase.DEGRADED && available -> {
-                if (_state.compareAndSet(SessionPhase.DEGRADED, SessionPhase.RUNNING)) {
-                    _degradedReason.value = null
-                    appendLog("Recovered: USB session running")
+            reason != null && current == SessionPhase.RUNNING -> {
+                if (_state.compareAndSet(SessionPhase.RUNNING, SessionPhase.DEGRADED)) {
+                    _degradedReason.value = reason
+                    appendLog("Degraded: $reason")
                 }
             }
+
+            reason != null && current == SessionPhase.DEGRADED -> _degradedReason.value = reason
         }
+    }
+
+    /** Runs on [scope], from the link-state collector (and the watchdog's rebuild). */
+    private fun onLinkState(state: LinkState) {
+        if (state is LinkState.Up) {
+            if (wifiServerFor != state) startWifiServer(state, clearBindings = true)
+        } else {
+            stopWifiServer()
+        }
+    }
+
+    /** Replaces any Wi-Fi listener with one serving [up]. [clearBindings] is false only for a
+     *  watchdog rebuild of a dead listener for the very group it served: the group and its DHCP
+     *  leases are unchanged, so dropping every device's binding would only lock them out until
+     *  they re-fetch their PAC. If the start fails, [wifiServerFor] stays null so the watchdog
+     *  retries. */
+    private fun startWifiServer(up: LinkState.Up, clearBindings: Boolean) {
+        val phase = _state.value
+        if (phase != SessionPhase.RUNNING && phase != SessionPhase.DEGRADED) return
+        val registry = activeRegistry ?: return
+        val cfg = sessionConfig ?: return
+        stopWifiServer(clearBindings = false)
+        if (clearBindings) registry.clearBindings()
+        val owner = up.ownerAddress
+        val proxyConfig = ProxyConfig(bindAddress = owner, port = cfg.wifiPort, peerSubnet = subnetOf(owner), wifi = up.credentials)
+        var server: SessionServer? = null
+        try {
+            val newServer = serverFactory.create(proxyConfig, registry, egress, buildFilter(), ::onServerError)
+            server = newServer
+            newServer.start()
+            wifiServer = newServer
+            wifiServerFor = up
+            appendLog("Wi-Fi listener running")
+        } catch (e: Exception) {
+            appendLog("Wi-Fi listener failed: ${e::class.simpleName}")
+            runCatching { server?.stop() }
+        }
+    }
+
+    /** Stops the Wi-Fi listener, if one is running, and clears the Wi-Fi bindings (the group it
+     *  served is gone or being replaced). Keeps it in [lastWifiServer] for [revoke]. */
+    private fun stopWifiServer(clearBindings: Boolean = true) {
+        val server = wifiServer ?: return
+        wifiServer = null
+        wifiServerFor = null
+        lastWifiServer = server
+        runCatching { server.stop() }
+        if (clearBindings) activeRegistry?.clearBindings()
+        appendLog("Wi-Fi listener stopped")
     }
 
     /** (M10) Hops onto [scope] - never runs on the connectivity callback thread that invokes it -
@@ -299,11 +490,20 @@ class SessionController(
      *  `NetworkInterface` enumeration. Also keeps it serialized against start/stop/watchdog (C2). */
     private fun onLinkChange() {
         scope.launch {
-            activeServer?.updateFilter(buildFilter())
+            val servers = listOfNotNull(usbServer, wifiServer)
+            if (servers.isEmpty()) return@launch
+            val filter = buildFilter()
+            servers.forEach { it.updateFilter(filter) }
         }
     }
 
-    private fun buildFilter(): DestinationFilter = DestinationFilter.default(wifiDirectSubnet, egress.hostAddresses())
+    private fun buildFilter(): DestinationFilter {
+        val subnet = (link.state.value as? LinkState.Up)?.let { subnetOf(it.ownerAddress) } ?: DEFAULT_WIFI_DIRECT_SUBNET
+        return DestinationFilter.default(subnet, egress.hostAddresses())
+    }
+
+    private fun subnetOf(owner: Inet4Address): Cidr =
+        Cidr(InetAddress.getByAddress(owner.address.copyOf().also { it[3] = 0 }), 24)
 
     /** Atomically moves any phase except IDLE/STOPPING to STOPPING, so two concurrent callers
      *  never both schedule a [doStop]. */
@@ -318,24 +518,27 @@ class SessionController(
             }
         }
         if (!shouldStop) return
-        appendLog("Stopping USB session")
+        appendLog("Stopping session")
         scope.launch { doStop() }
     }
 
     private suspend fun doStop() {
-        // Anything but STOPPING means this stop() has already been honoured: a concurrent doStart()
-        // noticed it and rolled itself back to IDLE (see checkNotInterruptedByStop/rollbackStart).
-        // The phase may even have moved on to STARTING again by now, for a *new* session whose
-        // doStart is queued behind this doStop - tearing down here would kill that session. Since
-        // every serial-side transition is a CAS (R2), nothing but teardown() can move the phase
-        // off STOPPING, so this check can no longer lose a stop the way it did before R2.
-        if (_state.value != SessionPhase.STOPPING) return
-        try {
-            runCatching { activeServer?.stop() }
-            runCatching { egress.stop() }
-        } finally {
-            teardown()
-            appendLog("USB session stopped")
+        lifecycle.withLock {
+            // Anything but STOPPING means this stop() has already been honoured: a concurrent
+            // doStart() noticed it and rolled itself back to IDLE (see
+            // checkNotInterruptedByStop/rollbackStart). The phase may even have moved on to
+            // STARTING again by now, for a *new* session whose doStart is queued behind this
+            // doStop - tearing down here would kill that session. Since every serial-side
+            // transition is a CAS (R2), nothing but teardown() can move the phase off STOPPING,
+            // so this check can no longer lose a stop the way it did before R2.
+            if (_state.value != SessionPhase.STOPPING) return
+            try {
+                stopAll(usbServer)
+                runCatching { egress.stop() }
+            } finally {
+                teardown()
+                appendLog("Session stopped")
+            }
         }
     }
 
@@ -346,27 +549,91 @@ class SessionController(
         availabilityJob = null
         networkGenerationJob?.cancel()
         networkGenerationJob = null
-        activeServer = null
+        linkJob?.cancel()
+        linkJob = null
+        wifiServerFor = null
+        wifiServer = null
+        lastWifiServer = null
+        usbServer = null
         activeRegistry = null
+        sessionConfig = null
+        platforms.clear()
         _degradedReason.value = null
         _state.value = SessionPhase.IDLE
         onIdle?.invoke()
     }
 
-    /** Synchronous, best-effort shutdown for [ProxySessionService.onDestroy] when the controller
-     *  never reached IDLE through the normal [stop] path (I1) - e.g. the process is being torn
-     *  down mid-session. Bypasses [scope] entirely (which may already be cancelled/cancelling) and
-     *  blocks for as long as the server's NIO loop join takes (~1s) plus the egress unregister, so
-     *  it must only ever be called from a background thread, never main. */
-    fun shutdownBlocking() {
-        runCatching { activeServer?.stop() }
-        runCatching { egress.stop() }
-        teardown()
+    /** Best-effort shutdown for [ProxySessionService.onDestroy] when the controller never reached
+     *  IDLE through the normal [stop] path (I1) - e.g. the process is being torn down mid-session.
+     *  Stops both servers, the link and the egress. Waits for any start/stop already in progress
+     *  (see [lifecycle]) and does nothing if that left the controller IDLE. Blocks for as long as
+     *  the servers' NIO loop joins take (~1s each), so it must only ever run on a background
+     *  dispatcher, never main. */
+    suspend fun shutdown() {
+        lifecycle.withLock {
+            if (_state.value == SessionPhase.IDLE) return
+            try {
+                stopAll(usbServer)
+                runCatching { egress.stop() }
+            } finally {
+                teardown()
+            }
+        }
+    }
+
+    /**
+     * Adds a Wi-Fi device slot and persists it. Null when the session isn't RUNNING/DEGRADED, the
+     * link isn't Up (an invite needs the group-owner address) or there's no room.
+     */
+    fun addDevice(name: String, platform: ClientPlatform): Slot? {
+        val phase = _state.value
+        if (phase != SessionPhase.RUNNING && phase != SessionPhase.DEGRADED) return null
+        val registry = activeRegistry ?: return null
+        if (link.state.value !is LinkState.Up) return null
+        val slot = registry.addSlot(name) ?: return null
+        platforms[slot.id] = platform
+        persist(registry)
+        appendLog("Device added")
+        return slot
+    }
+
+    /** [ClientPlatform.LAPTOP] for the pinned USB slot, the stored platform otherwise. */
+    fun platformOf(slotId: String): ClientPlatform {
+        if (activeRegistry?.slots()?.any { it.id == slotId && it.pinned } == true) return ClientPlatform.LAPTOP
+        return platforms[slotId] ?: ClientPlatform.ANDROID
     }
 
     /** Goes through [SessionServer.revoke] (in production, `ProxyServer.revoke`), never the
-     *  registry directly, so the slot's live tunnels are cancelled too. */
-    fun revoke(slotId: String): Boolean = activeServer?.revoke(slotId) ?: false
+     *  registry directly, so the slot's live tunnels are cancelled too. A Wi-Fi slot goes through
+     *  the Wi-Fi server - the running one, else the last stopped one, else the USB one; with none
+     *  at all, through a never-started server, which has no tunnels and just removes the slot. */
+    fun revoke(slotId: String): Boolean {
+        val registry = activeRegistry ?: return false
+        if (registry.slots().any { it.id == slotId && it.pinned }) return usbServer?.revoke(slotId) ?: false
+        // The never-started server's filter is never consulted, so it gets the static default
+        // rather than buildFilter(), which does IPC on this (caller's) thread.
+        val server = wifiServer ?: lastWifiServer ?: usbServer
+            ?: serverFactory.create(
+                ProxyConfig(usbBindAddress, 0, USB_PEER_SUBNET),
+                registry,
+                egress,
+                DestinationFilter.default(DEFAULT_WIFI_DIRECT_SUBNET),
+            ) {}
+        val revoked = server.revoke(slotId)
+        if (revoked) {
+            platforms.remove(slotId)
+            persist(registry)
+        }
+        return revoked
+    }
+
+    private fun persist(registry: ClientRegistry) {
+        try {
+            slots.save(registry.snapshot().map { PersistedSlot(it, platforms[it.id] ?: ClientPlatform.ANDROID) })
+        } catch (e: Exception) {
+            appendLog("Couldn't save devices: ${e::class.simpleName}")
+        }
+    }
 
     private fun ensureWatchdog() {
         if (watchdogStarted) return
@@ -391,12 +658,27 @@ class SessionController(
     private fun watchdogTick() {
         val phase = _state.value
         if (phase != SessionPhase.RUNNING && phase != SessionPhase.DEGRADED) return
-        val server = activeServer ?: return
-        server.updateFilter(buildFilter()) // M3: refresh on every tick, not just on a link change.
-        if (!server.isAccepting) {
-            appendLog("Watchdog: rebuilding the proxy server")
-            server.stop()
-            server.start()
+        if (sessionConfig?.wifi != null) link.checkHealth()
+
+        // M3: refresh the filter on every tick, not just on a link change.
+        val usb = usbServer
+        val wifi = wifiServer
+        if (usb != null || wifi != null) {
+            val filter = buildFilter()
+            usb?.updateFilter(filter)
+            wifi?.updateFilter(filter)
+        }
+
+        val up = link.state.value as? LinkState.Up
+        if (up != null && (wifi == null || !wifi.isAccepting)) {
+            appendLog("Watchdog: rebuilding the Wi-Fi listener")
+            startWifiServer(up, clearBindings = wifiServerFor != up)
+        }
+
+        if (usb != null && !usb.isAccepting) {
+            appendLog("Watchdog: rebuilding the USB listener")
+            usb.stop()
+            usb.start()
         }
     }
 

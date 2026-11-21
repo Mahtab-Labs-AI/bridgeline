@@ -1,7 +1,17 @@
 package com.wifiproxy.app.service
 
 import com.wifiproxy.app.egress.SessionEgress
+import com.wifiproxy.app.session.ClientPlatform
 import com.wifiproxy.app.session.SessionPhase
+import com.wifiproxy.app.wifi.LinkConfig
+import com.wifiproxy.app.wifi.LinkManager
+import com.wifiproxy.app.wifi.LinkState
+import com.wifiproxy.app.wifi.PersistedSlot
+import com.wifiproxy.app.wifi.REASON_CREATING
+import com.wifiproxy.app.wifi.REASON_LOST
+import com.wifiproxy.app.wifi.SlotPersistence
+import com.wifiproxy.core.ProxyConfig
+import com.wifiproxy.core.WifiCredentials
 import com.wifiproxy.core.net.Cidr
 import com.wifiproxy.core.net.DestinationFilter
 import kotlinx.coroutines.CoroutineScope
@@ -17,12 +27,14 @@ import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.currentTime
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
+import java.net.Inet4Address
 import java.net.InetAddress
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -126,6 +138,46 @@ private class FakeSessionServer(
     }
 }
 
+/** A controllable [LinkManager]: [start] moves to "creating" like the real link does, and tests
+ *  drive [state] directly (or through [up]) to exercise every link transition. */
+private class FakeLink : LinkManager {
+    override val state = MutableStateFlow<LinkState>(LinkState.Idle)
+    val starts = mutableListOf<LinkConfig>()
+    var stops = 0
+    var healthChecks = 0
+    override fun start(config: LinkConfig) {
+        starts += config
+        state.value = LinkState.Down(REASON_CREATING)
+    }
+
+    override suspend fun stop() {
+        stops++
+        state.value = LinkState.Idle
+    }
+
+    override fun checkHealth() {
+        healthChecks++
+    }
+
+    fun up(owner: String = "192.168.49.1") {
+        state.value = LinkState.Up(InetAddress.getByName(owner) as Inet4Address, WIFI.credentials)
+    }
+}
+
+private class MemorySlots(var saved: List<PersistedSlot> = emptyList()) : SlotPersistence {
+    var saves = 0
+    override fun load() = saved
+    override fun save(slots: List<PersistedSlot>) {
+        saved = slots
+        saves++
+    }
+}
+
+private val WIFI = LinkConfig(WifiCredentials("DIRECT-k3-HostPhone", "correct horse battery"), prefer5Ghz = false)
+private val USB_ONLY = SessionConfig(usbEnabled = true, wifi = null, wifiPort = 8080, maxClients = 3)
+private val WIFI_ONLY = SessionConfig(usbEnabled = false, wifi = WIFI, wifiPort = 8080, maxClients = 3)
+private val BOTH = SessionConfig(usbEnabled = true, wifi = WIFI, wifiPort = 8080, maxClients = 3)
+
 @OptIn(ExperimentalCoroutinesApi::class)
 class SessionControllerTest {
 
@@ -135,9 +187,18 @@ class SessionControllerTest {
         scope: CoroutineScope,
         watchdogIntervalMs: Long = 30_000L,
         now: () -> Long = { 0L },
+        link: FakeLink = FakeLink(),
+        slots: MemorySlots = MemorySlots(),
+        config: SessionConfig = USB_ONLY,
+        servers: MutableList<Pair<ProxyConfig, FakeSessionServer>>? = null,
     ) = SessionController(
         egress = egress,
-        serverFactory = SessionServerFactory { _, _, _, _, _ -> server },
+        link = link,
+        slots = slots,
+        config = { config },
+        serverFactory = SessionServerFactory { cfg, _, _, _, _ ->
+            if (servers == null) server else FakeSessionServer().also { servers += cfg to it }
+        },
         scope = scope,
         watchdogIntervalMs = watchdogIntervalMs,
         now = now,
@@ -443,6 +504,9 @@ class SessionControllerTest {
         }
         val c = SessionController(
             egress = egress,
+            link = FakeLink(),
+            slots = MemorySlots(),
+            config = { USB_ONLY },
             serverFactory = SessionServerFactory { _, _, _, _, _ -> FakeSessionServer() },
             scope = backgroundScope,
         )
@@ -517,6 +581,9 @@ class SessionControllerTest {
         }
         c = SessionController(
             egress = egress,
+            link = FakeLink(),
+            slots = MemorySlots(),
+            config = { USB_ONLY },
             serverFactory = SessionServerFactory { _, _, _, _, _ -> server },
             scope = backgroundScope,
         )
@@ -577,6 +644,9 @@ class SessionControllerTest {
             val egress = FakeSessionEgress()
             val c = SessionController(
                 egress = egress,
+                link = FakeLink(),
+                slots = MemorySlots(),
+                config = { USB_ONLY },
                 serverFactory = SessionServerFactory { _, _, _, _, _ -> server },
                 scope = realScope,
             )
@@ -677,5 +747,169 @@ class SessionControllerTest {
         runCurrent()
 
         assertEquals(0, idleCalls)
+    }
+
+    // --- Wi-Fi Direct listener (Plan 2b Task 6) ---------------------------------------------------
+
+    @Test
+    fun `wifi session is degraded until the group is up, then serves on the owner address`() = runTest {
+        val link = FakeLink()
+        val servers = mutableListOf<Pair<ProxyConfig, FakeSessionServer>>()
+        val c = controller(scope = backgroundScope, link = link, config = WIFI_ONLY, servers = servers)
+        c.start(); runCurrent()
+        assertEquals(SessionPhase.DEGRADED, c.state.value)
+        assertEquals(REASON_CREATING, c.degradedReason.value)
+        assertEquals(listOf(WIFI), link.starts)
+        assertTrue(servers.isEmpty())
+
+        link.up(); runCurrent()
+        assertEquals(SessionPhase.RUNNING, c.state.value)
+        val (cfg, server) = servers.single()
+        assertEquals(InetAddress.getByName("192.168.49.1"), cfg.bindAddress)
+        assertEquals(8080, cfg.port)
+        assertEquals(WIFI.credentials, cfg.wifi)
+        assertTrue(cfg.peerSubnet.contains(InetAddress.getByName("192.168.49.77")))
+        assertEquals(1, server.startCalls)
+    }
+
+    @Test
+    fun `group loss stops the wifi listener, clears bindings and degrades with the link reason`() = runTest {
+        val link = FakeLink()
+        val servers = mutableListOf<Pair<ProxyConfig, FakeSessionServer>>()
+        val c = controller(scope = backgroundScope, link = link, config = WIFI_ONLY, servers = servers)
+        c.start(); runCurrent(); link.up(); runCurrent()
+        val slot = c.addDevice("Pixel 7", ClientPlatform.ANDROID)!!
+        c.registry!!.onPacFetch(slot.token, InetAddress.getByName("192.168.49.5"))
+
+        link.state.value = LinkState.Down(REASON_LOST); runCurrent()
+        assertEquals(SessionPhase.DEGRADED, c.state.value)
+        assertEquals(REASON_LOST, c.degradedReason.value)
+        assertEquals(1, servers.single().second.stopCalls)
+        assertNull(c.registry!!.slots().single { it.id == slot.id }.boundIp)
+
+        link.up(); runCurrent()
+        assertEquals(SessionPhase.RUNNING, c.state.value)
+        assertEquals(2, servers.size)   // a fresh server for the recreated group
+    }
+
+    @Test
+    fun `a new owner address rebuilds the listener`() = runTest {
+        val link = FakeLink()
+        val servers = mutableListOf<Pair<ProxyConfig, FakeSessionServer>>()
+        val c = controller(scope = backgroundScope, link = link, config = WIFI_ONLY, servers = servers)
+        c.start(); runCurrent(); link.up("192.168.49.1"); runCurrent()
+        link.up("192.168.50.1"); runCurrent()
+        assertEquals(2, servers.size)
+        assertEquals(1, servers[0].second.stopCalls)
+        assertEquals(InetAddress.getByName("192.168.50.1"), servers[1].first.bindAddress)
+    }
+
+    @Test
+    fun `link failure degrades with its message and keeps usb serving`() = runTest {
+        val link = FakeLink()
+        val servers = mutableListOf<Pair<ProxyConfig, FakeSessionServer>>()
+        val c = controller(scope = backgroundScope, link = link, config = BOTH, servers = servers)
+        c.start(); runCurrent()
+        link.state.value = LinkState.Failed("This phone doesn't support Wi-Fi Direct."); runCurrent()
+        assertEquals(SessionPhase.DEGRADED, c.state.value)
+        assertEquals("This phone doesn't support Wi-Fi Direct.", c.degradedReason.value)
+        val usb = servers.single { it.first.bindAddress.isLoopbackAddress }.second
+        assertEquals(0, usb.stopCalls)
+    }
+
+    @Test
+    fun `no mobile data outranks the link reason`() = runTest {
+        val egress = FakeSessionEgress(available = false)
+        val c = controller(egress = egress, scope = backgroundScope, config = WIFI_ONLY)
+        c.start(); runCurrent()
+        assertEquals("No mobile data", c.degradedReason.value)
+    }
+
+    @Test
+    fun `neither usb nor wifi refuses to start`() = runTest {
+        val c = controller(scope = backgroundScope, config = SessionConfig(false, null, 8080, 3))
+        c.start(); runCurrent()
+        assertEquals(SessionPhase.IDLE, c.state.value)
+        assertEquals("Set a Wi-Fi password in Settings or turn on USB sharing", c.lastError.value)
+    }
+
+    @Test
+    fun `usb disabled means no pinned slot and no loopback listener`() = runTest {
+        val servers = mutableListOf<Pair<ProxyConfig, FakeSessionServer>>()
+        val c = controller(scope = backgroundScope, config = WIFI_ONLY, servers = servers)
+        c.start(); runCurrent()
+        assertTrue(c.registry!!.slots().none { it.pinned })
+        assertTrue(servers.none { it.first.bindAddress.isLoopbackAddress })
+    }
+
+    @Test
+    fun `devices persist with their platform and are restored on the next start`() = runTest {
+        val link = FakeLink()
+        val slots = MemorySlots()
+        val c = controller(scope = backgroundScope, link = link, slots = slots, config = WIFI_ONLY)
+        c.start(); runCurrent(); link.up(); runCurrent()
+        val added = c.addDevice("Ben's iPhone", ClientPlatform.IPHONE)!!
+        assertEquals(listOf(PersistedSlot(c.registry!!.snapshot().single(), ClientPlatform.IPHONE)), slots.saved)
+
+        c.stop(); runCurrent(); c.start(); runCurrent()
+        val restored = c.registry!!.slots().single()
+        assertEquals(added.id, restored.id)
+        assertEquals(added.token, restored.token)
+        assertEquals(ClientPlatform.IPHONE, c.platformOf(added.id))
+    }
+
+    @Test
+    fun `addDevice needs the group up and room`() = runTest {
+        val link = FakeLink()
+        val c = controller(scope = backgroundScope, link = link, config = BOTH.copy(maxClients = 2))
+        c.start(); runCurrent()
+        assertNull(c.addDevice("Too early", ClientPlatform.ANDROID))
+        link.up(); runCurrent()
+        assertNotNull(c.addDevice("Pixel", ClientPlatform.ANDROID))      // USB pin + 1 = 2
+        assertNull(c.addDevice("No room", ClientPlatform.ANDROID))
+    }
+
+    @Test
+    fun `revoke goes through a server and is persisted, even while the group is down`() = runTest {
+        val link = FakeLink()
+        val slots = MemorySlots()
+        val servers = mutableListOf<Pair<ProxyConfig, FakeSessionServer>>()
+        val c = controller(scope = backgroundScope, link = link, slots = slots, config = WIFI_ONLY, servers = servers)
+        c.start(); runCurrent(); link.up(); runCurrent()
+        val slot = c.addDevice("Pixel", ClientPlatform.ANDROID)!!
+        link.state.value = LinkState.Down(REASON_LOST); runCurrent()
+        val savesBefore = slots.saves
+
+        assertTrue(c.revoke(slot.id))
+        // The stopped Wi-Fi server is reused for the revoke. The fake can't remove the slot from the
+        // registry (ClientRegistry.revoke is internal to :proxy-core), so assert the routing and that
+        // persistence ran; the real ProxyServer.revoke removes it, and Task 9 checks that on a device.
+        assertEquals(listOf(slot.id), servers.single().second.revokedIds)
+        assertEquals(savesBefore + 1, slots.saves)
+    }
+
+    @Test
+    fun `stop stops the link and every server`() = runTest {
+        val link = FakeLink()
+        val servers = mutableListOf<Pair<ProxyConfig, FakeSessionServer>>()
+        val c = controller(scope = backgroundScope, link = link, config = BOTH, servers = servers)
+        c.start(); runCurrent(); link.up(); runCurrent()
+        c.stop(); runCurrent()
+        assertEquals(SessionPhase.IDLE, c.state.value)
+        assertEquals(1, link.stops)
+        assertTrue(servers.all { it.second.stopCalls == 1 })
+    }
+
+    @Test
+    fun `watchdog checks the link and rebuilds a dead wifi listener`() = runTest {
+        val link = FakeLink()
+        val servers = mutableListOf<Pair<ProxyConfig, FakeSessionServer>>()
+        val c = controller(scope = backgroundScope, link = link, config = WIFI_ONLY, servers = servers)
+        c.start(); runCurrent(); link.up(); runCurrent()
+        servers.single().second.killAcceptLoop()
+        advanceTimeBy(30_000); runCurrent()
+        assertEquals(1, link.healthChecks)
+        assertEquals(2, servers.size)
+        assertEquals(SessionPhase.RUNNING, c.state.value)
     }
 }
