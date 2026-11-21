@@ -10,6 +10,7 @@ private const val KEY_MAX_CLIENTS = "max_clients"
 private const val KEY_WIFI_PORT = "wifi_port"
 private const val KEY_PREFER_5GHZ = "prefer_5ghz"
 private const val KEY_SESSION_DESIRED = "session_desired"
+private const val KEY_REQUIRE_DEVICE_CODES = "require_device_codes"
 
 /**
  * The app-level settings that live outside [com.wifiproxy.app.session.SessionRepository]:
@@ -40,6 +41,12 @@ class AppPreferences(context: Context) : HostPrefs {
     override var prefer5Ghz: Boolean
         get() = prefs.getBoolean(KEY_PREFER_5GHZ, true)
         set(value) = prefs.edit { putBoolean(KEY_PREFER_5GHZ, value) }
+
+    /** User decision D8: off by default - any device that joined the group (so knows the Wi-Fi
+     *  password) may use the proxy, up to the device limit. On restores per-device invites. */
+    override var requireDeviceCodes: Boolean
+        get() = prefs.getBoolean(KEY_REQUIRE_DEVICE_CODES, false)
+        set(value) = prefs.edit { putBoolean(KEY_REQUIRE_DEVICE_CODES, value) }
 
     /** True while the user wants sharing on (spec §3): set by a Start, cleared by a Stop or any
      *  other path to IDLE while the service is alive. A sticky restart after process death only

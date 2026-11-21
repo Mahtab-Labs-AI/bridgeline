@@ -29,6 +29,7 @@ interface HostPrefs {
     var maxClients: Int
     var wifiPort: Int
     var prefer5Ghz: Boolean
+    var requireDeviceCodes: Boolean
 }
 
 /**
@@ -62,6 +63,14 @@ class HostConfigSource(
     private val credentials: CredentialStore,
 ) {
     fun hostSettings(): HostSettings = snapshot().settings
+
+    /** "Require a code for each device" (D8), off by default; read by [sessionConfig], so a change
+     *  applies the next time sharing starts. */
+    var requireDeviceCodes: Boolean
+        get() = prefs.requireDeviceCodes
+        set(value) {
+            prefs.requireDeviceCodes = value
+        }
 
     /** One decrypt for both the settings and the SSID. */
     fun snapshot(): HostSnapshot = when (val r = credentials.read()) {
@@ -98,6 +107,7 @@ class HostConfigSource(
             wifi = c?.let { LinkConfig(WifiCredentials(it.ssid, it.password), prefs.prefer5Ghz) },
             wifiPort = prefs.wifiPort,
             maxClients = prefs.maxClients,
+            requireDeviceCodes = prefs.requireDeviceCodes,
         )
     }
 

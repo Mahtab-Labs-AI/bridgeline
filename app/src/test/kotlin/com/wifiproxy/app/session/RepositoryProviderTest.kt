@@ -39,6 +39,8 @@ private class TrackingRepository(val label: String) : SessionRepository {
     override fun inviteFor(slotId: String): DeviceInvite? = null
     override fun revoke(slotId: String) {}
     override fun updateSettings(settings: HostSettings): SettingsUpdate = SettingsUpdate.SAVED
+    override val requireDeviceCodes: StateFlow<Boolean> = MutableStateFlow(false)
+    override fun setRequireDeviceCodes(value: Boolean) {}
     override fun close() {
         closed = true
     }

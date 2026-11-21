@@ -20,6 +20,9 @@ interface SlotPersistence {
  *  base64url-encoded. A line that doesn't parse is dropped rather than failing the whole load -
  *  that slot's device just needs a new invite. */
 object PersistedSlotsCodec {
+    /** Only invited (coded) devices are ever saved: never the USB laptop, never an auto slot. */
+    private val INVITED_PLATFORMS = setOf(ClientPlatform.ANDROID, ClientPlatform.IPHONE)
+
     fun encode(slots: List<PersistedSlot>): String = slots.joinToString("\n") { s ->
         val name = Base64.getUrlEncoder().withoutPadding().encodeToString(s.record.name.toByteArray(Charsets.UTF_8))
         listOf("v1", s.record.id, name, s.record.token, s.record.createdAtMs.toString(), s.platform.name).joinToString("|")
@@ -34,7 +37,7 @@ object PersistedSlotsCodec {
         if (!ClientRegistry.TOKEN_PATTERN.matches(f[3])) return null
         val name = runCatching { String(Base64.getUrlDecoder().decode(f[2]), Charsets.UTF_8) }.getOrNull() ?: return null
         val createdAt = f[4].toLongOrNull() ?: return null
-        val platform = ClientPlatform.entries.firstOrNull { it.name == f[5] && it != ClientPlatform.LAPTOP } ?: return null
+        val platform = ClientPlatform.entries.firstOrNull { it.name == f[5] && it in INVITED_PLATFORMS } ?: return null
         return PersistedSlot(SlotRecord(f[1], name, f[3], createdAt), platform)
     }
 }

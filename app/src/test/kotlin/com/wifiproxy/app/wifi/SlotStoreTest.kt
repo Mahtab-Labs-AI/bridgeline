@@ -36,6 +36,12 @@ class SlotStoreTest {
     }
 
     @Test
+    fun `laptop and unknown (auto) platforms are never loaded`() {
+        val text = listOf("LAPTOP", "UNKNOWN").joinToString("\n") { "v1|id-$it|bmFtZQ|${"A".repeat(22)}|5|$it" }
+        assertTrue(PersistedSlotsCodec.decode(text).isEmpty())
+    }
+
+    @Test
     fun `store saves, loads and clears`() {
         val kv = object : KeyValueStore {
             var value: String? = null

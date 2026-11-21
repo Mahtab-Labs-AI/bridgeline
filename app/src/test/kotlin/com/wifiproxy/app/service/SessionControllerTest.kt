@@ -1137,6 +1137,69 @@ class SessionControllerTest {
         assertTrue(slots.saved.isEmpty())
     }
 
+    // --- D8: open admission --------------------------------------------------------------------------
+
+    @Test
+    fun `the wifi listener admits openly by default and the usb listener never does`() = runTest {
+        val link = FakeLink()
+        val servers = mutableListOf<Pair<ProxyConfig, FakeSessionServer>>()
+        val c = controller(scope = backgroundScope, link = link, config = BOTH, servers = servers)
+        c.start(); runCurrent(); link.up(); runCurrent()
+        val (wifi, _) = servers.single { !it.first.bindAddress.isLoopbackAddress }
+        val (usb, _) = servers.single { it.first.bindAddress.isLoopbackAddress }
+        assertTrue(wifi.openAdmission)
+        assertFalse(usb.openAdmission)
+        assertEquals(true, c.openAdmission)
+    }
+
+    @Test
+    fun `requiring device codes closes admission on the wifi listener`() = runTest {
+        val link = FakeLink()
+        val servers = mutableListOf<Pair<ProxyConfig, FakeSessionServer>>()
+        val config = BOTH.copy(requireDeviceCodes = true)
+        val c = controller(scope = backgroundScope, link = link, config = config, servers = servers)
+        c.start(); runCurrent(); link.up(); runCurrent()
+        assertTrue(servers.none { it.first.openAdmission })
+        assertEquals(false, c.openAdmission)
+        c.stop(); runCurrent()
+        assertNull(c.openAdmission)
+    }
+
+    @Test
+    fun `D7 - auto slots never take the pinned USB laptop's seat`() = runTest {
+        val link = FakeLink()
+        val c = controller(scope = backgroundScope, link = link, config = BOTH.copy(maxClients = 2), servers = mutableListOf())
+        c.start(); runCurrent(); link.up(); runCurrent()
+        val registry = c.registry!!
+        val pinned = registry.slots().single { it.pinned }
+
+        assertNotNull(registry.admitOrCreate(InetAddress.getByName("192.168.49.20")))
+        assertNull(registry.admitOrCreate(InetAddress.getByName("192.168.49.21")))
+        assertEquals(listOf(pinned.id), registry.slots().filter { it.pinned }.map { it.id })
+        assertTrue(registry.snapshot().isEmpty())
+
+        // A group teardown removes the auto slot; the laptop keeps its seat throughout.
+        link.state.value = LinkState.Down(REASON_LOST); runCurrent()
+        assertEquals(listOf(pinned.id), registry.slots().map { it.id })
+        link.up(); runCurrent()
+        assertNotNull(registry.admitOrCreate(InetAddress.getByName("192.168.49.21")))
+        assertEquals(pinned.id, registry.admittedSlot(InetAddress.getByName("127.0.0.1"))?.id)
+    }
+
+    @Test
+    fun `auto slots are never persisted, and revoking one saves only the coded devices`() = runTest {
+        val link = FakeLink()
+        val slots = MemorySlots(storedSlots(1))
+        val c = revokingController(link, slots, WIFI_ONLY, mutableListOf())
+        c.start(); runCurrent(); link.up(); runCurrent()
+        val auto = c.registry!!.admitOrCreate(InetAddress.getByName("192.168.49.30"))!!
+        assertEquals(ClientPlatform.UNKNOWN, c.platformOf(auto.id))
+
+        assertTrue(c.revoke(auto.id))
+        assertEquals(listOf("id-1"), slots.saved.map { it.record.id })
+        assertEquals(listOf("id-1"), c.registry!!.slots().map { it.id })
+    }
+
     @Test
     fun `a Wi-Fi listener that can't start degrades the session and blocks invites until it recovers`() = runTest {
         val link = FakeLink()

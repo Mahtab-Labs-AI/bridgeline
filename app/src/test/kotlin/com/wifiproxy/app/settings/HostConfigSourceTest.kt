@@ -21,6 +21,7 @@ private class MemoryPrefs : HostPrefs {
     override var maxClients = 1
     override var wifiPort = 8080
     override var prefer5Ghz = true
+    override var requireDeviceCodes = false
 }
 
 private class MapKv : KeyValueStore {
@@ -50,6 +51,20 @@ class HostConfigSourceTest {
         assertNull(cfg.wifi)
         assertEquals(1, cfg.maxClients)
         assertEquals("", source.hostSettings().password)
+    }
+
+    @Test
+    fun `device codes are off by default and the flag is persisted into the session config`() {
+        assertFalse(source.requireDeviceCodes)
+        assertFalse(source.sessionConfig().requireDeviceCodes)
+        source.requireDeviceCodes = true
+        assertTrue(prefs.requireDeviceCodes)
+        assertTrue(source.sessionConfig().requireDeviceCodes)
+        // A settings save never touches it.
+        source.save(valid)
+        assertTrue(source.sessionConfig().requireDeviceCodes)
+        source.requireDeviceCodes = false
+        assertFalse(source.sessionConfig().requireDeviceCodes)
     }
 
     @Test

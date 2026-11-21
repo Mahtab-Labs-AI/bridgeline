@@ -56,6 +56,10 @@ data class SessionConfig(
     val wifi: LinkConfig?,
     val wifiPort: Int,
     val maxClients: Int,
+    /** D8: false (the default) means open admission on the Wi-Fi listener - any device in the
+     *  group may use the proxy, up to [maxClients]; true keeps per-device invites. Never affects
+     *  the USB listener, which only ever admits its pinned laptop. */
+    val requireDeviceCodes: Boolean = false,
 )
 
 /** See [SessionController.wifiEndpoint]. */
@@ -231,6 +235,10 @@ class SessionController(
 
     /** Whether the current session has Wi-Fi Direct configured; false while idle. */
     val wifiConfigured: Boolean get() = sessionConfig?.wifi != null
+
+    /** Whether this session's Wi-Fi listener admits any device in the group (D8); null while
+     *  idle, when the next start's setting is what counts. */
+    val openAdmission: Boolean? get() = sessionConfig?.let { !it.requireDeviceCodes }
 
     private var availabilityJob: Job? = null
     private var networkGenerationJob: Job? = null
@@ -500,7 +508,16 @@ class SessionController(
         stopWifiServer(clearBindings = false)
         if (clearBindings) registry.clearBindings()
         val owner = up.ownerAddress
-        val proxyConfig = ProxyConfig(bindAddress = owner, port = cfg.wifiPort, peerSubnet = subnetOf(owner), wifi = up.credentials)
+        // (D8) Open admission is a property of this listener only. (D7) The USB laptop's pinned
+        // slot was added to the registry in doStart, before any Wi-Fi listener existed, so it
+        // already holds its seat against every auto slot this listener creates.
+        val proxyConfig = ProxyConfig(
+            bindAddress = owner,
+            port = cfg.wifiPort,
+            peerSubnet = subnetOf(owner),
+            wifi = up.credentials,
+            openAdmission = !cfg.requireDeviceCodes,
+        )
         var server: SessionServer? = null
         try {
             val newServer = serverFactory.create(proxyConfig, registry, egress, buildFilter(), ::onServerError)
@@ -653,9 +670,12 @@ class SessionController(
         return slot
     }
 
-    /** [ClientPlatform.LAPTOP] for the pinned USB slot, the stored platform otherwise. */
+    /** [ClientPlatform.LAPTOP] for the pinned USB slot, [ClientPlatform.UNKNOWN] for an auto slot
+     *  (D8: nothing says what joined), the stored platform otherwise. */
     fun platformOf(slotId: String): ClientPlatform {
-        if (activeRegistry?.slots()?.any { it.id == slotId && it.pinned } == true) return ClientPlatform.LAPTOP
+        val slot = activeRegistry?.slots()?.firstOrNull { it.id == slotId }
+        if (slot?.pinned == true) return ClientPlatform.LAPTOP
+        if (slot?.auto == true) return ClientPlatform.UNKNOWN
         return platforms[slotId] ?: ClientPlatform.ANDROID
     }
 

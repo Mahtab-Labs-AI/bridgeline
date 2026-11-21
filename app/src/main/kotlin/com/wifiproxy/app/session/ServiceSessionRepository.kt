@@ -111,6 +111,17 @@ class ServiceSessionRepository(
     private val _checks = MutableStateFlow<List<SetupCheck>>(emptyList())
     override val checks: StateFlow<List<SetupCheck>> = _checks.asStateFlow()
 
+    // A plain SharedPreferences read (in memory once loaded), like the other prefs above.
+    private val _requireDeviceCodes = MutableStateFlow(hostConfig.requireDeviceCodes)
+    override val requireDeviceCodes: StateFlow<Boolean> = _requireDeviceCodes.asStateFlow()
+
+    /** Read by the next session's start ([HostConfigSource.sessionConfig]); a running one keeps
+     *  the mode it started with. */
+    override fun setRequireDeviceCodes(value: Boolean) {
+        hostConfig.requireDeviceCodes = value
+        _requireDeviceCodes.value = value
+    }
+
     // Unknown (null) until first computed: the USB switch stays disabled until then.
     private val _usbSwitchAllowed = MutableStateFlow<Boolean?>(null)
     override val usbSwitchAllowed: StateFlow<Boolean?> = _usbSwitchAllowed.asStateFlow()

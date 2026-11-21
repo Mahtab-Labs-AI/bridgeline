@@ -198,6 +198,41 @@ fun SettingsScreen(
         }
 
         Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            // (D8) Read once per start, like the USB switch: locked while a real session runs.
+            val requireCodes by repository.requireDeviceCodes.collectAsStateWithLifecycle()
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = "Require a code for each device",
+                    style = MaterialTheme.typography.titleMedium,
+                    modifier = Modifier.weight(1f),
+                )
+                Switch(
+                    checked = requireCodes,
+                    enabled = !demoSwitchLocked,
+                    onCheckedChange = { repository.setRequireDeviceCodes(it) },
+                )
+            }
+            Text(
+                text = buildString {
+                    append(
+                        if (requireCodes) {
+                            "Each device needs its own invite."
+                        } else {
+                            "Anyone who knows the Wi-Fi password can use it, up to the device limit."
+                        },
+                    )
+                    if (demoSwitchLocked) append(" Applies the next time sharing starts. Stop sharing to change it.")
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+
+        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,

@@ -23,6 +23,7 @@ private class SaverPrefs : HostPrefs {
     override var maxClients = 3
     override var wifiPort = 8080
     override var prefer5Ghz = false
+    override var requireDeviceCodes = false
 }
 
 private class SaverKv : KeyValueStore {

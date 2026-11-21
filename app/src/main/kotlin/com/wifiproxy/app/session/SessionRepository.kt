@@ -17,8 +17,10 @@ enum class SettingsUpdate { SAVED, REJECTED, CREDENTIALS_UNREADABLE }
 /** Lifecycle of the shared-proxy session. Mirrors the real session state machine (design spec §3). */
 enum class SessionPhase { IDLE, STARTING, RUNNING, DEGRADED, STOPPING }
 
-/** LAPTOP is the pinned USB slot (design spec §8a); it has no QR/invite flow of its own. */
-enum class ClientPlatform { ANDROID, IPHONE, LAPTOP }
+/** LAPTOP is the pinned USB slot (design spec §8a); it has no QR/invite flow of its own.
+ *  UNKNOWN is an auto slot (open admission, D8): a device that just joined, with no invite. Neither
+ *  is ever persisted (the slot codec drops both). */
+enum class ClientPlatform { ANDROID, IPHONE, LAPTOP, UNKNOWN }
 
 data class SlotUi(
     val id: String,
@@ -130,6 +132,12 @@ interface SessionRepository {
      *  needs a free seat next to every saved Wi-Fi device); null until it has been computed. A
      *  cached value, cheap to read from composition; always true for the fake. */
     val usbSwitchAllowed: StateFlow<Boolean?> get() = ALWAYS_ALLOWED
+
+    /** "Require a code for each device" (D8): false (the default) lets any device that joined the
+     *  group use the proxy, up to the device limit. Applies the next time sharing starts. */
+    val requireDeviceCodes: StateFlow<Boolean>
+
+    fun setRequireDeviceCodes(value: Boolean)
 
     /** [usbSwitchAllowed]'s current value; false while it is still unknown. */
     fun canEnableUsb(): Boolean = usbSwitchAllowed.value == true
