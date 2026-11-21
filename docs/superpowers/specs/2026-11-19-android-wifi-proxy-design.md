@@ -268,6 +268,7 @@ Plan 2a (USB) and Plan 2b (Wi-Fi Direct) are both implemented; `:proxy-core` has
    - The host's own owner address is never seated, on either the fixed or the token paths.
    - The optional setting "Require a code for each device" restores the per-device token flow from §4 Layer 2. Saved coded devices hold no seats while open admission is active.
    - The trust boundary is the Wi-Fi password, as §11 risk 4 anticipated: disconnecting frees a seat, but the device can simply rejoin; changing the password is what keeps it out.
+   - **Idle seats free themselves on demand.** When open admission would otherwise refuse a new peer because every seat is taken, `ProxyServer` evicts (through `ProxyServer.revoke`) the least-recently-active auto slot idle for at least `idleSeatMs` (default 3 minutes) and retries admission once; a full registry with no idle auto slot still gets `403`. Nothing is evicted while there's room, and there's no background sweeper. Pinned and coded slots are never candidates.
 9. **VPN limitation.** A VPN on the host that covers this app routes the proxy's replies to Wi-Fi Direct clients into the tunnel, so clients time out. The app warns (a Setup check plus a Home banner) but cannot fix this in-app without root. Users must use split tunnelling (exclude Wi-Fi Proxy) or turn the VPN off.
 10. **Other changes:**
     - The group-info wait (§6, read-back verification) is about 30 s, not the original few seconds; a matching existing group is adopted, and 5 GHz falls back to `AUTO` on a timeout.

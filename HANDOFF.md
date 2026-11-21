@@ -22,12 +22,14 @@ An Android app that shares a phone's **cellular data** with other devices **with
 `main` (309ef95: the spec, plan and Plan 2a USB sharing) → **`feature/wifi-direct`** (head `051b9e6`; latest; work here), which adds Plan 2b on top. **Not yet merged into `main`.** The backup is the git bundle in the handoff folder.
 
 ## State
-- **`:proxy-core`** (pure Kotlin/JVM, **171 tests**): the slot registry with pinned slots and unpersisted per-IP auto slots for open admission, a strict parser, PAC/mobileconfig/probes (including the fixed `/proxy.pac` and `/proxy.mobileconfig` paths), a post-DNS destination filter, a happy-eyeballs dialer, the NIO selector loop, a per-direction tunnel failure policy, and a ProxyServer with pre-admission caps and per-run state.
-- **`:app`** (Compose, minSdk 29, targetSdk/compileSdk **36**, **197 tests**):
+- **`:proxy-core`** (pure Kotlin/JVM, **181 tests**): the slot registry with pinned slots and unpersisted per-IP auto slots for open admission, a strict parser, PAC/mobileconfig/probes (including the fixed `/proxy.pac` and `/proxy.mobileconfig` paths), a post-DNS destination filter, a happy-eyeballs dialer, the NIO selector loop, a per-direction tunnel failure policy, and a ProxyServer with pre-admission caps and per-run state.
+  - **Idle seat eviction (on demand):** under open admission, a full registry evicts (through `ProxyServer.revoke`) the least-recently-active auto slot idle for at least `idleSeatMs` (`ProxyConfig`, default 3 minutes) before retrying admission once, on the manual-proxy path and through `LocalContent`'s injected `admit` function (fixed paths and the token-path fallback alike). Pinned and coded slots are never candidates; nothing is evicted while there's room, and there's no background sweeper.
+- **`:app`** (Compose, minSdk 29, targetSdk/compileSdk **36**, **200 tests**):
   - Demo mode (fake data) versus real mode;
   - `CellularEgress` (DnsResolver, bindSocket);
   - `SessionController` (renamed from `UsbSessionController`), running USB and Wi-Fi Direct listeners side by side, plus a foreground service with a serialized lifecycle and `START_STICKY` restart;
   - `P2pGroupLink`, `CredentialStore` (Keystore-encrypted), `SlotStore`, open admission by default with the "Require a code for each device" setting, and the laptop kit.
+  - The Devices screen shows "Active now"/"Idle N min" under each auto device in open mode, from `Slot.lastActivityMs` via the 1 Hz session poll.
 - Zero Kotlin warnings across both modules.
 
 ### Verification done
@@ -50,7 +52,6 @@ An Android app that shares a phone's **cellular data** with other devices **with
    - browser preconnect bursts against the per-peer cap of 16;
    - Wi-Fi lock effectiveness.
 2. **Deferred findings** (the main ones; full ledger in `.superpowers/sdd/progress.md`):
-   - auto slots don't expire while the group is up (planned: evict idle LRU auto slots through `ProxyServer.revoke`);
    - the password-change window can re-persist inactive slots;
    - teardown race / generation counter;
    - `updateSettings` still does one decrypt plus one encrypt on Main;
