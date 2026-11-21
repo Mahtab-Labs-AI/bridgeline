@@ -120,6 +120,12 @@ class ProxySessionService : Service() {
      *  reaches IDLE and, if set, starts a fresh session instead of letting the service stop. */
     private var pendingStart: Boolean = false
 
+    /** Main-only, like [pendingStart]. True while the current session is a START_STICKY resume
+     *  after process death rather than a user's Start: if that start then fails (e.g. the
+     *  credentials can't be read), nobody is looking at the app, so the onIdle hand-off posts the
+     *  "Tap to resume" notice instead of stopping silently (B4a). */
+    private var resumedBySticky: Boolean = false
+
     /** Set the instant [onDestroy] begins, so [updateNotification] can refuse to resurrect the
      *  notification for a tick that was already in flight when teardown started. */
     @Volatile private var serviceStopping = false
@@ -192,6 +198,7 @@ class ProxySessionService : Service() {
                 // own fresh notificationJob too, or its notification never updates again. After
                 // c.start(), not before, so the updater's first value is STARTING rather than the
                 // IDLE it would otherwise treat as "remove the notification" (stopForeground).
+                resumedBySticky = intent == null
                 c.start()
                 startNotificationUpdates(c)
             }
@@ -284,6 +291,7 @@ class ProxySessionService : Service() {
                         // that the session has actually reached IDLE, honour it as a fresh start
                         // rather than letting the service stop.
                         pendingStart = false
+                        resumedBySticky = false
                         if (enterForeground(buildNotification(SessionPhase.STARTING, null, 0, 0))) {
                             newController.start()
                             startNotificationUpdates(newController)
@@ -294,8 +302,15 @@ class ProxySessionService : Service() {
                         // (Spec §3) Any path to IDLE while the service is alive - a Stop, a failed
                         // start - means sharing is no longer wanted: don't resume it after a
                         // process death.
+                        //
+                        // (B4a) Except that a sticky resume whose start failed (lastError is set
+                        // only by a failed start, and cleared by a successful one) was never the
+                        // user's doing: tell them it stopped, rather than stopping silently.
+                        val failedResume = resumedBySticky && newController.lastError.value != null
+                        resumedBySticky = false
                         prefs.sessionDesired = false
                         removeNotification()
+                        if (failedResume) postStoppedNotification()
                         stopSelf(currentStartId)
                     }
                 }
