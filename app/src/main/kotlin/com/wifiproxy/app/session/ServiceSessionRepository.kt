@@ -6,7 +6,9 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.location.LocationManager
 import android.net.ConnectivityManager
+import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Build
@@ -46,6 +48,7 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 
 private const val POLL_INTERVAL_MS = 1_000L
@@ -118,8 +121,14 @@ class ServiceSessionRepository(
         _requireDeviceCodes.value = value
     }
 
-    private val host = combine(_settings, configuredSsid, _requireDeviceCodes) { settings, ssid, requireCodes ->
-        HostView(settings, ssid, requireCodes)
+    /** (B1) Whether a VPN network applies to this app right now. A VPN on the host routes the
+     *  app's own sockets - including replies to Wi-Fi Direct clients - into its tunnel, which
+     *  silently breaks sharing. Followed live by [vpnCallback]. Declared before [host]. */
+    private val _vpnActive = MutableStateFlow(false)
+    private val vpnNetworks: MutableSet<Network> = ConcurrentHashMap.newKeySet()
+
+    private val host = combine(_settings, configuredSsid, _requireDeviceCodes, _vpnActive) { settings, ssid, requireCodes, vpn ->
+        HostView(settings, ssid, requireCodes, vpn)
     }
 
     private val _checks = MutableStateFlow<List<SetupCheck>>(emptyList())
@@ -138,12 +147,60 @@ class ServiceSessionRepository(
         _usbSwitchAllowed.value = SeatRules.canEnableUsb(slotStore.load().size, prefs.maxClients)
     }
 
+    private val connectivityManager: ConnectivityManager? = context.getSystemService(ConnectivityManager::class.java)
+
+    /** Runs on ConnectivityManager's own thread; only touches thread-safe state. */
+    private val vpnCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            vpnNetworks.add(network)
+            publishVpn()
+        }
+
+        override fun onLost(network: Network) {
+            vpnNetworks.remove(network)
+            publishVpn()
+        }
+    }
+
     init {
         loadSettings()
         repositoryScope.launch {
             SessionHolder.controller
                 .flatMapLatest { it?.state ?: flowOf(SessionPhase.IDLE) }
                 .collect { requestUsbSwitchAllowed() }
+        }
+        watchVpn()
+    }
+
+    /** Only VPNs that apply to this app are reported to it, so one that excludes Wi-Fi Proxy
+     *  (split tunnelling) never warns. Unregistered when [repositoryJob] ends - by [close], or by
+     *  the activity scope it is a child of - so a recreated activity never leaks a callback. */
+    private fun watchVpn() {
+        val cm = connectivityManager ?: return
+        val request = NetworkRequest.Builder()
+            .addTransportType(NetworkCapabilities.TRANSPORT_VPN)
+            .removeCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+            .build()
+        try {
+            cm.registerNetworkCallback(request, vpnCallback)
+        } catch (e: RuntimeException) {
+            Log.w(TAG, "Couldn't watch for a VPN: ${e::class.simpleName}")
+            return
+        }
+        repositoryJob.invokeOnCompletion {
+            try {
+                cm.unregisterNetworkCallback(vpnCallback)
+            } catch (e: RuntimeException) {
+                Log.w(TAG, "Couldn't stop watching for a VPN: ${e::class.simpleName}")
+            }
+        }
+    }
+
+    private fun publishVpn() {
+        val active = vpnNetworks.isNotEmpty()
+        if (_vpnActive.value != active) {
+            _vpnActive.value = active
+            requestChecks()
         }
     }
 
@@ -222,7 +279,7 @@ class ServiceSessionRepository(
         .stateIn(
             repositoryScope,
             SharingStarted.WhileSubscribed(5_000),
-            idleUi(HostView(_settings.value, configuredSsid.value, _requireDeviceCodes.value)),
+            idleUi(HostView(_settings.value, configuredSsid.value, _requireDeviceCodes.value, _vpnActive.value)),
         )
 
     override val log: StateFlow<List<LogEntry>> = SessionHolder.controller
@@ -259,7 +316,12 @@ class ServiceSessionRepository(
         val link: LinkState,
     )
 
-    private data class HostView(val settings: HostSettings, val ssid: String?, val requireDeviceCodes: Boolean)
+    private data class HostView(
+        val settings: HostSettings,
+        val ssid: String?,
+        val requireDeviceCodes: Boolean,
+        val vpnActive: Boolean,
+    )
 
     private fun buildUi(live: Live, host: HostView, controller: SessionController?): SessionUi {
         val up = live.link as? LinkState.Up
@@ -286,6 +348,7 @@ class ServiceSessionRepository(
             proxyAddress = proxyAddress,
             // A running session keeps the mode it started with; idle shows the next start's.
             openAdmission = (if (sharing) controller?.openAdmission else null) ?: !host.requireDeviceCodes,
+            vpnActive = host.vpnActive,
         )
     }
 
@@ -420,6 +483,7 @@ class ServiceSessionRepository(
         locationOnCheck(),
         wifiOnCheck(),
         cellularCheck(),
+        vpnCheck(),
         usbDebuggingCheck(),
         batteryOptimisationCheck(),
     )
@@ -505,6 +569,18 @@ class ServiceSessionRepository(
             detail = "The host needs an active cellular connection to share.",
             status = if (hasCellular) CheckStatus.OK else CheckStatus.ACTION_NEEDED,
             fixIntent = if (hasCellular) null else Intent(Settings.ACTION_WIRELESS_SETTINGS),
+        )
+    }
+
+    /** (B1) From the live [vpnCallback] state; rebuilt whenever it changes. */
+    private fun vpnCheck(): SetupCheck {
+        val vpn = _vpnActive.value
+        return SetupCheck(
+            title = "No VPN active",
+            detail = "A VPN on this phone stops Wi-Fi Direct devices getting replies. Exclude Wi-Fi Proxy " +
+                "in your VPN app (split tunnelling) or turn the VPN off.",
+            status = if (vpn) CheckStatus.ACTION_NEEDED else CheckStatus.OK,
+            fixIntent = if (vpn) Intent(Settings.ACTION_VPN_SETTINGS) else null,
         )
     }
 

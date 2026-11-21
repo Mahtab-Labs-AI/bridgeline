@@ -55,6 +55,9 @@ data class SessionUi(
     /** (D8) The running session's Wi-Fi admission while sharing, else what the next start will
      *  use: true means no per-device code is needed. False for the demo, which shows invites. */
     val openAdmission: Boolean = false,
+    /** (B1) A VPN applies to this app: its sockets, replies to Wi-Fi Direct devices included, go
+     *  into the tunnel. */
+    val vpnActive: Boolean = false,
 )
 
 data class HostSettings(

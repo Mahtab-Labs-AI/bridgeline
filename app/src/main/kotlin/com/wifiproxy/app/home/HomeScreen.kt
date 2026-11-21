@@ -19,6 +19,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.SignalCellularAlt
 import androidx.compose.material.icons.filled.SignalCellularOff
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
@@ -76,6 +77,12 @@ fun HomeScreen(repository: SessionRepository, modifier: Modifier = Modifier, onS
             proxyAddress = if (session.phase == SessionPhase.IDLE) null else session.proxyAddress ?: "—",
             lastError = session.lastError,
         )
+
+        // (B1) A VPN on this phone routes the proxy's replies into its tunnel: Wi-Fi Direct
+        // devices just see nothing come back, so say why while sharing.
+        if (session.vpnActive && session.phase != SessionPhase.IDLE) {
+            VpnWarning()
+        }
 
         // The activity decides when Start really happens (after any permission dialog).
         StartStopButton(
@@ -190,6 +197,27 @@ private fun StatusCard(
                     color = MaterialTheme.colorScheme.error,
                 )
             }
+        }
+    }
+}
+
+@Composable
+private fun VpnWarning() {
+    Card(
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.errorContainer,
+            contentColor = MaterialTheme.colorScheme.onErrorContainer,
+        ),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Row(modifier = Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Filled.Warning, contentDescription = null)
+            Spacer(modifier = Modifier.width(12.dp))
+            Text(
+                text = "A VPN is on. Wi-Fi Direct devices won't get replies through it. Exclude Wi-Fi Proxy " +
+                    "in your VPN app (split tunnelling) or turn the VPN off.",
+                style = MaterialTheme.typography.bodyMedium,
+            )
         }
     }
 }
