@@ -321,7 +321,9 @@ class SessionController(
                         appendLog("Could not pin the USB slot (no room)")
                     }
                     val usbConfig = ProxyConfig(bindAddress = usbBindAddress, port = usbPort, peerSubnet = USB_PEER_SUBNET)
-                    val newServer = serverFactory.create(usbConfig, registry, egress, buildFilter(), ::onServerError, ::logEviction)
+                    // usbConfig never sets openAdmission, so this listener can never evict: a
+                    // no-op, not ::logEviction, keeps that true in the code, not just in practice.
+                    val newServer = serverFactory.create(usbConfig, registry, egress, buildFilter(), ::onServerError) {}
                     usb = newServer
                     newServer.start()
                     checkNotInterruptedByStop()

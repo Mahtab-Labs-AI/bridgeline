@@ -242,8 +242,8 @@ private fun OpenDevicesContent(repository: SessionRepository, modifier: Modifier
         }
         if (full) {
             Text(
-                text = "Idle devices give up their seat to a new one automatically. To make room now, " +
-                    "disconnect a device or raise the limit in Settings.",
+                text = "All ${session.maxClients} slots are in use. Idle devices give up their seat to a new " +
+                    "one automatically. To make room now, disconnect a device or raise the limit in Settings.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.error,
             )
@@ -337,8 +337,9 @@ private fun OpenSetupCard(invite: OpenInvite, ssid: String) {
             // Built from the core's own default, not a hard-coded "3": ProxyConfig.idleSeatMs is
             // the one place that number is defined.
             val idleMinutes = ProxyConfig.DEFAULT_IDLE_SEAT_MS / 60_000L
+            val idleMinutesText = if (idleMinutes == 1L) "1 minute" else "$idleMinutes minutes"
             Text(
-                text = "Devices idle for $idleMinutes minutes give up their seat when a new device needs it.",
+                text = "Devices idle for $idleMinutesText give up their seat when a new device needs it.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )

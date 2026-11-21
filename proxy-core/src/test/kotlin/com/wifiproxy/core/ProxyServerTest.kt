@@ -52,6 +52,7 @@ class ProxyServerTest {
         openAdmission: Boolean = false,
         idleSeatMs: Long = 3 * 60_000L,
         onError: (Throwable) -> Unit = {},
+        onEvicted: () -> Unit = {},
     ) {
         val config = ProxyConfig(
             bindAddress = loopback, port = 0, peerSubnet = peerSubnet, wifi = wifi, idleTimeoutMs = idleMs,
@@ -59,7 +60,7 @@ class ProxyServerTest {
             maxPendingHeads = maxPendingHeads, connectTimeoutMs = connectTimeoutMs, openAdmission = openAdmission,
             idleSeatMs = idleSeatMs,
         )
-        server = ProxyServer(config, registry, egress, filter, onError).also { it.start() }
+        server = ProxyServer(config, registry, egress, filter, onError, onEvicted).also { it.start() }
     }
 
     @AfterTest
@@ -294,7 +295,8 @@ class ProxyServerTest {
     fun `a full registry with no idle auto slot still gives 403`() {
         var now = 0L
         registry = ClientRegistry(maxClients = 2, clock = { now })
-        start(openAdmission = true, idleSeatMs = 1_000)
+        val evictions = java.util.concurrent.atomic.AtomicInteger()
+        start(openAdmission = true, idleSeatMs = 1_000, onEvicted = { evictions.incrementAndGet() })
         registry.admitOrCreate(guest)
         now = 10L
         registry.admitOrCreate(guest2)
@@ -303,6 +305,7 @@ class ProxyServerTest {
             rawRequest("CONNECT 127.0.0.1:1 HTTP/1.1\r\n\r\n", from = guest3).startsWith("HTTP/1.1 403"),
         )
         assertEquals(2, registry.slots().size)
+        assertEquals(0, evictions.get())
     }
 
     @Test
@@ -374,7 +377,8 @@ class ProxyServerTest {
         var now = 0L
         registry = ClientRegistry(maxClients = 1, clock = { now })
         val idleAuto = registry.admitOrCreate(guest)!!
-        start(openAdmission = true, idleSeatMs = 1_000)
+        val evictions = java.util.concurrent.atomic.AtomicInteger()
+        start(openAdmission = true, idleSeatMs = 1_000, onEvicted = { evictions.incrementAndGet() })
         now = 1_000_000L
         val echo = startEcho()
         // No `from`: connects from `loopback`, the listener's own bind (owner) address.
@@ -383,6 +387,7 @@ class ProxyServerTest {
         )
         assertTrue(rawRequest("GET /proxy.pac HTTP/1.1\r\nHost: x\r\n\r\n").startsWith("HTTP/1.1 403"))
         assertEquals(listOf(idleAuto.id), registry.slots().map { it.id })
+        assertEquals(0, evictions.get())
     }
 
     @Test
@@ -414,9 +419,13 @@ class ProxyServerTest {
         registry.admitOrCreate(guest)
         registry.admitOrCreate(guest2)
         now = 10_000L // both idle well past idleSeatMs
-        start(openAdmission = true, idleSeatMs = 1_000)
+        val evictions = java.util.concurrent.atomic.AtomicInteger()
+        start(openAdmission = true, idleSeatMs = 1_000, onEvicted = { evictions.incrementAndGet() })
         val before = registry.slots().map { it.id }.toSet()
-        val burst = 16
+        // 8, not maxPendingHeadsPerPeer (16): a burst at the cap could collide with the
+        // per-peer pending-head limit and get pre-admission-rejected instead of exercising
+        // the eviction race this test is actually about.
+        val burst = 8
         val latch = java.util.concurrent.CountDownLatch(burst)
         val errors = CopyOnWriteArrayList<Throwable>()
         repeat(burst) {
@@ -439,6 +448,7 @@ class ProxyServerTest {
         assertEquals(2, after.size)
         assertEquals(1, before.intersect(after.map { it.id }.toSet()).size)
         assertTrue(after.any { it.boundIp == guest3 })
+        assertEquals(1, evictions.get())
     }
 
     @Test
@@ -446,12 +456,14 @@ class ProxyServerTest {
         var now = 0L
         registry = ClientRegistry(maxClients = 1, clock = { now })
         val idleAuto = registry.admitOrCreate(guest)!!
-        start(openAdmission = false, idleSeatMs = 1_000)
+        val evictions = java.util.concurrent.atomic.AtomicInteger()
+        start(openAdmission = false, idleSeatMs = 1_000, onEvicted = { evictions.incrementAndGet() })
         now = 1_000_000L
         assertTrue(
             rawRequest("CONNECT 127.0.0.1:1 HTTP/1.1\r\n\r\n", from = guest2).startsWith("HTTP/1.1 403"),
         )
         assertEquals(listOf(idleAuto.id), registry.slots().map { it.id })
+        assertEquals(0, evictions.get())
     }
 
     @Test

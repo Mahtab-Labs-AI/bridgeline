@@ -60,8 +60,11 @@ class ProxyServer(
     private val egress: Egress,
     initialFilter: DestinationFilter,
     private val onError: (Throwable) -> Unit = {},
-    /** Called (on whichever thread triggered it) every time [admitOpen] evicts an idle auto slot.
-     *  Diagnostics only - carries no slot id, name or address. */
+    /** Called (on whichever thread triggered it, after [admitOpen] has released its internal
+     *  eviction lock - never while holding it) every time an idle auto slot is actually evicted.
+     *  Diagnostics only - carries no slot id, name or address. Must not block: nothing here waits
+     *  on it, but a slow callback still delays the thread that just admitted a peer. Exceptions
+     *  are caught, same as [onError]. */
     private val onEvicted: () -> Unit = {},
 ) {
     private class ProxyFailure(val response: HttpResponse) : Exception()
@@ -200,13 +203,26 @@ class ProxyServer(
     private fun admitOpen(peer: InetAddress): Slot? {
         if (!config.openAdmission || peer == config.bindAddress) return registry.admittedSlot(peer)
         registry.admitOrCreate(peer)?.let { return it }
-        return synchronized(evictLock) {
-            registry.admitOrCreate(peer) ?: registry.idleAutoSlotToEvict(config.idleSeatMs)?.let {
-                revoke(it)
-                onEvicted()
+        var evicted = false
+        val admitted = synchronized(evictLock) {
+            registry.admitOrCreate(peer) ?: registry.idleAutoSlotToEvict(config.idleSeatMs)?.let { victim ->
+                // Only count it as an eviction if this call actually removed the slot: a concurrent
+                // revoke() of the very same victim (e.g. the user tapping Disconnect) could have
+                // already done so, outside evictLock entirely.
+                evicted = revoke(victim)
                 registry.admitOrCreate(peer)
             }
         }
+        // Outside evictLock, not before: onEvicted is diagnostics-only and must never run while
+        // this holds the lock (see its KDoc).
+        if (evicted) safeOnEvicted()
+        return admitted
+    }
+
+    private fun safeOnEvicted() {
+        // Same guard as safeOnError: a throwing callback must not affect admission or crash the
+        // caller's thread.
+        runCatching { onEvicted() }
     }
 
     private fun safeOnError(e: Throwable) {
