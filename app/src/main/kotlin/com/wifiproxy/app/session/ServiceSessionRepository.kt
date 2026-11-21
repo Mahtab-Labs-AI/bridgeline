@@ -71,11 +71,14 @@ class ServiceSessionRepository(
     private val hostConfig = HostConfigSource.forContext(context)
     private val slotStore = SlotStore(HostConfigSource.secureStore(context))
 
-    private val _settings = MutableStateFlow(hostConfig.hostSettings())
+    // One decrypt (a Keystore round trip, on Main) for both the settings and the SSID.
+    private val initial = hostConfig.snapshot()
+
+    private val _settings = MutableStateFlow(initial.settings)
     override val settings: StateFlow<HostSettings> = _settings.asStateFlow()
 
     /** The stored credentials' full SSID (`DIRECT-xy-<suffix>`), or null when none are set. */
-    private val configuredSsid = MutableStateFlow(storedSsid())
+    private val configuredSsid = MutableStateFlow(initial.ssid)
 
     private val host = combine(_settings, configuredSsid) { settings, ssid -> HostView(settings, ssid) }
 
@@ -205,25 +208,28 @@ class ServiceSessionRepository(
     /**
      * (D7) Refused when the saved Wi-Fi devices (active and inactive alike) plus the USB laptop's
      * seat wouldn't fit the new `maxClients`, counted from storage whether or not a session is
-     * running. A changed Wi-Fi name or password deletes every saved device (plan decision 5) and,
-     * if a session is running, restarts it with the new credentials: the Stop then Start become a
-     * restart through the service's pending-start path (M-b).
+     * running - except that a save which changes the Wi-Fi name or password counts none, since it
+     * deletes every saved device (plan decision 5). That save also restarts a running session
+     * with the new credentials: the Stop then Start become a restart through the service's
+     * pending-start path (M-b).
+     *
+     * At most one decrypt and one encrypt (Keystore round trips on Main): [HostConfigSource.update]
+     * returns the new state instead of it being read back.
      */
     override fun updateSettings(settings: HostSettings): Boolean {
-        if (!SeatRules.fits(slotStore.load().size, prefs.usbSharingEnabled, settings.maxClients)) return false
-        when (hostConfig.save(settings)) {
-            SaveResult.INVALID -> return false
-            SaveResult.SAVED -> Unit
-            SaveResult.SAVED_CREDENTIALS_CHANGED -> {
-                slotStore.clear()
-                if (sessionActive()) {
-                    stop()
-                    start()
-                }
+        val outcome = hostConfig.update(settings) { credentialsChanged ->
+            SeatRules.fitsAfterSave(slotStore.load().size, credentialsChanged, prefs.usbSharingEnabled, settings.maxClients)
+        }
+        val snapshot = outcome.snapshot ?: return false
+        if (outcome.result == SaveResult.SAVED_CREDENTIALS_CHANGED) {
+            slotStore.clear()
+            if (sessionActive()) {
+                stop()
+                start()
             }
         }
-        _settings.value = hostConfig.hostSettings()
-        configuredSsid.value = storedSsid()
+        _settings.value = snapshot.settings
+        configuredSsid.value = snapshot.ssid
         refreshChecks()
         return true
     }
@@ -236,8 +242,6 @@ class ServiceSessionRepository(
         SessionPhase.STARTING, SessionPhase.RUNNING, SessionPhase.DEGRADED -> true
         else -> false
     }
-
-    private fun storedSsid(): String? = hostConfig.sessionConfig().wifi?.credentials?.ssid
 
     override fun refreshChecks() {
         _checks.value = buildChecks()

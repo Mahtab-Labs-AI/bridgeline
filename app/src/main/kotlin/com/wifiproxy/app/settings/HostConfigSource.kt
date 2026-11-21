@@ -7,6 +7,7 @@ import com.wifiproxy.app.wifi.AesGcmSecretBox
 import com.wifiproxy.app.wifi.CredentialStore
 import com.wifiproxy.app.wifi.KeystoreKeys
 import com.wifiproxy.app.wifi.LinkConfig
+import com.wifiproxy.app.wifi.StoredCredentials
 import com.wifiproxy.app.wifi.WifiCredentialRules
 import com.wifiproxy.core.WifiCredentials
 
@@ -28,6 +29,13 @@ interface HostPrefs {
 
 enum class SaveResult { SAVED, SAVED_CREDENTIALS_CHANGED, INVALID }
 
+/** [HostSettings] plus the stored credentials' full SSID (`DIRECT-xy-<suffix>`, null when none
+ *  are set), read with a single decrypt. */
+data class HostSnapshot(val settings: HostSettings, val ssid: String?)
+
+/** What [HostConfigSource.update] did; [snapshot] is the new state, null on [SaveResult.INVALID]. */
+data class SaveOutcome(val result: SaveResult, val snapshot: HostSnapshot?)
+
 /**
  * The persisted host settings: [prefs] for the plain ones, [credentials] (encrypted) for the
  * Wi-Fi name and password. [sessionConfig] is what [com.wifiproxy.app.service.SessionController]
@@ -37,16 +45,21 @@ class HostConfigSource(
     private val prefs: HostPrefs,
     private val credentials: CredentialStore,
 ) {
-    fun hostSettings(): HostSettings {
-        val c = credentials.get()
-        return HostSettings(
+    fun hostSettings(): HostSettings = snapshot().settings
+
+    /** One decrypt for both the settings and the SSID. */
+    fun snapshot(): HostSnapshot = snapshotOf(credentials.get())
+
+    private fun snapshotOf(c: StoredCredentials?) = HostSnapshot(
+        settings = HostSettings(
             ssidSuffix = c?.suffix.orEmpty(),
             password = c?.password.orEmpty(),
             maxClients = prefs.maxClients,
             port = prefs.wifiPort,
             prefer5Ghz = prefs.prefer5Ghz,
-        )
-    }
+        ),
+        ssid = c?.ssid,
+    )
 
     /** No credentials set means a USB-only session (plan decision 2). */
     fun sessionConfig(): SessionConfig {
@@ -61,14 +74,24 @@ class HostConfigSource(
 
     /** Validates everything first and changes nothing on [SaveResult.INVALID]. A blank name and
      *  password together clear the credentials (Wi-Fi Direct off). */
-    fun save(settings: HostSettings): SaveResult {
-        if (settings.port !in WIFI_PORT_RANGE || settings.port == USB_PORT) return SaveResult.INVALID
-        if (settings.maxClients !in MAX_CLIENTS_RANGE) return SaveResult.INVALID
+    fun save(settings: HostSettings): SaveResult = update(settings).result
+
+    /**
+     * [save], also returning the new [HostSnapshot] so a caller needn't decrypt again. At most one
+     * decrypt (the previous credentials) and one encrypt (only when they change).
+     *
+     * [allow] is asked once the settings are valid, with whether this save changes the
+     * credentials; returning false refuses the save as [SaveResult.INVALID], changing nothing.
+     */
+    fun update(settings: HostSettings, allow: (credentialsChanged: Boolean) -> Boolean = { true }): SaveOutcome {
+        val invalid = SaveOutcome(SaveResult.INVALID, null)
+        if (settings.port !in WIFI_PORT_RANGE || settings.port == USB_PORT) return invalid
+        if (settings.maxClients !in MAX_CLIENTS_RANGE) return invalid
         val clear = settings.ssidSuffix.isBlank() && settings.password.isBlank()
         if (!clear &&
             (WifiCredentialRules.suffixError(settings.ssidSuffix) != null || WifiCredentialRules.passwordError(settings.password) != null)
         ) {
-            return SaveResult.INVALID
+            return invalid
         }
 
         val before = credentials.get()
@@ -77,14 +100,21 @@ class HostConfigSource(
         } else {
             before?.suffix != settings.ssidSuffix || before.password != settings.password
         }
+        if (!allow(changed)) return invalid
 
         prefs.maxClients = settings.maxClients
         prefs.wifiPort = settings.port
         prefs.prefer5Ghz = settings.prefer5Ghz
-        if (changed) {
-            if (clear) credentials.clear() else credentials.set(settings.ssidSuffix, settings.password)
+        val after = when {
+            !changed -> before
+            clear -> {
+                credentials.clear()
+                null
+            }
+            else -> credentials.set(settings.ssidSuffix, settings.password, ssidCode = before?.ssidCode)
         }
-        return if (changed) SaveResult.SAVED_CREDENTIALS_CHANGED else SaveResult.SAVED
+        val result = if (changed) SaveResult.SAVED_CREDENTIALS_CHANGED else SaveResult.SAVED
+        return SaveOutcome(result, snapshotOf(after))
     }
 
     companion object {

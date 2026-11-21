@@ -3,10 +3,12 @@ package com.wifiproxy.app.settings
 import com.wifiproxy.app.session.HostSettings
 import com.wifiproxy.app.wifi.AesGcmSecretBox
 import com.wifiproxy.app.wifi.CredentialStore
+import com.wifiproxy.app.wifi.SecretBox
 import java.util.Random
 import javax.crypto.KeyGenerator
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -21,6 +23,14 @@ private class MapKv : KeyValueStore {
     val map = mutableMapOf<String, String>()
     override fun getString(key: String) = map[key]
     override fun putString(key: String, value: String?) { if (value == null) map.remove(key) else map[key] = value }
+}
+
+/** Counts Keystore-backed operations: each one is a Keystore round trip on a device. */
+private class CountingBox(private val inner: SecretBox) : SecretBox {
+    var opens = 0
+    var seals = 0
+    override fun seal(plain: ByteArray): ByteArray = inner.seal(plain).also { seals++ }
+    override fun open(sealed: ByteArray): ByteArray = inner.open(sealed).also { opens++ }
 }
 
 class HostConfigSourceTest {
@@ -64,5 +74,54 @@ class HostConfigSourceTest {
         source.save(valid)
         assertEquals(SaveResult.SAVED_CREDENTIALS_CHANGED, source.save(valid.copy(ssidSuffix = "", password = "")))
         assertNull(source.sessionConfig().wifi)
+    }
+
+    // --- Fix round 1 ------------------------------------------------------------------------------
+
+    private val countingBox = CountingBox(AesGcmSecretBox { key })
+    private val counted = HostConfigSource(MemoryPrefs(), CredentialStore(MapKv(), countingBox, Random(7)))
+
+    @Test
+    fun `snapshot reads settings and ssid with one decrypt`() {
+        counted.save(valid)
+        countingBox.opens = 0
+        val snapshot = counted.snapshot()
+        assertEquals(1, countingBox.opens)
+        assertEquals(valid, snapshot.settings)
+        assertTrue(Regex("DIRECT-[a-z0-9]{2}-HostPhone").matches(snapshot.ssid!!))
+    }
+
+    @Test
+    fun `a credentials change decrypts once and returns the new snapshot`() {
+        val first = counted.update(valid).snapshot!!
+        countingBox.opens = 0
+        countingBox.seals = 0
+        val outcome = counted.update(valid.copy(password = "another passphrase"))
+        assertEquals(SaveResult.SAVED_CREDENTIALS_CHANGED, outcome.result)
+        assertEquals(1, countingBox.opens)
+        assertEquals(1, countingBox.seals)
+        // Same SSID code is kept, so clients auto-rejoin under the same SSID.
+        assertEquals(first.ssid, outcome.snapshot!!.ssid)
+        assertEquals("another passphrase", outcome.snapshot.settings.password)
+    }
+
+    @Test
+    fun `allow sees whether the credentials change, and a refusal changes nothing`() {
+        source.save(valid)
+        val seen = mutableListOf<Boolean>()
+        assertEquals(SaveResult.INVALID, source.update(valid.copy(maxClients = 1)) { changed -> seen += changed; false }.result)
+        assertEquals(SaveResult.INVALID, source.update(valid.copy(password = "brand new secret")) { changed -> seen += changed; false }.result)
+        assertEquals(listOf(false, true), seen)
+        assertEquals(valid, source.hostSettings())
+    }
+
+    @Test
+    fun `clearing whitespace-only credentials reports blank fields and no ssid`() {
+        source.save(valid)
+        val outcome = source.update(valid.copy(ssidSuffix = " ", password = " "))
+        assertEquals(SaveResult.SAVED_CREDENTIALS_CHANGED, outcome.result)
+        assertEquals("", outcome.snapshot!!.settings.password)
+        assertNull(outcome.snapshot.ssid)
+        assertFalse(outcome.snapshot.settings.ssidSuffix.isNotEmpty())
     }
 }

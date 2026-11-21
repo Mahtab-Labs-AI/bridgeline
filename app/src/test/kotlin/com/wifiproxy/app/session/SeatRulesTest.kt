@@ -28,4 +28,12 @@ class SeatRulesTest {
         assertFalse(SeatRules.canEnableUsb(savedWifiSlots = 3, maxClients = 3))
         assertFalse(SeatRules.canEnableUsb(savedWifiSlots = 1, maxClients = 1))
     }
+
+    @Test
+    fun `a save that changes the credentials counts no saved devices`() {
+        // Changing the Wi-Fi name or password deletes every saved device (plan decision 5).
+        assertTrue(SeatRules.fitsAfterSave(savedWifiSlots = 2, credentialsChanged = true, usbEnabled = true, maxClients = 1))
+        assertFalse(SeatRules.fitsAfterSave(savedWifiSlots = 2, credentialsChanged = false, usbEnabled = true, maxClients = 2))
+        assertTrue(SeatRules.fitsAfterSave(savedWifiSlots = 2, credentialsChanged = false, usbEnabled = false, maxClients = 2))
+    }
 }

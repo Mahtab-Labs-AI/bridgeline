@@ -381,7 +381,7 @@ class ProxySessionService : Service() {
             return
         }
         val powerManager = getSystemService(PowerManager::class.java)
-        wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "$packageName:usb-sharing").apply {
+        wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "$packageName:sharing").apply {
             setReferenceCounted(false)
             acquire(WAKE_LOCK_TIMEOUT_MS)
         }
@@ -510,8 +510,10 @@ class ProxySessionService : Service() {
 
     private fun createNotificationChannel() {
         val manager = getSystemService(NotificationManager::class.java)
+        // The ID stays "usb_sharing" so existing installs keep one channel; re-creating it with a
+        // new name just renames it.
         manager.createNotificationChannel(
-            NotificationChannel(CHANNEL_ID, "USB sharing", NotificationManager.IMPORTANCE_LOW),
+            NotificationChannel(CHANNEL_ID, "Sharing", NotificationManager.IMPORTANCE_LOW),
         )
     }
 

@@ -41,14 +41,21 @@ data class HostSettings(
     val maxClients: Int,
     val port: Int,
     val prefer5Ghz: Boolean,
-)
+) {
+    /** Spec §6: never the password. */
+    override fun toString() =
+        "HostSettings(ssidSuffix=$ssidSuffix, password=****, maxClients=$maxClients, port=$port, prefer5Ghz=$prefer5Ghz)"
+}
 
 data class DeviceInvite(
     val slotId: String,
     val wifiQr: String,
     val pacUrl: String,
     val mobileConfigUrl: String,
-)
+) {
+    /** Spec §6: the QR carries the Wi-Fi password and both URLs the slot token. */
+    override fun toString() = "DeviceInvite(slotId=$slotId, wifiQr=****, pacUrl=****, mobileConfigUrl=****)"
+}
 
 enum class CheckStatus { OK, ACTION_NEEDED, NOT_APPLICABLE }
 

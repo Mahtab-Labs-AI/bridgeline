@@ -33,10 +33,13 @@ class CredentialStore(
         return StoredCredentials(ssidCode = fields[1], suffix = fields[2], password = fields[3])
     }
 
-    fun set(suffix: String, password: String): StoredCredentials {
+    /** Keeps the stored SSID code, or picks a new one when none is stored. A caller that has just
+     *  read [get] can pass its [StoredCredentials.ssidCode] as [ssidCode] to skip a second decrypt
+     *  (a Keystore round trip); null still means "pick a new code". */
+    fun set(suffix: String, password: String, ssidCode: String? = get()?.ssidCode): StoredCredentials {
         WifiCredentialRules.suffixError(suffix)?.let { throw IllegalArgumentException(it) }
         WifiCredentialRules.passwordError(password)?.let { throw IllegalArgumentException(it) }
-        val code = get()?.ssidCode ?: WifiCredentialRules.newSsidCode(random)
+        val code = ssidCode ?: WifiCredentialRules.newSsidCode(random)
         val credentials = StoredCredentials(code, suffix, password)
         val plain = listOf(VERSION, code, suffix, password).joinToString("\n").toByteArray(Charsets.UTF_8)
         store.putString(KEY, Base64.getEncoder().encodeToString(box.seal(plain)))
