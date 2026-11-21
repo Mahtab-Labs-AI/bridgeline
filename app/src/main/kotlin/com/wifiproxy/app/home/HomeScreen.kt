@@ -41,6 +41,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.wifiproxy.app.session.ClientPlatform
 import com.wifiproxy.app.session.SessionPhase
 import com.wifiproxy.app.session.SessionRepository
 import com.wifiproxy.app.session.SlotUi
@@ -51,7 +52,7 @@ import com.wifiproxy.app.ui.icon
 import com.wifiproxy.app.ui.label
 
 @Composable
-fun HomeScreen(repository: SessionRepository, modifier: Modifier = Modifier, onBeforeStart: () -> Unit = {}) {
+fun HomeScreen(repository: SessionRepository, modifier: Modifier = Modifier, onStart: () -> Unit = { repository.start() }) {
     val session by repository.session.collectAsStateWithLifecycle()
     var slotPendingRevoke by remember { mutableStateOf<SlotUi?>(null) }
 
@@ -68,20 +69,24 @@ fun HomeScreen(repository: SessionRepository, modifier: Modifier = Modifier, onB
             phase = session.phase,
             degradedReason = session.degradedReason,
             ssid = session.ssid,
-            proxyAddress = "${session.proxyHost}:${session.port}",
+            // (E3.2) Only an address that really serves: the Wi-Fi listener while it runs, the USB
+            // one for a USB-only session, "—" while Wi-Fi isn't up yet, nothing while idle.
+            proxyAddress = if (session.phase == SessionPhase.IDLE) null else session.proxyAddress ?: "—",
             lastError = session.lastError,
         )
 
+        // The activity decides when Start really happens (after any permission dialog).
         StartStopButton(
             phase = session.phase,
-            onStart = {
-                onBeforeStart()
-                repository.start()
-            },
+            onStart = onStart,
             onStop = repository::stop,
         )
 
-        MobileDataChip(cellularUp = session.cellularUp)
+        // (E3.1) Cellular availability is only tracked during a session; while idle the chip
+        // would always claim "No mobile data".
+        if (session.phase != SessionPhase.IDLE) {
+            MobileDataChip(cellularUp = session.cellularUp)
+        }
 
         Text(
             text = "Devices ${session.slots.size}/${session.maxClients}",
@@ -89,7 +94,9 @@ fun HomeScreen(repository: SessionRepository, modifier: Modifier = Modifier, onB
         )
 
         session.slots.forEach { slot ->
-            SlotRow(slot = slot, onRevokeClick = { slotPendingRevoke = slot })
+            // (D7) The USB laptop always keeps its seat while USB sharing is on: no Revoke.
+            val revocable = slot.platform != ClientPlatform.LAPTOP
+            SlotRow(slot = slot, onRevokeClick = if (revocable) ({ slotPendingRevoke = slot }) else null)
         }
 
         HorizontalDivider()
@@ -124,7 +131,7 @@ private fun StatusCard(
     phase: SessionPhase,
     degradedReason: String?,
     ssid: String,
-    proxyAddress: String,
+    proxyAddress: String?,
     lastError: String?,
 ) {
     Card(
@@ -141,11 +148,13 @@ private fun StatusCard(
                 Text(text = phase.label(), style = MaterialTheme.typography.headlineSmall)
             }
             Text(text = ssid, style = MaterialTheme.typography.bodyMedium)
-            Text(
-                text = proxyAddress,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+            proxyAddress?.let {
+                Text(
+                    text = it,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
             if (phase == SessionPhase.DEGRADED && degradedReason != null) {
                 Text(
                     text = degradedReason,
@@ -212,7 +221,7 @@ private fun MobileDataChip(cellularUp: Boolean) {
 }
 
 @Composable
-private fun SlotRow(slot: SlotUi, onRevokeClick: () -> Unit) {
+private fun SlotRow(slot: SlotUi, onRevokeClick: (() -> Unit)?) {
     ElevatedCard(modifier = Modifier.fillMaxWidth()) {
         Row(
             modifier = Modifier
@@ -240,8 +249,10 @@ private fun SlotRow(slot: SlotUi, onRevokeClick: () -> Unit) {
                     style = MaterialTheme.typography.bodySmall,
                 )
             }
-            IconButton(onClick = onRevokeClick) {
-                Icon(Icons.Filled.Close, contentDescription = "Revoke ${slot.name}")
+            if (onRevokeClick != null) {
+                IconButton(onClick = onRevokeClick) {
+                    Icon(Icons.Filled.Close, contentDescription = "Revoke ${slot.name}")
+                }
             }
         }
     }

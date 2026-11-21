@@ -44,7 +44,8 @@ fun AppRoot(
     prefs: AppPreferences,
     isDemoMode: Boolean,
     onDemoModeChange: (Boolean) -> Unit,
-    onBeforeStart: () -> Unit = {},
+    /** What the Start button does; [MainActivity] asks for missing permissions first. */
+    onStartSharing: () -> Unit = { repository.start() },
 ) {
     val navController = rememberNavController()
 
@@ -78,7 +79,7 @@ fun AppRoot(
             startDestination = Tab.Home.route,
             modifier = Modifier.padding(innerPadding),
         ) {
-            composable(Tab.Home.route) { HomeScreen(repository, onBeforeStart = onBeforeStart) }
+            composable(Tab.Home.route) { HomeScreen(repository, onStart = onStartSharing) }
             composable(Tab.Devices.route) {
                 AddDeviceScreen(
                     repository,

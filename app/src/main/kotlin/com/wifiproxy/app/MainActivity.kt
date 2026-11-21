@@ -47,13 +47,18 @@ class MainActivity : ComponentActivity() {
                     val repository by provider.repository.collectAsState()
                     var demoMode by remember { mutableStateOf(prefs.demoMode) }
 
+                    // Only ever launched by a Start tap (onStartSharing below), so its result -
+                    // granted or denied - is what lets that Start go ahead. Starting only now,
+                    // not alongside the request, means the session's first link attempt never
+                    // races the user's answer. A denial doesn't block sharing: a denied
+                    // notification permission just means the FGS notification won't show, and a
+                    // denied Wi-Fi Direct permission surfaces as the link's "Allow the Nearby
+                    // devices permission…" degraded reason (P2pGroupLink). `repository` is read
+                    // when the result arrives, so it is the current one.
                     val permissionsLauncher = rememberLauncherForActivityResult(
                         ActivityResultContracts.RequestMultiplePermissions(),
                     ) {
-                        // No-op either way: a denied notification permission just means the FGS
-                        // notification won't show, and a denied Wi-Fi Direct permission surfaces
-                        // on its own as the link's "Allow the Nearby devices permission…"
-                        // degraded reason (P2pGroupLink) once sharing is started.
+                        repository.start()
                     }
 
                     AppRoot(
@@ -65,7 +70,7 @@ class MainActivity : ComponentActivity() {
                             prefs.demoMode = newValue
                             provider.setDemoMode(newValue)
                         },
-                        onBeforeStart = {
+                        onStartSharing = {
                             // Wi-Fi Direct's own permission is only requested when a password is
                             // set (plan decision 2: no password means USB-only, no P2P group).
                             val wifiDirectNeeded = repository.settings.value.password.isNotEmpty()
@@ -90,9 +95,11 @@ class MainActivity : ComponentActivity() {
                                 ContextCompat.checkSelfPermission(this@MainActivity, it) !=
                                     PackageManager.PERMISSION_GRANTED
                             }
-                            // Start proceeds either way; a still-missing permission shows up as a
-                            // degraded reason rather than blocking Start.
-                            if (missing.isNotEmpty()) {
+                            // Start proceeds either way: right away when nothing is missing,
+                            // otherwise from the launcher's result callback above.
+                            if (missing.isEmpty()) {
+                                repository.start()
+                            } else {
                                 permissionsLauncher.launch(missing.toTypedArray())
                             }
                         },
