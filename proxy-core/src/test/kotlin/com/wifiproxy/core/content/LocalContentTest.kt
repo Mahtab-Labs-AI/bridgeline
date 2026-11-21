@@ -108,6 +108,37 @@ class LocalContentTest {
     }
 
     @Test
+    fun `while open an unknown token falls back to an auto slot, keeping its own pac url`() {
+        val token = "AAAAAAAAAAAAAAAAAAAAAA"
+        val r = open(WifiCredentials("DIRECT-ab-Test", "password1")).serve(Local("GET", "/$token.mobileconfig"), peer)
+        assertEquals(200, r.status)
+        assertTrue("http://192.168.49.1:8080/$token.pac" in r.body.toString(Charsets.UTF_8))
+        assertTrue(registry.admittedSlot(peer)!!.auto)
+        assertEquals(200, open().serve(Local("GET", "/$token.pac"), peer).status)
+        assertEquals(1, registry.slots().size)
+    }
+
+    @Test
+    fun `an unknown token is 403 while open and full, 404 while closed`() {
+        val full = ClientRegistry(maxClients = 1)
+        full.addSlot("a")!!
+        assertEquals(403, open(reg = full).serve(Local("GET", "/AAAAAAAAAAAAAAAAAAAAAA.pac"), peer).status)
+        assertEquals(404, content().serve(Local("GET", "/AAAAAAAAAAAAAAAAAAAAAA.pac"), peer).status)
+        assertNull(full.admittedSlot(peer))
+        assertTrue(registry.slots().isEmpty())
+    }
+
+    @Test
+    fun `the owner address never gets an auto slot`() {
+        val owner = InetAddress.getByName("192.168.49.1")
+        val c = LocalContent(registry, "192.168.49.1", 8080, null, openAdmission = true, owner = owner)
+        assertEquals(403, c.serve(Local("GET", "/proxy.pac"), owner).status)
+        assertEquals(403, c.serve(Local("GET", "/AAAAAAAAAAAAAAAAAAAAAA.pac"), owner).status)
+        assertTrue(registry.slots().isEmpty())
+        assertEquals(200, c.serve(Local("GET", "/proxy.pac"), peer).status)
+    }
+
+    @Test
     fun `token paths keep working while admission is open`() {
         val slot = registry.addSlot("a")!!
         assertEquals(200, open().serve(Local("GET", "/${slot.token}.pac"), peer).status)

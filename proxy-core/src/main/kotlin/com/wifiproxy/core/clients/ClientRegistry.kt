@@ -180,6 +180,8 @@ class ClientRegistry(
         while (it.hasNext()) {
             val e = it.next()
             if (e === keep || e.pinned || e.boundIp != ip) continue
+            // Removing it without ProxyServer.revoke is safe: on a teardown the server is already
+            // stopped (its tunnels with it), and on a takeover the new slot is the same device.
             if (e.auto) it.remove() else e.boundIp = null
         }
     }

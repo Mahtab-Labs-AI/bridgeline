@@ -11,7 +11,10 @@ import java.net.InetAddress
  *
  * With [openAdmission] it also serves the fixed /proxy.pac and /proxy.mobileconfig, which admit
  * the peer through [ClientRegistry.admitOrCreate] (403 while every seat is taken). Without it,
- * those paths are 404 like any other unknown path.
+ * those paths are 404 like any other unknown path. Under open admission an unknown token falls
+ * back to [ClientRegistry.admitOrCreate] too, so an old per-device URL keeps working without
+ * reserving a seat. [owner] - the listener's own (group-owner) address - is never given an auto
+ * slot: the host phone's own apps must not take a seat.
  */
 class LocalContent(
     private val registry: ClientRegistry,
@@ -19,6 +22,7 @@ class LocalContent(
     private val proxyPort: Int,
     private val wifi: WifiCredentials?,
     private val openAdmission: Boolean = false,
+    private val owner: InetAddress? = null,
 ) {
     fun serve(request: ProxyRequest.Local, peer: InetAddress): HttpResponse {
         if (openAdmission) {
@@ -28,18 +32,25 @@ class LocalContent(
         if (request.method != "GET") return HttpResponse.METHOD_NOT_ALLOWED
         val (token, extension) = match.destructured
         if (extension == "mobileconfig" && wifi == null) return HttpResponse.NOT_FOUND
-        registry.onPacFetch(token, peer) ?: return HttpResponse.NOT_FOUND
+        if (registry.onPacFetch(token, peer) == null) {
+            if (!openAdmission) return HttpResponse.NOT_FOUND
+            admitOpen(peer) ?: return HttpResponse.FORBIDDEN
+        }
         return render(extension, pacUrl = "http://$proxyHost:$proxyPort/$token.pac", profileSeed = token)
     }
 
     private fun serveFixed(request: ProxyRequest.Local, extension: String, peer: InetAddress): HttpResponse {
         if (request.method != "GET") return HttpResponse.METHOD_NOT_ALLOWED
         if (extension == "mobileconfig" && wifi == null) return HttpResponse.NOT_FOUND
-        registry.admitOrCreate(peer) ?: return HttpResponse.FORBIDDEN
+        admitOpen(peer) ?: return HttpResponse.FORBIDDEN
         // The profile's UUIDs come from the group's SSID, not a per-slot token, so installing it
         // again on the same iPhone replaces the earlier copy instead of adding a second one.
         return render(extension, pacUrl = "http://$proxyHost:$proxyPort/$FIXED_NAME.pac", profileSeed = "open:${wifi?.ssid}")
     }
+
+    /** Open admission's lookup: never creates a slot for [owner]. */
+    private fun admitOpen(peer: InetAddress) =
+        if (peer == owner) registry.admittedSlot(peer) else registry.admitOrCreate(peer)
 
     private fun render(extension: String, pacUrl: String, profileSeed: String): HttpResponse {
         val pac = PacFile.render(proxyHost, proxyPort)
