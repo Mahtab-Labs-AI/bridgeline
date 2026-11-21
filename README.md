@@ -10,7 +10,7 @@ app-level HTTP proxy (no system tethering). Design: `docs/superpowers/specs/2026
 | `:proxy-core` | Plan 1 (done) | Pure Kotlin/JVM proxy data plane: slots/admission, parser, PAC/mobileconfig/probes, destination filter, dialer, NIO tunnel server |
 | `:app` | Plans 2a (USB) and 2b (Wi-Fi Direct), done | Android host app (service, Wi-Fi Direct, USB, cellular egress, UI) |
 
-`:proxy-core` has 171 tests and `:app` has 197, all green, with zero Kotlin warnings.
+`:proxy-core` has 187 tests and `:app` has 201, all green, with zero Kotlin warnings.
 
 ## Build and test (Windows)
 

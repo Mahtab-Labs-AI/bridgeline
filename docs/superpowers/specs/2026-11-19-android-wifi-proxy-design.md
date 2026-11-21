@@ -252,7 +252,7 @@ Laptop app → laptop 127.0.0.1:8081 ──adb forward (USB)──► host 127.0
 
 ## 12. Plan 2b decisions (2026-11-21)
 
-Plan 2a (USB) and Plan 2b (Wi-Fi Direct) are both implemented; `:proxy-core` has 171 tests and `:app` has 197, all green, with zero Kotlin warnings. These are the deviations and additions from real implementation and real-device testing, superseding the sections above where they conflict.
+Plan 2a (USB) and Plan 2b (Wi-Fi Direct) are both implemented; `:proxy-core` has 187 tests and `:app` has 201, all green, with zero Kotlin warnings. These are the deviations and additions from real implementation and real-device testing, superseding the sections above where they conflict.
 
 1. **No `Failed` phase.** A link that needs the user (firmware ignored the SSID or password, Wi-Fi Direct unsupported, a missing permission, 10 consecutive failures) shows as `Degraded` with that reason, and stops retrying. USB sharing keeps working. The user fixes the problem and restarts sharing.
 2. **Wi-Fi Direct runs only when credentials are set.** A session with no password is USB-only; start is refused only when there is neither USB sharing nor a password. §4's "first session can't start without a password" predates USB.
