@@ -2,8 +2,11 @@ package com.wifiproxy.app.wifi
 
 import com.wifiproxy.core.WifiCredentials
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
@@ -17,6 +20,7 @@ import java.net.Inet4Address
 import java.net.InetAddress
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertIs
 import kotlin.test.assertTrue
 
@@ -41,7 +45,12 @@ private class FakeP2pApi : P2pApi {
      *  between a cancellation being requested and the old run actually finishing. */
     var createGroupGate: CompletableDeferred<Unit>? = null
 
+    /** When set, createGroup() throws this instead of doing anything - simulating a run with a bug
+     *  (or an unexpected Android exception), to confirm it can't take the supervisor down. */
+    var throwOnCreateGroup: Throwable? = null
+
     override suspend fun createGroup(request: GroupRequest): CreateResult {
+        throwOnCreateGroup?.let { throw it }
         createGroupGate?.let { gate -> withContext(NonCancellable) { gate.await() } }
         requests += request
         val result = results.removeFirstOrNull() ?: CreateResult.Success
@@ -52,7 +61,12 @@ private class FakeP2pApi : P2pApi {
     /** Fired every time removeGroup() actually runs, so tests can record relative ordering. */
     var onRemoveGroup: () -> Unit = {}
 
+    /** When set, removeGroup() throws this - simulating a misbehaving implementation, even though
+     *  [P2pApi.removeGroup] is documented to never throw. */
+    var throwOnRemoveGroup: Throwable? = null
+
     override suspend fun removeGroup() {
+        throwOnRemoveGroup?.let { throw it }
         removeCalls++
         group = null
         onRemoveGroup()
@@ -288,14 +302,20 @@ class P2pGroupLinkTest {
         // own cancellation interrupts its join on A immediately (it doesn't actually wait for A to
         // finish), so stop() tears down right here, believing it's done.
         runCurrent()
-        // Only now does A's gated createGroup() resolve - too late, after the teardown already
-        // ran.
+        // On the fixed code, stop() is still waiting on the supervisor, which is itself waiting
+        // (non-cancellably) for A to actually finish - it has not given up early.
+        assertFalse(stopJob.isCompleted)
+        // Only now does A's gated createGroup() resolve - too late, on the old code, after the
+        // teardown already ran.
         gate.complete(Unit)
         runCurrent()
 
         assertEquals(LinkState.Idle, link.state.value)
         assertEquals(null, api.group)
         assertTrue(stopJob.isCompleted)
+        // B was cancelled before it ever got to run (A was still current when stop() landed), so
+        // only A's one request exists - never two.
+        assertEquals(1, api.requests.size)
     }
 
     @Test
@@ -305,20 +325,24 @@ class P2pGroupLinkTest {
         link.start(LinkConfig(CREDS, prefer5Ghz = false))
         runCurrent()
 
-        val order = mutableListOf<String>()
-        api.onRemoveGroup = { order += "removeGroup" }
+        var removeGroupCalls = 0
+        api.onRemoveGroup = { removeGroupCalls++ }
 
-        val stop1 = launch { link.stop(); order += "stop1" }
-        val stop2 = launch { link.stop(); order += "stop2" }
+        var removeGroupCallsWhenStop1Completed = -1
+        var removeGroupCallsWhenStop2Completed = -1
+        val stop1 = launch { link.stop(); removeGroupCallsWhenStop1Completed = removeGroupCalls }
+        val stop2 = launch { link.stop(); removeGroupCallsWhenStop2Completed = removeGroupCalls }
         runCurrent()
 
+        // The contract, not one specific scheduler interleaving: both callers complete, each one's
+        // completion marker is recorded only after at least one removeGroup() has actually run,
+        // and - since every Stop is handled, never skipped or merged - there were exactly two
+        // removeGroup() calls in total, one per stop().
         assertTrue(stop1.isCompleted)
         assertTrue(stop2.isCompleted)
-        // The supervisor processes both Stop commands - including both removeGroup() calls -
-        // before either waiting stop() caller is resumed (completing a Deferred doesn't preempt
-        // the completer). Both removeGroup() calls precede both completions, and - since commands
-        // are processed strictly in submission order - stop1 completes before stop2.
-        assertEquals(listOf("removeGroup", "removeGroup", "stop1", "stop2"), order)
+        assertTrue(removeGroupCallsWhenStop1Completed >= 1)
+        assertTrue(removeGroupCallsWhenStop2Completed >= 1)
+        assertEquals(2, removeGroupCalls)
     }
 
     @Test
@@ -393,5 +417,71 @@ class P2pGroupLinkTest {
         runCurrent()
         assertEquals(listOf(GroupBand.GHZ_5), api.requests.map { it.band })
         assertEquals(LinkState.Down(REASON_RETRYING), link.state.value)
+    }
+
+    // --- Round 3: stop() must never hang, even once the supervisor is gone. ---
+
+    @Test
+    fun `stop still returns Idle after its own scope is cancelled`() = runTest {
+        val api = FakeP2pApi()
+        val childScope = CoroutineScope(backgroundScope.coroutineContext + Job())
+        val link = P2pGroupLink(api, childScope, deviceModel = "Pixel 11")
+        link.start(LinkConfig(CREDS, prefer5Ghz = false))
+        runCurrent()
+        assertIs<LinkState.Up>(link.state.value)
+
+        // Simulates onDestroy cancelling the whole scope before the session shutdown gets to call
+        // stop() - on a *different* scope, as the real service does.
+        childScope.cancel()
+        runCurrent()
+
+        link.stop()
+        assertEquals(LinkState.Idle, link.state.value)
+        assertEquals(null, api.group)
+    }
+
+    @Test
+    fun `a link built on an already-cancelled scope never hangs`() = runTest {
+        val api = FakeP2pApi()
+        val deadScope = CoroutineScope(backgroundScope.coroutineContext + Job()).apply { cancel() }
+        val link = P2pGroupLink(api, deadScope, deviceModel = "Pixel 11")
+
+        // The supervisor never ran at all; start() must still be a harmless no-op.
+        link.start(LinkConfig(CREDS, prefer5Ghz = false))
+        runCurrent()
+        assertEquals(LinkState.Idle, link.state.value)
+        assertEquals(0, api.requests.size)
+
+        link.stop()
+        assertEquals(LinkState.Idle, link.state.value)
+    }
+
+    @Test
+    fun `a run that throws becomes Failed with only the exception's class name, and stop still works`() = runTest {
+        val api = FakeP2pApi().apply { throwOnCreateGroup = IllegalStateException("boom, 10.0.0.1 leaked") }
+        val link = newLink(api)
+        link.start(LinkConfig(CREDS, prefer5Ghz = false))
+        runCurrent()
+
+        val failed = assertIs<LinkState.Failed>(link.state.value)
+        assertEquals("Wi-Fi Direct error: IllegalStateException", failed.message)
+        assertFalse("boom" in failed.message)
+        assertFalse("10.0.0.1" in failed.message)
+
+        // The bug didn't take the supervisor down with it: stop() still works normally.
+        link.stop()
+        assertEquals(LinkState.Idle, link.state.value)
+    }
+
+    @Test
+    fun `stop still returns even when removeGroup throws`() = runTest {
+        val api = FakeP2pApi()
+        val link = newLink(api)
+        link.start(LinkConfig(CREDS, prefer5Ghz = false))
+        runCurrent()
+
+        api.throwOnRemoveGroup = IllegalStateException("boom")
+        link.stop()
+        assertEquals(LinkState.Idle, link.state.value)
     }
 }

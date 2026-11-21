@@ -48,7 +48,21 @@ sealed interface CreateResult {
     }
 }
 
-/** The thin Android seam; [AndroidP2pApi] is the only real implementation. */
+/**
+ * The thin Android seam; [AndroidP2pApi] is the only real implementation.
+ *
+ * [P2pGroupLink] drives all three suspend functions from a single serialized command queue with
+ * nothing else running concurrently: a call that never returns stalls that queue - and so every
+ * later [P2pGroupLink.start]/[P2pGroupLink.stop] - forever. Implementations of [createGroup],
+ * [removeGroup] and [groupInfo] must therefore be cancellable (respond to coroutine cancellation
+ * promptly, the way suspend functions built on cancellable Android callbacks naturally are) or
+ * otherwise time-bounded (e.g. with an internal timeout); never a call that can simply hang.
+ *
+ * [connectionChanged] must be hot: it has to support being subscribed to at any time and start
+ * delivering events from that point on, synchronously from the subscriber's point of view (the way
+ * a [kotlinx.coroutines.flow.SharedFlow] is), not a cold flow that only starts listening for
+ * system broadcasts once collection begins.
+ */
 interface P2pApi {
     /** Wi-Fi P2P enabled state (follows Wi-Fi on/off). */
     val p2pEnabled: StateFlow<Boolean>
