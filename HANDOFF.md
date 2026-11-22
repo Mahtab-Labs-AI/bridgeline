@@ -20,7 +20,11 @@ An Android app that shares a phone's **cellular data** with other devices **with
 
 ## Repository and branches
 - **GitHub:** private repo `Mahtab-Labs-AI/bridgeline` (the project's public name), remote `origin`.
-- **`main`:** the stable, tested line. It contains Plans 1, 2a (USB) and 2b (Wi-Fi Direct, including open admission and on-demand idle seat eviction). It is **protected** by the `protect-main` ruleset: changes arrive only by pull request, with no force-push and no deletion.
+- **`main`:** the stable, released line. Its latest release is **Bridgeline 1.0.0** (tag `v1.0.0.124`, a GitHub release with the APK attached). It is **protected** by the `protect-main` ruleset:
+  - changes arrive only by pull request;
+  - merge commits only, because BUILD is the commit count;
+  - the CI check "Build and test" is required;
+  - no force-push and no deletion.
 - **`develop`:** the integration branch.
 - **Flow:**
   1. Branch features off `develop`, then merge them into `develop`.
@@ -68,7 +72,10 @@ An Android app that shares a phone's **cellular data** with other devices **with
    - the tests bind 127.0.0.2, which macOS needs aliased.
 3. **Pixel 11 with Advanced Protection** blocks sideloading, even with the device toggle off and the phone restarted. The likely cause is the Google account being enrolled in the Advanced Protection Program, or a work policy. Use another device, or Play Console **Internal testing** (needs a Play developer account, release signing and an AAB).
 4. **Planned v2** (spec §1): an optional Android client app (`VpnService` + tun2socks) and SOCKS5.
-5. Merge `feature/wifi-direct` into `main` once you're happy.
+5. Small post-1.0 hardening from the reviews (see the ledger):
+   - the verbose rate limiter should use a monotonic clock;
+   - idle-seat timing uses the wall clock;
+   - IO_ERROR can mislabel a stop.
 
 ## Environment setup on a new Windows machine
 1. **JDK 21:** `winget install --id EclipseAdoptium.Temurin.21.JDK -e`, or extract the Temurin zip to `%LOCALAPPDATA%\Programs\Temurin\`. `scripts/env.ps1` searches both. Dot-source it in every shell: `. .\scripts\env.ps1`.
