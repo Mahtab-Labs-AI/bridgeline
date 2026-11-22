@@ -1,5 +1,7 @@
 package com.wifiproxy.app.session
 
+import com.wifiproxy.app.logs.VerbosePrefs
+import com.wifiproxy.app.logs.VerboseSwitch
 import java.security.SecureRandom
 import java.util.Base64
 import kotlinx.coroutines.CoroutineScope
@@ -58,6 +60,23 @@ class FakeSessionRepository(
 
     override fun setRequireDeviceCodes(value: Boolean) {
         _requireDeviceCodes.value = value
+    }
+
+    // The demo only shows the verbose switch (and its 30-minute auto-off): nothing is persisted
+    // and no extra log lines appear.
+    private val verbose = VerboseSwitch(
+        prefs = object : VerbosePrefs {
+            override var verboseUntilMs = 0L
+            override var verboseVersionCode = 0
+        },
+        versionCode = 0,
+        clock = now,
+        scope = repositoryScope,
+    )
+    override val verboseUntilMs: StateFlow<Long> = verbose.untilMs
+
+    override fun setVerboseLogging(on: Boolean) {
+        if (on) verbose.enable() else verbose.disable()
     }
 
     private val _checks = MutableStateFlow(

@@ -19,6 +19,7 @@ import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import androidx.core.location.LocationManagerCompat
 import androidx.core.net.toUri
+import com.wifiproxy.app.logs.VerboseLog
 import com.wifiproxy.app.service.ProxySessionService
 import com.wifiproxy.app.service.SessionHolder
 import com.wifiproxy.app.service.SessionController
@@ -208,8 +209,18 @@ class ServiceSessionRepository(
         val active = vpnNetworks.isNotEmpty()
         if (_vpnActive.value != active) {
             _vpnActive.value = active
+            SessionHolder.controller.value?.logVerbose(
+                if (active) "VPN active (${vpnNetworks.size} VPN network(s) apply to this app)" else "VPN gone",
+            )
             requestChecks()
         }
+    }
+
+    private val verbose = VerboseLog.get(context)
+    override val verboseUntilMs: StateFlow<Long> = verbose.untilMs
+
+    override fun setVerboseLogging(on: Boolean) {
+        if (on) verbose.enable() else verbose.disable()
     }
 
     /**
