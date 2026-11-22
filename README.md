@@ -44,7 +44,7 @@ Release procedure:
 
 1. Bump `version.properties` for the kind of change (major/minor/patch).
 2. Update `CHANGELOG.md`: move `## [Unreleased]` into a new `## [x.y.z] - YYYY-MM-DD` heading (date it, keep its Added/Changed/Fixed/Security lists user-meaningful rather than one line per commit).
-3. Open a PR `develop` -> `main`.
+3. Open a PR `develop` -> `main`, wait for the required "Build and test" check, and merge with a normal **merge commit**. The `main` ruleset only allows that method: BUILD is the commit count, so a squash or rebase merge could lower `versionCode`, which Android and the Play Store reject.
 4. After it merges, tag `main` as `vX.Y.Z.BUILD` and create a GitHub release with that changelog section and the built APK.
 
 ## `:proxy-core` rules

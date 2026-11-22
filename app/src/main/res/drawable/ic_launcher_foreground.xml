@@ -14,7 +14,7 @@
         android:pivotY="60"
         android:rotation="-10">
         <path
-            android:fillColor="#FFFFFF"
+            android:fillColor="@color/brand_on_primary"
             android:fillType="evenOdd"
             android:pathData="M31.5,44 H40.5 A4.5,4.5 0 0 1 45,48.5 V71.5 A4.5,4.5 0 0 1 40.5,76 H31.5 A4.5,4.5 0 0 1 27,71.5 V48.5 A4.5,4.5 0 0 1 31.5,44 Z M30.5,48.5 V68 H41.5 V48.5 Z" />
     </group>
@@ -23,16 +23,16 @@
         android:pivotY="60"
         android:rotation="10">
         <path
-            android:fillColor="#FFFFFF"
+            android:fillColor="@color/brand_on_primary"
             android:fillType="evenOdd"
             android:pathData="M67.5,44 H76.5 A4.5,4.5 0 0 1 81,48.5 V71.5 A4.5,4.5 0 0 1 76.5,76 H67.5 A4.5,4.5 0 0 1 63,71.5 V48.5 A4.5,4.5 0 0 1 67.5,44 Z M66.5,48.5 V68 H77.5 V48.5 Z" />
     </group>
     <path
         android:pathData="M41,41 Q54,22 67,41"
-        android:strokeColor="#FFFFFF"
+        android:strokeColor="@color/brand_on_primary"
         android:strokeLineCap="round"
         android:strokeWidth="4" />
     <path
-        android:fillColor="#FFFFFF"
+        android:fillColor="@color/brand_on_primary"
         android:pathData="M51.2,31.5 A2.8,2.8 0 1 0 56.8,31.5 A2.8,2.8 0 1 0 51.2,31.5 Z" />
 </vector>

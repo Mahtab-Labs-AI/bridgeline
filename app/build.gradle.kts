@@ -15,8 +15,11 @@ plugins {
 // major/minor/patch come from version.properties at the repo root (bumped by hand per release);
 // BUILD is the commit count, auto-counted and identical locally and on CI. Read via
 // providers.fileContents/ValueSource (not plain java.io at configuration time) so both stay
-// configuration-cache compatible: Gradle reruns each provider only when the file or git's answer
-// could have changed, rather than treating this script's configuration as always-stale.
+// configuration-cache compatible. If the configuration cache is ever enabled, Gradle re-runs a
+// ValueSource like GitCommitCountSource on every build to fingerprint the cached entry and
+// invalidates it when the value changes. So a new commit can't leave a stale BUILD or versionCode
+// in the APK. Keep this as a ValueSource; don't move the git call into a plain configuration-time
+// exec.
 abstract class GitCommitCountSource : org.gradle.api.provider.ValueSource<Int, ValueSourceParameters.None> {
     @get:Inject
     abstract val execOperations: ExecOperations
