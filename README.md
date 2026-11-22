@@ -14,6 +14,25 @@ Brand assets: `docs/brand/`.
 Contributions are welcome — see [`CONTRIBUTING.md`](CONTRIBUTING.md) to get started, or browse the
 [`good first issue`](https://github.com/Mahtab-Labs-AI/bridgeline/labels/good%20first%20issue) label.
 
+## Screenshots
+
+<table>
+<tr>
+<td width="20%"><img width="100%" src="docs/screenshots/home-running.png" alt="Home screen, sharing running with one connected device"></td>
+<td width="20%"><img width="100%" src="docs/screenshots/devices-setup.png" alt="Devices screen: join the Wi-Fi network, then set the proxy"></td>
+<td width="20%"><img width="100%" src="docs/screenshots/settings.png" alt="Settings: open admission by default, verbose logging, network name and password"></td>
+<td width="20%"><img width="100%" src="docs/screenshots/setup-check.png" alt="Setup check: all green, including the no-VPN check"></td>
+<td width="20%"><img width="100%" src="docs/screenshots/diagnostics-verbose.png" alt="Diagnostics with verbose logging on, showing real connection events"></td>
+</tr>
+<tr>
+<td><b>Running.</b> Open admission, one device connected and moving data — no invite needed, just the Wi-Fi password.</td>
+<td><b>Joining.</b> Scan the Wi-Fi QR, then point the OS's Proxy Auto-Config (or manual proxy) at one URL. Nothing to install.</td>
+<td><b>Settings.</b> Open admission by default ("Require a code" is opt-in), plus the 30-minute verbose troubleshooting log.</td>
+<td><b>Setup check.</b> Catches the things that actually break sharing before you hit them — including an active VPN.</td>
+<td><b>Verbose logging.</b> Per-connection detail (device IP, port, bytes, timing) for troubleshooting — never website names.</td>
+</tr>
+</table>
+
 ## Modules
 
 | Module | Status | What |
