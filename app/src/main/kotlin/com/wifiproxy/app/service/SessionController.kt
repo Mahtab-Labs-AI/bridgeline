@@ -3,8 +3,10 @@ package com.wifiproxy.app.service
 import com.wifiproxy.app.egress.SessionEgress
 import com.wifiproxy.app.logs.VERBOSE_AUTO_OFF_MESSAGE
 import com.wifiproxy.app.logs.VERBOSE_PREFIX
+import com.wifiproxy.app.logs.VerboseRateLimiter
 import com.wifiproxy.app.logs.describeLink
 import com.wifiproxy.app.logs.formatProxyEvent
+import com.wifiproxy.app.logs.withSuppressed
 import com.wifiproxy.app.session.ClientPlatform
 import com.wifiproxy.app.session.LogEntry
 import com.wifiproxy.app.session.SessionPhase
@@ -69,6 +71,17 @@ data class SessionConfig(
      *  the USB listener, which only ever admits its pinned laptop. */
     val requireDeviceCodes: Boolean = false,
 )
+
+/** [entries] plus [entry], keeping the newest [capacity]: one copy of what is kept, instead of
+ *  copying everything (`+`) and then the tail again (`takeLast`) - this runs per verbose line,
+ *  with up to 3000 entries. */
+internal fun <T> appendCapped(entries: List<T>, entry: T, capacity: Int): List<T> {
+    val keep = minOf(entries.size, capacity - 1).coerceAtLeast(0)
+    val out = ArrayList<T>(keep + 1)
+    for (i in entries.size - keep until entries.size) out.add(entries[i])
+    out.add(entry)
+    return out
+}
 
 /** See [SessionController.wifiEndpoint]. */
 data class WifiEndpoint(val group: LinkState.Up, val port: Int)
@@ -878,9 +891,17 @@ class SessionController(
     /** `ProxyServer.onEvent`, from either listener: on whichever thread the event happened (the
      *  accept loop or a connection handler), never [scope]. */
     private fun onProxyEvent(event: ProxyEvent) {
+        // TunnelClosed carries everything TunnelOpened would say, so only the close is logged.
+        if (event is ProxyEvent.TunnelOpened) return
         if (!verbose()) return
-        appendEntry(VERBOSE_PREFIX + formatProxyEvent(event), VERBOSE_LOG_CAPACITY)
+        // Before any formatting: a suppressed event costs only the limiter's lookup.
+        val earlier = proxyEventLimiter.admit(event.peer, event.javaClass)
+        if (earlier == VerboseRateLimiter.SUPPRESSED) return
+        appendEntry(VERBOSE_PREFIX + withSuppressed(formatProxyEvent(event), earlier), VERBOSE_LOG_CAPACITY)
     }
+
+    /** 10 lines per (peer, event type) and 100 in total per second, for [onProxyEvent] only. */
+    private val proxyEventLimiter = VerboseRateLimiter(clock = now)
 
     /**
      * Appends `[v] message` while [verbose] is on, else does nothing. For internal detail from
@@ -895,13 +916,17 @@ class SessionController(
         }
     }
 
-    /** Verbose logging just turned off: trims the log back to [LOG_CAPACITY] newest entries and,
-     *  for the 30-minute auto-off ([autoOff]), says so in one plain line. Any thread. */
+    /** Verbose logging just turned off: says how many proxy-event lines the rate limit still held
+     *  back (and forgets its counts), trims the log back to [LOG_CAPACITY] newest entries and, for
+     *  the 30-minute auto-off ([autoOff]), says so in one plain line. Any thread. */
     fun onVerboseEnded(autoOff: Boolean) {
-        _log.update { entries ->
-            val all = if (autoOff) entries + LogEntry(now(), VERBOSE_AUTO_OFF_MESSAGE) else entries
-            all.takeLast(LOG_CAPACITY)
+        val suppressed = proxyEventLimiter.drain()
+        val time = now()
+        val tail = buildList {
+            if (suppressed > 0) add(LogEntry(time, "$VERBOSE_PREFIX$suppressed more lines suppressed by the rate limit"))
+            if (autoOff) add(LogEntry(time, VERBOSE_AUTO_OFF_MESSAGE))
         }
+        _log.update { entries -> (entries + tail).takeLast(LOG_CAPACITY) }
     }
 
     private fun appendLog(message: String) {
@@ -910,6 +935,7 @@ class SessionController(
 
     /** Lock-free: a [MutableStateFlow.update] CAS loop, safe from any thread. */
     private fun appendEntry(message: String, capacity: Int) {
-        _log.update { (it + LogEntry(now(), message)).takeLast(capacity) }
+        val entry = LogEntry(now(), message)
+        _log.update { appendCapped(it, entry, capacity) }
     }
 }

@@ -278,6 +278,54 @@ class SessionControllerTest {
     }
 
     @Test
+    fun `TunnelOpened is never logged, the close carries everything`() = runTest {
+        val sinks = mutableListOf<(ProxyEvent) -> Unit>()
+        val c = controller(scope = backgroundScope, verbose = { true }, eventSinks = sinks)
+        c.start(); runCurrent()
+        val before = c.log.value.size
+        sinks.single()(ProxyEvent.TunnelOpened(peer, 443, ProxyEvent.TunnelKind.CONNECT))
+        assertEquals(before, c.log.value.size)
+    }
+
+    @Test
+    fun `a flood of proxy events is rate limited and the next window reports how many were held back`() = runTest {
+        var clock = 0L
+        val sinks = mutableListOf<(ProxyEvent) -> Unit>()
+        val c = controller(scope = backgroundScope, verbose = { true }, eventSinks = sinks, now = { clock })
+        c.start(); runCurrent()
+        val flooder = InetAddress.getByName("192.168.49.12")
+        val refused = ProxyEvent.Refused(flooder, ProxyEvent.RefusalReason.PER_PEER_CAP)
+        repeat(50) { sinks.single()(refused) }
+        val line = "[v] 192.168.49.12 refused: too many pending requests from this device"
+        assertEquals(10, c.log.value.count { it.message == line })
+
+        clock = 1_000
+        sinks.single()(refused)
+        assertEquals("$line (40 similar suppressed)", c.log.value.last().message)
+    }
+
+    @Test
+    fun `turning verbose off reports what the rate limit still held back`() = runTest {
+        var verboseOn = true
+        val sinks = mutableListOf<(ProxyEvent) -> Unit>()
+        val c = controller(scope = backgroundScope, verbose = { verboseOn }, eventSinks = sinks)
+        c.start(); runCurrent()
+        repeat(13) { sinks.single()(ProxyEvent.Refused(null, ProxyEvent.RefusalReason.OUTSIDE_SUBNET)) }
+        assertTrue(c.log.value.any { it.message == "[v] off-link peer refused: outside the group's subnet" })
+        verboseOn = false
+        c.onVerboseEnded(autoOff = true)
+        val tail = c.log.value.takeLast(2).map { it.message }
+        assertEquals(listOf("[v] 3 more lines suppressed by the rate limit", VERBOSE_AUTO_OFF_MESSAGE), tail)
+    }
+
+    @Test
+    fun `appendCapped keeps the newest entries in order`() {
+        assertEquals(listOf(1, 2, 3), appendCapped(listOf(1, 2), 3, 5))
+        assertEquals(listOf(3, 4, 5), appendCapped(listOf(1, 2, 3, 4), 5, 3))
+        assertEquals(listOf(9), appendCapped(emptyList(), 9, 1))
+    }
+
+    @Test
     fun `logVerbose is a no-op while verbose is off`() = runTest {
         val c = controller(scope = backgroundScope)
         c.logVerbose("detail")

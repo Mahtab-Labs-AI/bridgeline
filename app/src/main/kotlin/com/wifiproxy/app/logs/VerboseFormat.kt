@@ -15,18 +15,23 @@ import java.util.Locale
  * destination port, counts, durations, reason codes and exception class names.
  */
 fun formatProxyEvent(event: ProxyEvent): String {
-    val peer = event.peer.hostAddress
+    // A peer off the local link prints as "off-link peer", never as an address.
+    val peer = ProxyEvent.describePeer(event.peer)
     return when (event) {
         is ProxyEvent.Refused -> "$peer refused: ${refusalText(event.reason)}"
         is ProxyEvent.LocalServed -> "$peer served ${localText(event.kind)}"
         is ProxyEvent.TunnelOpened -> "$peer ${event.kind} :${event.port} opened"
         is ProxyEvent.TunnelClosed ->
-            "$peer ${event.kind} :${event.port} closed (${event.end ?: "CANCELLED"}) " +
+            "$peer ${event.kind} :${event.port} closed (${event.outcome}) " +
                 "↑${formatBytes(event.upBytes)} ↓${formatBytes(event.downBytes)} ${formatSeconds(event.durationMs)}"
         is ProxyEvent.UpstreamFailed -> "$peer :${event.port} upstream failed: ${event.failure} (${event.errorClass})"
         is ProxyEvent.Evicted -> "$peer took the seat of an idle device"
     }
 }
+
+/** [line] plus, when the rate limiter held some back, how many similar lines it suppressed. */
+fun withSuppressed(line: String, suppressed: Int): String =
+    if (suppressed > 0) "$line ($suppressed similar suppressed)" else line
 
 private fun refusalText(reason: ProxyEvent.RefusalReason): String = when (reason) {
     ProxyEvent.RefusalReason.OUTSIDE_SUBNET -> "outside the group's subnet"

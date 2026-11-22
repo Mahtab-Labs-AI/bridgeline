@@ -27,6 +27,28 @@ class VerboseFormatTest {
     }
 
     @Test
+    fun `a tunnel cut off by an I-O error says so, not CANCELLED`() {
+        val event = ProxyEvent.TunnelClosed(
+            peer, 443, ProxyEvent.TunnelKind.CONNECT, 0, 0, 10, null, ProxyEvent.TunnelAbort.IO_ERROR,
+        )
+        assertEquals("192.168.49.87 CONNECT :443 closed (IO_ERROR) ↑0 B ↓0 B 0.0 s", formatProxyEvent(event))
+    }
+
+    @Test
+    fun `an off-link peer is never printed as an address`() {
+        assertEquals(
+            "off-link peer refused: too many connections",
+            formatProxyEvent(ProxyEvent.Refused(null, ProxyEvent.RefusalReason.CONNECTION_CAP)),
+        )
+    }
+
+    @Test
+    fun `suppressed counts are appended only when there are some`() {
+        assertEquals("x", withSuppressed("x", 0))
+        assertEquals("x (4 similar suppressed)", withSuppressed("x", 4))
+    }
+
+    @Test
     fun `every other event formats to one line`() {
         val p = InetAddress.getByName("192.168.49.12")
         assertEquals("192.168.49.12 refused: registry full", formatProxyEvent(ProxyEvent.Refused(p, ProxyEvent.RefusalReason.REGISTRY_FULL)))
