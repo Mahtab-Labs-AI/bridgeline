@@ -62,6 +62,9 @@ interface SessionEgress : Egress {
  */
 class CellularEgress(
     private val connectivityManager: ConnectivityManager,
+    /** Verbose diagnostics: the cellular network gained, lost or (in)validated, by its network
+     *  id only. Called on the connectivity callback thread; must not block. */
+    private val debug: (String) -> Unit = {},
 ) : SessionEgress {
 
     private val _network = MutableStateFlow<Network?>(null)
@@ -120,6 +123,7 @@ class CellularEgress(
                     // the controller must rebuild the proxy server against the new network.
                     _isValidated.value = false
                     _networkGeneration.value += 1
+                    log("cellular network $network available" + (previous?.let { " (replaces $it)" } ?: ""))
                 }
             }
 
@@ -129,13 +133,16 @@ class CellularEgress(
                     _network.value = null
                     _available.value = false
                     _isValidated.value = false
+                    log("cellular network $network lost")
                 }
             }
 
             override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
                 if (callback !== this) return
                 if (_network.value == network) {
-                    _isValidated.value = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+                    val validated = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+                    if (_isValidated.value != validated) log("cellular network $network validated: $validated")
+                    _isValidated.value = validated
                 }
             }
 
@@ -183,6 +190,10 @@ class CellularEgress(
         _network.value = null
         _available.value = false
         _isValidated.value = false
+    }
+
+    private fun log(message: String) {
+        runCatching { debug(message) }
     }
 
     override suspend fun resolve(host: String): List<InetAddress> = resolver.resolve(_network.value, host)

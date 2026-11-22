@@ -164,6 +164,7 @@ Permissions granted, password set, cellular available, battery-optimization exem
 
 - Ring-buffer file log of state transitions; exportable. `ApplicationExitInfo` reason recorded on startup.
 - **No URLs or hostnames logged** — byte and connection counters only.
+- **Verbose mode** (Settings → "Verbose logging (troubleshooting)"; off by default, only ever switched on by the user, off again after 30 minutes, never restored as on after an app update) adds `[v]` lines per connection and per internal step. They may contain client addresses on the local link (192.168.49.x, 127.0.0.1), destination ports, byte counts, durations, exception class names, reason codes, `WifiP2pManager` result codes and network ids — never URLs, hostnames, request paths or tokens, the Wi-Fi name or password, or destination IP addresses. A peer outside the listener's subnet (refused by the pre-admission caps or the subnet check) is not on the local link and is logged as "off-link peer", never by address. Per-connection lines are rate-limited (10 per device and event type, 100 in total, per second; the next line says how many were held back). While it is on the log keeps up to 3000 entries, trimmed back to 500 when it turns off.
 
 ## 7. Permissions and manifest
 
@@ -252,7 +253,7 @@ Laptop app → laptop 127.0.0.1:8081 ──adb forward (USB)──► host 127.0
 
 ## 12. Plan 2b decisions (2026-11-21)
 
-Plan 2a (USB) and Plan 2b (Wi-Fi Direct) are both implemented; `:proxy-core` has 187 tests and `:app` has 201, all green, with zero Kotlin warnings. These are the deviations and additions from real implementation and real-device testing, superseding the sections above where they conflict.
+Plan 2a (USB) and Plan 2b (Wi-Fi Direct) are both implemented; `:proxy-core` has 214 tests and `:app` has 249, all green, with zero Kotlin warnings. These are the deviations and additions from real implementation and real-device testing, superseding the sections above where they conflict.
 
 1. **No `Failed` phase.** A link that needs the user (firmware ignored the SSID or password, Wi-Fi Direct unsupported, a missing permission, 10 consecutive failures) shows as `Degraded` with that reason, and stops retrying. USB sharing keeps working. The user fixes the problem and restarts sharing.
 2. **Wi-Fi Direct runs only when credentials are set.** A session with no password is USB-only; start is refused only when there is neither USB sharing nor a password. §4's "first session can't start without a password" predates USB.

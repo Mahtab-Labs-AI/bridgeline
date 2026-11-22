@@ -1,4 +1,4 @@
-Wi-Fi Proxy: Laptop kit
+Bridgeline: Laptop kit
 ========================
 
 This folder lets an offline Windows laptop share this phone's cellular data
@@ -20,11 +20,11 @@ How to use it
 -------------
 1. Plug the phone into this laptop with a USB cable.
 2. On the phone, choose "File transfer" (MTP) for the USB connection, if asked.
-3. Copy this whole "WiFiProxy-LaptopKit" folder from the phone to anywhere on
+3. Copy this whole "Bridgeline-LaptopKit" folder from the phone to anywhere on
    the laptop (the Desktop is fine).
 4. On the phone, turn on USB debugging (Settings > Developer options) and
    accept the "Allow USB debugging?" prompt when it appears.
-5. On the phone, start "USB sharing" in the Wi-Fi Proxy app.
+5. On the phone, start "USB sharing" in the Bridgeline app.
 6. On the laptop, double-click connect-usb.cmd in the copied folder. It finds
    the bundled adb.exe automatically, and points this laptop's system proxy at
    the phone for the rest of the session. Press Enter in its window when

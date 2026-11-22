@@ -1,10 +1,59 @@
+import org.gradle.api.provider.ValueSourceParameters
+import org.gradle.process.ExecOperations
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+import java.io.ByteArrayOutputStream
+import javax.inject.Inject
 
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
 }
+
+// --- Version (brand-version brief section A) ------------------------------------------------
+//
+// major/minor/patch come from version.properties at the repo root (bumped by hand per release);
+// BUILD is the commit count, auto-counted and identical locally and on CI. Read via
+// providers.fileContents/ValueSource (not plain java.io at configuration time) so both stay
+// configuration-cache compatible. If the configuration cache is ever enabled, Gradle re-runs a
+// ValueSource like GitCommitCountSource on every build to fingerprint the cached entry and
+// invalidates it when the value changes. So a new commit can't leave a stale BUILD or versionCode
+// in the APK. Keep this as a ValueSource; don't move the git call into a plain configuration-time
+// exec.
+abstract class GitCommitCountSource : org.gradle.api.provider.ValueSource<Int, ValueSourceParameters.None> {
+    @get:Inject
+    abstract val execOperations: ExecOperations
+
+    override fun obtain(): Int = try {
+        val output = ByteArrayOutputStream()
+        execOperations.exec {
+            commandLine("git", "rev-list", "--count", "HEAD")
+            standardOutput = output
+            isIgnoreExitValue = true
+        }
+        output.toString().trim().toIntOrNull() ?: 0
+    } catch (e: Exception) {
+        // No git on PATH, not a git checkout, etc: fall back rather than fail the build.
+        0
+    }
+}
+
+val versionPropsMap = providers.fileContents(
+    rootProject.layout.projectDirectory.file("version.properties"),
+).asText.orElse("major=0\nminor=0\npatch=0\n").map { text ->
+    text.lineSequence()
+        .map { it.trim() }
+        .filter { it.isNotEmpty() && !it.startsWith("#") && it.contains("=") }
+        .associate { line ->
+            val (key, value) = line.split("=", limit = 2)
+            key.trim() to value.trim()
+        }
+}
+val gitBuildNumber: Int = providers.of(GitCommitCountSource::class) {}.get()
+val verMajor = versionPropsMap.map { it["major"]?.toIntOrNull() ?: 0 }.get()
+val verMinor = versionPropsMap.map { it["minor"]?.toIntOrNull() ?: 0 }.get()
+val verPatch = versionPropsMap.map { it["patch"]?.toIntOrNull() ?: 0 }.get()
+val appVersionName = "$verMajor.$verMinor.$verPatch.$gitBuildNumber"
 
 // --- Laptop kit assets (design spec section 8a / plan Task 7) ----------------------------------
 //
@@ -42,8 +91,11 @@ android {
         applicationId = "com.wifiproxy.app"
         minSdk = 29
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1-mockup"
+        // versionCode must only increase between releases: the commit count does, since commits
+        // are never removed from develop/main history. Android requires versionCode >= 1, so the
+        // (git-unavailable) fallback of 0 is floored here, not in appVersionName/BUILD itself.
+        versionCode = gitBuildNumber.coerceAtLeast(1)
+        versionName = appVersionName
     }
 
     buildTypes {
@@ -54,6 +106,7 @@ android {
 
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 
     compileOptions {

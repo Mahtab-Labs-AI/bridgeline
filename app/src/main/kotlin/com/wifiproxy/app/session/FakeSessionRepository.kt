@@ -1,5 +1,7 @@
 package com.wifiproxy.app.session
 
+import com.wifiproxy.app.logs.VerbosePrefs
+import com.wifiproxy.app.logs.VerboseSwitch
 import java.security.SecureRandom
 import java.util.Base64
 import kotlinx.coroutines.CoroutineScope
@@ -60,6 +62,23 @@ class FakeSessionRepository(
         _requireDeviceCodes.value = value
     }
 
+    // The demo only shows the verbose switch (and its 30-minute auto-off): nothing is persisted
+    // and no extra log lines appear.
+    private val verbose = VerboseSwitch(
+        prefs = object : VerbosePrefs {
+            override var verboseUntilMs = 0L
+            override var verboseVersionCode = 0
+        },
+        versionCode = 0,
+        clock = now,
+        scope = repositoryScope,
+    )
+    override val verboseUntilMs: StateFlow<Long> = verbose.untilMs
+
+    override fun setVerboseLogging(on: Boolean) {
+        if (on) verbose.enable() else verbose.disable()
+    }
+
     private val _checks = MutableStateFlow(
         listOf(
             SetupCheck(
@@ -79,12 +98,12 @@ class FakeSessionRepository(
             ),
             SetupCheck(
                 title = "Battery optimisation",
-                detail = "Exempt Wi-Fi Proxy from battery optimisation so Android doesn't kill it in the background.",
+                detail = "Exempt Bridgeline from battery optimisation so Android doesn't kill it in the background.",
                 status = CheckStatus.ACTION_NEEDED,
             ),
             SetupCheck(
                 title = "Samsung: Never sleeping apps",
-                detail = "Add Wi-Fi Proxy to Never sleeping apps in Device care so One UI doesn't freeze it.",
+                detail = "Add Bridgeline to Never sleeping apps in Device care so One UI doesn't freeze it.",
                 status = CheckStatus.ACTION_NEEDED,
             ),
         ),

@@ -37,8 +37,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.wifiproxy.app.BuildConfig
+import com.wifiproxy.app.logs.formatClockTime
+import com.wifiproxy.app.logs.rememberVerboseActive
 import com.wifiproxy.app.service.SessionHolder
 import com.wifiproxy.app.session.HostSettings
 import com.wifiproxy.app.session.PasswordStrength
@@ -260,6 +264,41 @@ fun SettingsScreen(
         }
 
         Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            // Off by default and only ever turned on here; it turns itself off after 30 minutes.
+            // Unlike the switches above it applies at once, also while sharing.
+            val verboseUntil by repository.verboseUntilMs.collectAsStateWithLifecycle()
+            val verboseOn = rememberVerboseActive(verboseUntil)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = "Verbose logging (troubleshooting)",
+                    style = MaterialTheme.typography.titleMedium,
+                    modifier = Modifier.weight(1f),
+                )
+                Switch(
+                    checked = verboseOn,
+                    onCheckedChange = { repository.setVerboseLogging(it) },
+                )
+            }
+            Text(
+                text = "Adds per-connection detail to Logs (device IP, port, errors; never website names). " +
+                    "Turns itself off after 30 minutes.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            if (verboseOn) {
+                Text(
+                    text = "On until ${formatClockTime(verboseUntil)}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+            }
+        }
+
+        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Text(text = "Network name", style = MaterialTheme.typography.titleMedium)
             // (E3.5) The real saved code (it is kept when the name changes), or a placeholder
             // until the first save picks one.
@@ -438,6 +477,14 @@ fun SettingsScreen(
                 color = MaterialTheme.colorScheme.primary,
             )
         }
+
+        Text(
+            text = "Bridgeline ${BuildConfig.VERSION_NAME}",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.fillMaxWidth(),
+            textAlign = TextAlign.Center,
+        )
     }
 
     if (pendingPasswordConfirm) {

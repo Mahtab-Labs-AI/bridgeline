@@ -590,7 +590,7 @@ private fun LaptopUsbCard(slot: SlotUi?) {
 
 /**
  * "Prepare laptop kit" (design spec §8a "Offline laptops: the Laptop kit" / plan Task 7): downloads
- * a verified `platform-tools` plus the bundled scripts to this phone's `Download/WiFiProxy-LaptopKit/`,
+ * a verified `platform-tools` plus the bundled scripts to this phone's `Download/Bridgeline-LaptopKit/`,
  * for a laptop with no internet of its own. Independent of demo/real mode and of the "Laptop (USB)"
  * slot above - it's a real download either way, so it's shown in both [DemoDevicesContent] and
  * [RealDevicesContent].

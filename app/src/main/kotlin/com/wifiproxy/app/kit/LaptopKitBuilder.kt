@@ -25,7 +25,7 @@ private const val KEY_MEDIASTORE_IDS = "mediastore_ids"
 private const val REPO_BASE_URL = "https://dl.google.com/android/repository/"
 private const val INDEX_PRIMARY = "repository2-3.xml"
 private const val INDEX_FALLBACK = "repository2-1.xml"
-private const val KIT_RELATIVE_ROOT = "Download/WiFiProxy-LaptopKit"
+private const val KIT_RELATIVE_ROOT = "Download/Bridgeline-LaptopKit"
 private const val ASSETS_DIR = "laptop-kit"
 
 private const val CONNECT_TIMEOUT_MS = 15_000
@@ -37,7 +37,7 @@ private val BUNDLED_ASSET_FILES = listOf("connect-usb.ps1", "connect-usb.cmd", "
 /**
  * Builds the offline "Laptop kit" (design spec §8a, plan Task 7): fetches Google's SDK repository
  * index, downloads and verifies the stable Windows `platform-tools` archive, extracts it, and
- * writes it plus the bundled laptop scripts to `Download/WiFiProxy-LaptopKit/` via
+ * writes it plus the bundled laptop scripts to `Download/Bridgeline-LaptopKit/` via
  * `MediaStore.Downloads` - so a laptop with no internet of its own can get `adb` and the sharing
  * scripts over a USB **File transfer** copy.
  *
@@ -82,7 +82,7 @@ class LaptopKitBuilder(private val context: Context) {
             pendingUri = null
             persistIds(writtenIds)
 
-            val message = "Ready in Download/WiFiProxy-LaptopKit - copy it to the laptop over USB File transfer."
+            val message = "Ready in Download/Bridgeline-LaptopKit - copy it to the laptop over USB File transfer."
             progress(KitProgress.Ready(message))
             KitResult.Success(platformToolsCount + assetCount)
         } catch (e: CancellationException) {
@@ -176,7 +176,7 @@ class LaptopKitBuilder(private val context: Context) {
     // --- Extraction / MediaStore write ------------------------------------------------------------
 
     /** Extracts every file entry of [zipBytes] (a `platform-tools_*.zip` from the Android SDK
-     *  repository) to `Download/WiFiProxy-LaptopKit/<entry path>` via MediaStore, appending each
+     *  repository) to `Download/Bridgeline-LaptopKit/<entry path>` via MediaStore, appending each
      *  written row's id to [writtenIds]. Refuses the whole kit (throws) on a zip-slip entry,
      *  rather than silently dropping just that one file. */
     private suspend fun extractPlatformTools(
@@ -216,7 +216,7 @@ class LaptopKitBuilder(private val context: Context) {
         return count
     }
 
-    /** Writes [input] to `Download/WiFiProxy-LaptopKit/<segments>` via `MediaStore.Downloads`,
+    /** Writes [input] to `Download/Bridgeline-LaptopKit/<segments>` via `MediaStore.Downloads`,
      *  using the `IS_PENDING` dance so the file never appears half-written to other apps. Returns
      *  the inserted row's id. */
     private fun writeToDownloads(segments: List<String>, input: InputStream, onPending: (Uri?) -> Unit): Long {

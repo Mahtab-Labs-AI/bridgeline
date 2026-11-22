@@ -19,6 +19,7 @@ import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import androidx.core.location.LocationManagerCompat
 import androidx.core.net.toUri
+import com.wifiproxy.app.logs.VerboseLog
 import com.wifiproxy.app.service.ProxySessionService
 import com.wifiproxy.app.service.SessionHolder
 import com.wifiproxy.app.service.SessionController
@@ -180,7 +181,7 @@ class ServiceSessionRepository(
         watchVpn()
     }
 
-    /** Only VPNs that apply to this app are reported to it, so one that excludes Wi-Fi Proxy
+    /** Only VPNs that apply to this app are reported to it, so one that excludes Bridgeline
      *  (split tunnelling) never warns. Unregistered when [repositoryJob] ends - by [close], or by
      *  the activity scope it is a child of - so a recreated activity never leaks a callback. */
     private fun watchVpn() {
@@ -208,8 +209,18 @@ class ServiceSessionRepository(
         val active = vpnNetworks.isNotEmpty()
         if (_vpnActive.value != active) {
             _vpnActive.value = active
+            SessionHolder.controller.value?.logVerbose(
+                if (active) "VPN active (${vpnNetworks.size} VPN network(s) apply to this app)" else "VPN gone",
+            )
             requestChecks()
         }
+    }
+
+    private val verbose = VerboseLog.get(context)
+    override val verboseUntilMs: StateFlow<Long> = verbose.untilMs
+
+    override fun setVerboseLogging(on: Boolean) {
+        if (on) verbose.enable() else verbose.disable()
     }
 
     /**
@@ -601,7 +612,7 @@ class ServiceSessionRepository(
         val vpn = _vpnActive.value
         return SetupCheck(
             title = "No VPN active",
-            detail = "A VPN on this phone stops Wi-Fi Direct devices getting replies. Exclude Wi-Fi Proxy " +
+            detail = "A VPN on this phone stops Wi-Fi Direct devices getting replies. Exclude Bridgeline " +
                 "in your VPN app (split tunnelling) or turn the VPN off.",
             status = if (vpn) CheckStatus.ACTION_NEEDED else CheckStatus.OK,
             fixIntent = if (vpn) Intent(Settings.ACTION_VPN_SETTINGS) else null,
@@ -623,7 +634,7 @@ class ServiceSessionRepository(
         val exempt = powerManager?.isIgnoringBatteryOptimizations(context.packageName) == true
         return SetupCheck(
             title = "Battery optimisation",
-            detail = "Exempt Wi-Fi Proxy from battery optimisation so Android doesn't kill it in the background.",
+            detail = "Exempt Bridgeline from battery optimisation so Android doesn't kill it in the background.",
             status = if (exempt) CheckStatus.OK else CheckStatus.ACTION_NEEDED,
             fixIntent = if (exempt) {
                 null

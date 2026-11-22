@@ -17,7 +17,9 @@ import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.wifiproxy.app.MainActivity
+import com.wifiproxy.app.R
 import com.wifiproxy.app.egress.CellularEgress
+import com.wifiproxy.app.logs.VerboseLog
 import com.wifiproxy.app.session.SessionPhase
 import com.wifiproxy.app.settings.AppPreferences
 import com.wifiproxy.app.settings.HostConfigSource
@@ -37,6 +39,7 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import java.util.concurrent.atomic.AtomicReference
 
 private const val CHANNEL_ID = "usb_sharing"
 private const val NOTIFICATION_ID = 1
@@ -241,7 +244,7 @@ class ProxySessionService : Service() {
 
     private fun postStoppedNotification() {
         val notification = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.stat_sys_upload)
+            .setSmallIcon(R.drawable.ic_stat_bridgeline)
             .setContentTitle("Sharing stopped")
             .setContentText("Sharing stopped. Tap to resume.")
             .setContentIntent(openAppIntent())
@@ -256,18 +259,26 @@ class ProxySessionService : Service() {
         // would otherwise be eligible for GC, so building it from the Service context (implicitly
         // keeping the Service alive) risks retaining a destroyed service.
         val connectivityManager = applicationContext.getSystemService(ConnectivityManager::class.java)
-        val egress = CellularEgress(connectivityManager)
+        // The egress and the link are built before the controller whose log their verbose lines
+        // go to; set right below, before anything can call it (nothing runs until start()).
+        val verboseSink = AtomicReference<SessionController?>(null)
+        val debug: (String) -> Unit = { verboseSink.get()?.logVerbose(it) }
+        val egress = CellularEgress(connectivityManager, debug)
         // On Main (onStartCommand): AndroidP2pApi registers its broadcast receiver and opens its
         // WifiP2pManager channel on the main looper. applicationContext too (R6).
         val api = AndroidP2pApi(applicationContext).also { p2pApi = it }
+        // Process-wide; its first use (re-)arms the 30-minute auto-off.
+        val verbose = VerboseLog.get(applicationContext)
         val newController = SessionController(
             egress = egress,
-            link = P2pGroupLink(api, serviceScope, Build.MODEL),
+            link = P2pGroupLink(api, serviceScope, Build.MODEL, debug = debug),
             slots = SlotStore(HostConfigSource.secureStore(applicationContext)),
             // Read once per start, on `serial` (it decrypts the credentials), never on Main.
             config = hostConfig::sessionConfig,
             scope = serviceScope,
+            verbose = verbose::isActive,
         )
+        verboseSink.set(newController)
         // (C1) Set before this controller's start() is ever called: see the kdoc on
         // SessionController.onIdle for why this must be a direct callback, not something this
         // service subscribes to by collecting controller.state.
@@ -523,7 +534,7 @@ class ProxySessionService : Service() {
             ),
         )
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.stat_sys_upload)
+            .setSmallIcon(R.drawable.ic_stat_bridgeline)
             .setContentTitle("Sharing mobile data")
             .setContentText(contentText)
             .setContentIntent(openAppIntent())

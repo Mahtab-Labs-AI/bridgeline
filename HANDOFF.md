@@ -18,16 +18,21 @@ An Android app that shares a phone's **cellular data** with other devices **with
 | `README.md` | Build instructions, `:proxy-core` rules, and the **"Handoff notes for Plan 2"**, which are binding contracts for the Android layer |
 | `tools/usb-client/README.md` | Laptop-side usage (Windows script, macOS/Linux manual steps) |
 
-## Branches (no remote; there is a git bundle)
-`main` contains Plans 1, 2a (USB) and 2b (Wi-Fi Direct, including open admission and on-demand idle
-seat eviction), merged from `feature/wifi-direct` and `feature/idle-seat-eviction`. There is no open
-branch. Start new work on a branch off `main`. The backup is the newest git bundle in the handoff
-folder (`android-wifi-proxy-2026-11-21b.bundle`).
+## Repository and branches
+- **GitHub:** private repo `Mahtab-Labs-AI/bridgeline` (the project's public name), remote `origin`.
+- **`main`:** the stable, tested line. It contains Plans 1, 2a (USB) and 2b (Wi-Fi Direct, including open admission and on-demand idle seat eviction). It is **protected** by the `protect-main` ruleset: changes arrive only by pull request, with no force-push and no deletion.
+- **`develop`:** the integration branch.
+- **Flow:**
+  1. Branch features off `develop`, then merge them into `develop`.
+  2. Build and test on phones from `develop`.
+  3. When it's good, open a PR from `develop` to `main` and merge it.
+- **Old feature branches** (`feature/*`) are kept for history.
+- **Offline backup:** the newest git bundle in the handoff folder (`android-wifi-proxy-2026-11-21b.bundle`).
 
 ## State
-- **`:proxy-core`** (pure Kotlin/JVM, **187 tests**): the slot registry with pinned slots and unpersisted per-IP auto slots for open admission, a strict parser, PAC/mobileconfig/probes (including the fixed `/proxy.pac` and `/proxy.mobileconfig` paths), a post-DNS destination filter, a happy-eyeballs dialer, the NIO selector loop, a per-direction tunnel failure policy, and a ProxyServer with pre-admission caps and per-run state.
+- **`:proxy-core`** (pure Kotlin/JVM, **214 tests**): the slot registry with pinned slots and unpersisted per-IP auto slots for open admission, a strict parser, PAC/mobileconfig/probes (including the fixed `/proxy.pac` and `/proxy.mobileconfig` paths), a post-DNS destination filter, a happy-eyeballs dialer, the NIO selector loop, a per-direction tunnel failure policy, and a ProxyServer with pre-admission caps and per-run state.
   - **Idle seat eviction (on demand):** under open admission, a full registry evicts (through `ProxyServer.revoke`) the least-recently-active auto slot idle for at least `idleSeatMs` (`ProxyConfig.DEFAULT_IDLE_SEAT_MS`, 3 minutes) before retrying admission once, on the manual-proxy path and through `LocalContent`'s injected `admit` function (fixed paths and the token-path fallback alike). Pinned and coded slots are never candidates; nothing is evicted while there's room, and there's no background sweeper. The slow (eviction) path is serialized through its own lock, re-trying the fast admission inside it first, so a burst of connections from one newcomer can't evict more than one victim. `ProxyServer.onEvicted` surfaces each eviction to the app for diagnostics.
-- **`:app`** (Compose, minSdk 29, targetSdk/compileSdk **36**, **201 tests**):
+- **`:app`** (Compose, minSdk 29, targetSdk/compileSdk **36**, **249 tests**):
   - Demo mode (fake data) versus real mode;
   - `CellularEgress` (DnsResolver, bindSocket);
   - `SessionController` (renamed from `UsbSessionController`), running USB and Wi-Fi Direct listeners side by side, plus a foreground service with a serialized lifecycle and `START_STICKY` restart;

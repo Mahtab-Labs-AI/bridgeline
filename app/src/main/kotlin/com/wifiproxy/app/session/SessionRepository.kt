@@ -7,6 +7,7 @@ import kotlinx.coroutines.flow.asStateFlow
 
 private val ALWAYS_ALLOWED: StateFlow<Boolean?> = MutableStateFlow<Boolean?>(true).asStateFlow()
 private val ALWAYS_READY: StateFlow<SettingsStatus> = MutableStateFlow(SettingsStatus.READY).asStateFlow()
+private val ALWAYS_OFF: StateFlow<Long> = MutableStateFlow(0L).asStateFlow()
 
 /** See [SessionRepository.settingsStatus]. */
 enum class SettingsStatus { LOADING, READY, UNREADABLE }
@@ -170,6 +171,14 @@ interface SessionRepository {
     val requireDeviceCodes: StateFlow<Boolean>
 
     fun setRequireDeviceCodes(value: Boolean)
+
+    /** "Verbose logging (troubleshooting)": when it turns itself off, or 0 while it is off (the
+     *  default). Always 0 unless the user switched it on. */
+    val verboseUntilMs: StateFlow<Long> get() = ALWAYS_OFF
+
+    /** Switches verbose logging on for 30 minutes, or off early. Takes effect at once, also
+     *  mid-session. The fake only shows the switch: it logs nothing extra. */
+    fun setVerboseLogging(on: Boolean) {}
 
     /** [usbSwitchAllowed]'s current value; false while it is still unknown. */
     fun canEnableUsb(): Boolean = usbSwitchAllowed.value == true

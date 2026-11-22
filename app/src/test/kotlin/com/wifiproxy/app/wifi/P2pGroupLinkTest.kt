@@ -663,4 +663,45 @@ class P2pGroupLinkTest {
         )
         assertEquals(1, api.requests.size)
     }
+
+    @Test
+    fun `debug lines cover the create result codes, the 5 GHz fallback and the group-info wait`() = runTest {
+        val api = FakeP2pApi().apply { results += CreateResult.Failure(CreateResult.ERROR) }
+        val lines = mutableListOf<String>()
+        val link = P2pGroupLink(api, backgroundScope, deviceModel = "Pixel 11", debug = { lines += it })
+        link.start(LinkConfig(CREDS, prefer5Ghz = true))
+        runCurrent()
+        assertIs<LinkState.Up>(link.state.value)
+        assertEquals("createGroup(GHZ_5): failure, reason 0", lines[0])
+        assertEquals("5 GHz create failed; falling back to AUTO", lines[1])
+        assertEquals("createGroup(AUTO): success", lines[2])
+        assertTrue(lines[3].matches(Regex("group info after \\d+ ms")), lines[3])
+        assertEquals("group up at AUTO (owner 192.168.49.1)", lines[4])
+        // Never the Wi-Fi name or password.
+        assertTrue(lines.none { CREDS.ssid in it || CREDS.password in it }, lines.toString())
+    }
+
+    @Test
+    fun `debug lines say when a group is adopted and when it is lost`() = runTest {
+        val api = FakeP2pApi().apply { group = GroupInfo(CREDS.ssid, CREDS.password, OWNER) }
+        val lines = mutableListOf<String>()
+        val link = P2pGroupLink(api, backgroundScope, deviceModel = "Pixel 11", debug = { lines += it })
+        link.start(LinkConfig(CREDS, prefer5Ghz = false))
+        runCurrent()
+        assertEquals(listOf("adopting the existing group (owner 192.168.49.1)"), lines)
+        api.loseGroup()
+        runCurrent()
+        assertTrue("group lost" in lines, lines.toString())
+    }
+
+    @Test
+    fun `a throwing debug callback changes nothing`() = runTest {
+        val api = FakeP2pApi()
+        val link = P2pGroupLink(api, backgroundScope, deviceModel = "Pixel 11", debug = { throw IllegalStateException("boom") })
+        link.start(LinkConfig(CREDS, prefer5Ghz = true))
+        runCurrent()
+        assertEquals(LinkState.Up(OWNER, CREDS), link.state.value)
+        link.stop()
+        assertEquals(LinkState.Idle, link.state.value)
+    }
 }

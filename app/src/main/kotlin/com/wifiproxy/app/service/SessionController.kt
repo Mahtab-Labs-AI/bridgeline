@@ -1,6 +1,12 @@
 package com.wifiproxy.app.service
 
 import com.wifiproxy.app.egress.SessionEgress
+import com.wifiproxy.app.logs.VERBOSE_AUTO_OFF_MESSAGE
+import com.wifiproxy.app.logs.VERBOSE_PREFIX
+import com.wifiproxy.app.logs.VerboseRateLimiter
+import com.wifiproxy.app.logs.describeLink
+import com.wifiproxy.app.logs.formatProxyEvent
+import com.wifiproxy.app.logs.withSuppressed
 import com.wifiproxy.app.session.ClientPlatform
 import com.wifiproxy.app.session.LogEntry
 import com.wifiproxy.app.session.SessionPhase
@@ -11,6 +17,7 @@ import com.wifiproxy.app.wifi.PersistedSlot
 import com.wifiproxy.app.wifi.REASON_CREATING
 import com.wifiproxy.app.wifi.SlotPersistence
 import com.wifiproxy.core.ProxyConfig
+import com.wifiproxy.core.ProxyEvent
 import com.wifiproxy.core.ProxyServer
 import com.wifiproxy.core.clients.ClientRegistry
 import com.wifiproxy.core.clients.Slot
@@ -36,6 +43,9 @@ import java.net.InetAddress
 import java.util.concurrent.ConcurrentHashMap
 
 private const val LOG_CAPACITY = 500
+
+/** While verbose logging is on; trimmed back to [LOG_CAPACITY] when it turns off. */
+private const val VERBOSE_LOG_CAPACITY = 3000
 private const val PINNED_SLOT_NAME = "Laptop (USB)"
 private const val DEFAULT_WATCHDOG_INTERVAL_MS = 30_000L
 private const val DEFAULT_PORT = 8081
@@ -61,6 +71,17 @@ data class SessionConfig(
      *  the USB listener, which only ever admits its pinned laptop. */
     val requireDeviceCodes: Boolean = false,
 )
+
+/** [entries] plus [entry], keeping the newest [capacity]: one copy of what is kept, instead of
+ *  copying everything (`+`) and then the tail again (`takeLast`) - this runs per verbose line,
+ *  with up to 3000 entries. */
+internal fun <T> appendCapped(entries: List<T>, entry: T, capacity: Int): List<T> {
+    val keep = minOf(entries.size, capacity - 1).coerceAtLeast(0)
+    val out = ArrayList<T>(keep + 1)
+    for (i in entries.size - keep until entries.size) out.add(entries[i])
+    out.add(entry)
+    return out
+}
 
 /** See [SessionController.wifiEndpoint]. */
 data class WifiEndpoint(val group: LinkState.Up, val port: Int)
@@ -100,11 +121,14 @@ fun interface SessionServerFactory {
         /** `ProxyServer.onEvicted` (Diagnostics): fires whenever open admission frees an idle
          *  auto slot's seat for a newcomer. No slot id, name or address - just that it happened. */
         onEvicted: () -> Unit,
+        /** `ProxyServer.onEvent` (verbose Diagnostics): per-connection detail, never a hostname,
+         *  path, token or destination address. */
+        onEvent: (ProxyEvent) -> Unit,
     ): SessionServer
 }
 
-private val defaultServerFactory = SessionServerFactory { config, registry, egress, filter, onError, onEvicted ->
-    RealSessionServer(ProxyServer(config, registry, egress, filter, onError, onEvicted))
+private val defaultServerFactory = SessionServerFactory { config, registry, egress, filter, onError, onEvicted, onEvent ->
+    RealSessionServer(ProxyServer(config, registry, egress, filter, onError, onEvicted, onEvent))
 }
 
 /** Raised internally when [SessionController] notices, after a blocking/suspending start step,
@@ -141,6 +165,11 @@ private class StartInterruptedByStopException : Exception()
  * between suspension points, so [doStart] (including its rollback), [doStop] and [shutdown] also
  * hold [lifecycle] for their whole run: a queued `doStop` can never run in the middle of a
  * suspended rollback (and tear down twice, or kill the session a rollback's `onIdle` restarted).
+ *
+ * **Verbose logging:** [verbose] is asked on every verbose line ([logVerbose], each
+ * `ProxyServer.onEvent`), so switching it on or off - including its 30-minute auto-off - applies
+ * at once, mid-session. Verbose lines are prefixed [VERBOSE_PREFIX]; like every other line they
+ * go through the lock-free [appendLog], so they never block (or throw into) the data path.
  */
 class SessionController(
     private val egress: SessionEgress,
@@ -153,6 +182,9 @@ class SessionController(
     private val now: () -> Long = System::currentTimeMillis,
     private val scope: CoroutineScope,
     private val watchdogIntervalMs: Long = DEFAULT_WATCHDOG_INTERVAL_MS,
+    /** Whether verbose lines are logged right now; checked per line, from any thread. Must be
+     *  cheap and must not block. */
+    private val verbose: () -> Boolean = { false },
 ) {
     private val _state = MutableStateFlow(SessionPhase.IDLE)
     val state: StateFlow<SessionPhase> = _state.asStateFlow()
@@ -323,7 +355,9 @@ class SessionController(
                     val usbConfig = ProxyConfig(bindAddress = usbBindAddress, port = usbPort, peerSubnet = USB_PEER_SUBNET)
                     // usbConfig never sets openAdmission, so this listener can never evict: a
                     // no-op, not ::logEviction, keeps that true in the code, not just in practice.
-                    val newServer = serverFactory.create(usbConfig, registry, egress, buildFilter(), ::onServerError) {}
+                    val newServer = serverFactory.create(
+                        usbConfig, registry, egress, buildFilter("USB listener start"), ::onServerError, {}, ::onProxyEvent,
+                    )
                     usb = newServer
                     newServer.start()
                     checkNotInterruptedByStop()
@@ -418,11 +452,12 @@ class SessionController(
         networkGenerationJob?.cancel()
         networkGenerationJob = scope.launch {
             var first = true
-            egress.networkGeneration.collect {
+            egress.networkGeneration.collect { generation ->
                 if (first) {
                     first = false
                     return@collect
                 }
+                logVerbose("cellular network generation $generation")
                 rebuildForNetworkChange()
             }
         }
@@ -434,6 +469,7 @@ class SessionController(
         linkJob?.cancel()
         linkJob = scope.launch {
             link.state.collect { state ->
+                logVerbose("Wi-Fi Direct link ${describeLink(state)}")
                 onLinkState(state)
                 refreshHealth()
             }
@@ -449,7 +485,7 @@ class SessionController(
         try {
             for (server in servers) {
                 server.stop()
-                server.updateFilter(buildFilter())
+                server.updateFilter(buildFilter("network change"))
                 server.start()
             }
         } catch (e: Exception) {
@@ -538,7 +574,9 @@ class SessionController(
         )
         var server: SessionServer? = null
         try {
-            val newServer = serverFactory.create(proxyConfig, registry, egress, buildFilter(), ::onServerError, ::logEviction)
+            val newServer = serverFactory.create(
+                proxyConfig, registry, egress, buildFilter("Wi-Fi listener start"), ::onServerError, ::logEviction, ::onProxyEvent,
+            )
             server = newServer
             newServer.start()
             wifiServer = newServer
@@ -569,14 +607,18 @@ class SessionController(
         scope.launch {
             val servers = listOfNotNull(usbServer, wifiServer)
             if (servers.isEmpty()) return@launch
-            val filter = buildFilter()
+            val filter = buildFilter("cellular link properties changed")
             servers.forEach { it.updateFilter(filter) }
         }
     }
 
-    private fun buildFilter(): DestinationFilter {
+    /** [reason] is only for the verbose log line. That line counts the host's own addresses but
+     *  never prints them: they include the phone's cellular address. */
+    private fun buildFilter(reason: String): DestinationFilter {
         val subnet = (link.state.value as? LinkState.Up)?.let { subnetOf(it.ownerAddress) } ?: DEFAULT_WIFI_DIRECT_SUBNET
-        return DestinationFilter.default(subnet, egress.hostAddresses())
+        val hostAddresses = egress.hostAddresses()
+        logVerbose("destination filter rebuilt ($reason): group subnet $subnet, ${hostAddresses.size} host addresses")
+        return DestinationFilter.default(subnet, hostAddresses)
     }
 
     private fun subnetOf(owner: Inet4Address): Cidr =
@@ -733,6 +775,7 @@ class SessionController(
                 DestinationFilter.default(DEFAULT_WIFI_DIRECT_SUBNET),
                 onError = {},
                 onEvicted = {},
+                onEvent = {},
             )
         val revoked = server.revoke(slotId)
         if (revoked) {
@@ -792,7 +835,7 @@ class SessionController(
         val usb = usbServer
         val wifi = wifiServer
         if (usb != null || wifi != null) {
-            val filter = buildFilter()
+            val filter = buildFilter("watchdog")
             usb?.updateFilter(filter)
             wifi?.updateFilter(filter)
         }
@@ -800,6 +843,10 @@ class SessionController(
         val up = link.state.value as? LinkState.Up
         if (up != null && (wifi == null || !wifi.isAccepting)) {
             appendLog("Watchdog: rebuilding the Wi-Fi listener")
+            logVerbose(
+                "watchdog: Wi-Fi listener ${if (wifi == null) "missing" else "not accepting"} " +
+                    "(same group: ${wifiServerFor == up})",
+            )
             startWifiServer(up, clearBindings = wifiServerFor != up)
             // A listener that failed (or now works again) changes healthReason().
             refreshHealth()
@@ -807,6 +854,7 @@ class SessionController(
 
         if (usb != null && !usb.isAccepting) {
             appendLog("Watchdog: rebuilding the USB listener")
+            logVerbose("watchdog: USB listener not accepting")
             usb.stop()
             usb.start()
         }
@@ -840,7 +888,54 @@ class SessionController(
         appendLog("Idle device freed its seat for a new one")
     }
 
+    /** `ProxyServer.onEvent`, from either listener: on whichever thread the event happened (the
+     *  accept loop or a connection handler), never [scope]. */
+    private fun onProxyEvent(event: ProxyEvent) {
+        // TunnelClosed carries everything TunnelOpened would say, so only the close is logged.
+        if (event is ProxyEvent.TunnelOpened) return
+        if (!verbose()) return
+        // Before any formatting: a suppressed event costs only the limiter's lookup.
+        val earlier = proxyEventLimiter.admit(event.peer, event.javaClass)
+        if (earlier == VerboseRateLimiter.SUPPRESSED) return
+        appendEntry(VERBOSE_PREFIX + withSuppressed(formatProxyEvent(event), earlier), VERBOSE_LOG_CAPACITY)
+    }
+
+    /** 10 lines per (peer, event type) and 100 in total per second, for [onProxyEvent] only. */
+    private val proxyEventLimiter = VerboseRateLimiter(clock = now)
+
+    /**
+     * Appends `[v] message` while [verbose] is on, else does nothing. For internal detail from
+     * this controller and from the link, the egress and the repository (link transitions, group
+     * creation attempts, network changes, VPN changes). Thread-safe and non-blocking, and never
+     * throws: a diagnostics line must never break what it describes. [message] must follow spec
+     * §6: no hostnames, URLs, tokens, Wi-Fi name or password, or destination addresses.
+     */
+    fun logVerbose(message: String) {
+        runCatching {
+            if (verbose()) appendEntry(VERBOSE_PREFIX + message, VERBOSE_LOG_CAPACITY)
+        }
+    }
+
+    /** Verbose logging just turned off: says how many proxy-event lines the rate limit still held
+     *  back (and forgets its counts), trims the log back to [LOG_CAPACITY] newest entries and, for
+     *  the 30-minute auto-off ([autoOff]), says so in one plain line. Any thread. */
+    fun onVerboseEnded(autoOff: Boolean) {
+        val suppressed = proxyEventLimiter.drain()
+        val time = now()
+        val tail = buildList {
+            if (suppressed > 0) add(LogEntry(time, "$VERBOSE_PREFIX$suppressed more lines suppressed by the rate limit"))
+            if (autoOff) add(LogEntry(time, VERBOSE_AUTO_OFF_MESSAGE))
+        }
+        _log.update { entries -> (entries + tail).takeLast(LOG_CAPACITY) }
+    }
+
     private fun appendLog(message: String) {
-        _log.update { (it + LogEntry(now(), message)).takeLast(LOG_CAPACITY) }
+        appendEntry(message, if (verbose()) VERBOSE_LOG_CAPACITY else LOG_CAPACITY)
+    }
+
+    /** Lock-free: a [MutableStateFlow.update] CAS loop, safe from any thread. */
+    private fun appendEntry(message: String, capacity: Int) {
+        val entry = LogEntry(now(), message)
+        _log.update { appendCapped(it, entry, capacity) }
     }
 }
