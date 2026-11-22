@@ -4,8 +4,8 @@
 
 ## Mark
 
-Two rounded phone shapes joined by a wavy link line - the phone sharing its cellular data, and
-the other device it's sharing it with. Flat, two colours, reads at 48dp and works as an Android
+Two phones (rounded bodies with screens) tilted toward each other and joined by an arc - the
+"bridge line" from the phone sharing its cellular data to the device it's sharing it with. Flat, two colours, reads at 48dp and works as an Android
 adaptive icon (foreground + background + API 33 monochrome layer) and a status-bar icon.
 
 ## Files

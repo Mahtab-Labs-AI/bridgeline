@@ -2,12 +2,12 @@
   <title>Bridgeline</title>
   <g>
     <rect width="108" height="108" rx="20" fill="#0F6E7A" />
-    <path fill="#FFFFFF" d="M31,34 L39,34 A3,3 0 0 1 42,37 L42,71 A3,3 0 0 1 39,74 L31,74 A3,3 0 0 1 28,71
-      L28,37 A3,3 0 0 1 31,34 Z" />
-    <path fill="#FFFFFF" d="M69,34 L77,34 A3,3 0 0 1 80,37 L80,71 A3,3 0 0 1 77,74 L69,74 A3,3 0 0 1 66,71
-      L66,37 A3,3 0 0 1 69,34 Z" />
-    <path fill="none" stroke="#FFFFFF" stroke-width="4" stroke-linecap="round"
-      d="M42,54 C46,47 50,61 54,54 C58,47 62,61 66,54" />
+    <g fill="#FFFFFF" fill-rule="evenodd">
+      <path transform="rotate(-10 36 60)" d="M31.5,44 H40.5 A4.5,4.5 0 0 1 45,48.5 V71.5 A4.5,4.5 0 0 1 40.5,76 H31.5 A4.5,4.5 0 0 1 27,71.5 V48.5 A4.5,4.5 0 0 1 31.5,44 Z M30.5,48.5 V68 H41.5 V48.5 Z" />
+      <path transform="rotate(10 72 60)" d="M67.5,44 H76.5 A4.5,4.5 0 0 1 81,48.5 V71.5 A4.5,4.5 0 0 1 76.5,76 H67.5 A4.5,4.5 0 0 1 63,71.5 V48.5 A4.5,4.5 0 0 1 67.5,44 Z M66.5,48.5 V68 H77.5 V48.5 Z" />
+    </g>
+    <path d="M41,41 Q54,22 67,41" fill="none" stroke="#FFFFFF" stroke-width="4" stroke-linecap="round" />
+    <circle cx="54" cy="31.5" r="2.8" fill="#FFFFFF" />
   </g>
   <!-- Wordmark: common sans-serif fallback stack rather than paths, per the brand brief. -->
   <text x="130" y="72" font-family="Helvetica, Arial, 'Segoe UI', sans-serif" font-size="52"
