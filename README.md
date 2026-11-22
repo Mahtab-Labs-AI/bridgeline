@@ -27,7 +27,7 @@ Brand assets: `docs/brand/`.
 - **Wi-Fi Direct (open mode, the default):** start sharing, then join the host's `DIRECT-xy-…` group with its password. Any joined device can then use `http://<owner>:<port>/proxy.pac` (Automatic/Proxy Auto-Config) or the manual proxy `<owner>:<port>` directly, no PAC fetch needed first. iPhones can instead install `/proxy.mobileconfig` in Safari. "Require a code for each device" in Settings switches back to the per-device invite/token flow.
 - **USB (laptop):** turn on "USB sharing", then run `tools/usb-client/connect-usb.ps1` on the laptop (Windows). It finds `adb`, forwards `tcp:8081`, and sets the laptop's system proxy for you.
 - **VPN note:** a VPN on the host that covers this app routes the proxy's replies to Wi-Fi Direct clients into the tunnel, so those clients time out. The app warns on Home and in the Setup check. Fix by excluding this app from the VPN (split tunnelling) or turning the VPN off; it can't be fixed in-app without root.
-- **Troubleshooting:** turn on "Verbose logging (troubleshooting)" in Settings, reproduce the problem within 30 minutes (it then turns itself off), and Export the Diagnostics log; it adds per-connection detail but never website names.
+- **Troubleshooting:** turn on "Verbose logging (troubleshooting)" in Settings, reproduce the problem, and Export the Diagnostics log **before** it turns itself off after 30 minutes (turning off trims the log to the last 500 lines). It adds per-connection detail but never website names.
 
 ## Versioning and releases
 
