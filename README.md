@@ -29,6 +29,23 @@ Brand assets: `docs/brand/`.
 - **VPN note:** a VPN on the host that covers this app routes the proxy's replies to Wi-Fi Direct clients into the tunnel, so those clients time out. The app warns on Home and in the Setup check. Fix by excluding this app from the VPN (split tunnelling) or turning the VPN off; it can't be fixed in-app without root.
 - **Troubleshooting:** turn on "Verbose logging (troubleshooting)" in Settings, reproduce the problem, and Export the Diagnostics log **before** it turns itself off after 30 minutes (turning off trims the log to the last 500 lines). It adds per-connection detail but never website names.
 
+## Security and privacy
+
+Devices talk to Bridgeline as a plain HTTP proxy (`http://<owner>:<port>`), not HTTPS. Here is what that does and doesn't expose.
+
+- **The Wi-Fi link is encrypted.** The Wi-Fi Direct group (`DIRECT-xy-…`) uses WPA2 with your password, so everything sent over the air between a device and the host is encrypted. That includes the proxy traffic. Someone nearby without the password can't read it.
+- **HTTPS stays end-to-end encrypted.** For an `https://` site (almost all sites and apps), the device asks the proxy for `CONNECT site:443`, and from then on the proxy only relays encrypted bytes. TLS runs from the device all the way to the website. The proxy, the host phone and the mobile carrier can see **which site** is contacted and how much data moves, but **never the content**: passwords, pages and messages stay private.
+- **What is exposed:**
+  - Plain `http://` sites are unencrypted, as they would be on any network.
+  - Someone who already knows the Wi-Fi password can see site names in the `CONNECT` lines and the setup file (`proxy.pac`, or per-device codes in code mode). WPA2 lets a password holder who captures a device joining decrypt that device's Wi-Fi traffic. They still can't read the content of HTTPS connections.
+- **Why not an HTTPS proxy?** Android's and iOS's system proxy settings and PAC files only support a plain HTTP proxy. An encrypted connection to the proxy would work only in some browsers, and every device would have to trust a certificate from the host.
+- **Recommendations:**
+  - The Wi-Fi password is the real security boundary. Use a strong one and share it only with people you trust.
+  - Change it after sharing with someone you don't fully trust; changing it also disconnects everyone.
+  - Prefer `https://` for anything sensitive.
+- **No logging of what you browse.** Bridgeline never logs website names or URLs. The optional verbose troubleshooting log records only device IPs, ports, sizes and timings, and it turns itself off after 30 minutes.
+- **Reporting a vulnerability:** use GitHub's private vulnerability reporting (**Security → Report a vulnerability**) rather than a public issue.
+
 ## Versioning and releases
 
 Bridgeline uses **MAJOR.MINOR.PATCH.BUILD** (e.g. `1.2.3.45`):
