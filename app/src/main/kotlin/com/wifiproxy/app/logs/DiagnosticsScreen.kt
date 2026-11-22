@@ -24,6 +24,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
+import com.wifiproxy.app.BuildConfig
 import com.wifiproxy.app.session.LogEntry
 import com.wifiproxy.app.session.SessionRepository
 import com.wifiproxy.app.ui.ScreenTitle
@@ -44,7 +45,8 @@ fun DiagnosticsScreen(repository: SessionRepository, modifier: Modifier = Modifi
 
         Button(
             onClick = {
-                val shareText = newestFirst.joinToString("\n") { it.format() }
+                val header = "Bridgeline ${BuildConfig.VERSION_NAME}"
+                val shareText = (listOf(header) + newestFirst.map { it.format() }).joinToString("\n")
                 val sendIntent = Intent(Intent.ACTION_SEND).apply {
                     type = "text/plain"
                     putExtra(Intent.EXTRA_TEXT, shareText)

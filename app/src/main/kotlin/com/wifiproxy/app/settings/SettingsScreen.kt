@@ -37,8 +37,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.wifiproxy.app.BuildConfig
 import com.wifiproxy.app.service.SessionHolder
 import com.wifiproxy.app.session.HostSettings
 import com.wifiproxy.app.session.PasswordStrength
@@ -438,6 +440,14 @@ fun SettingsScreen(
                 color = MaterialTheme.colorScheme.primary,
             )
         }
+
+        Text(
+            text = "Bridgeline ${BuildConfig.VERSION_NAME}",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.fillMaxWidth(),
+            textAlign = TextAlign.Center,
+        )
     }
 
     if (pendingPasswordConfirm) {
