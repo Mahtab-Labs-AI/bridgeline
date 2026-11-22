@@ -8,14 +8,16 @@ import java.net.InetAddress
  *
  * Privacy (spec §6): an event never carries a URL, hostname, request path, slot token, Wi-Fi
  * password or destination address - only the peer (a client on the local link), the destination
- * *port*, byte counts, durations, reason codes and exception class names. Every [toString] prints
- * the peer through [InetAddress.getHostAddress], never [InetAddress.toString], which would also
- * print a hostname the address object may have cached.
+ * *port*, byte counts, durations, reason codes and exception class names. A peer outside the
+ * listener's subnet is not on the local link, so its address is never carried at all ([peer] is
+ * null). Every [toString] prints the peer through [describePeer]: [InetAddress.getHostAddress],
+ * never [InetAddress.toString], which would also print a hostname the address may have cached.
  */
 sealed interface ProxyEvent {
     /** The client this is about: its address on the local link (the Wi-Fi Direct group, or
-     *  loopback for USB). */
-    val peer: InetAddress
+     *  loopback for USB), or null for an off-link peer (outside the listener's subnet) - only
+     *  ever on a [Refused] for [RefusalReason.OUTSIDE_SUBNET] or a pre-admission cap. */
+    val peer: InetAddress?
 
     /** Why a connection got no service. One per refusal path in `ProxyServer`. */
     enum class RefusalReason {
@@ -67,55 +69,75 @@ sealed interface ProxyEvent {
 
     enum class TunnelKind { CONNECT, FORWARD }
 
+    /** Why a tunnel stopped before it could end on its own ([TunnelClosed.end] is null then). */
+    enum class TunnelAbort {
+        /** Revoked (including an idle-seat eviction) or the server stopped. */
+        CANCELLED,
+
+        /** An I/O error outside the pumps, e.g. writing the 200 or the request head. */
+        IO_ERROR,
+
+        /** Anything else: a bug, reported through `onError` too. */
+        ERROR,
+    }
+
     /** Mirrors the 502/503/504 a client gets: [DNS] and [CONNECT_REFUSED] are 502, [NO_EGRESS] is
      *  503, [TIMEOUT] (resolve or connect) is 504. */
     enum class UpstreamFailure { DNS, CONNECT_REFUSED, TIMEOUT, NO_EGRESS }
 
-    class Refused(override val peer: InetAddress, val reason: RefusalReason) : ProxyEvent {
-        override fun toString() = "Refused(peer=${peer.hostAddress}, reason=$reason)"
+    class Refused(override val peer: InetAddress?, val reason: RefusalReason) : ProxyEvent {
+        override fun toString() = "Refused(peer=${describePeer(peer)}, reason=$reason)"
     }
 
-    class LocalServed(override val peer: InetAddress, val kind: LocalKind) : ProxyEvent {
-        override fun toString() = "LocalServed(peer=${peer.hostAddress}, kind=$kind)"
+    class LocalServed(override val peer: InetAddress?, val kind: LocalKind) : ProxyEvent {
+        override fun toString() = "LocalServed(peer=${describePeer(peer)}, kind=$kind)"
     }
 
-    class TunnelOpened(override val peer: InetAddress, val port: Int, val kind: TunnelKind) : ProxyEvent {
-        override fun toString() = "TunnelOpened(peer=${peer.hostAddress}, port=$port, kind=$kind)"
+    class TunnelOpened(override val peer: InetAddress?, val port: Int, val kind: TunnelKind) : ProxyEvent {
+        override fun toString() = "TunnelOpened(peer=${describePeer(peer)}, port=$port, kind=$kind)"
     }
 
     /**
      * A tunnel opened by [TunnelOpened] has closed. [upBytes]/[downBytes] are what this one
-     * connection moved (client to upstream, and back). [end] is why the tunnel stopped pumping, or
-     * null when it was cut off before it could end on its own: revoked (including an idle-seat
-     * eviction), the server stopped, or an I/O error before pumping began.
+     * connection moved (client to upstream, and back). [end] is why the tunnel stopped pumping;
+     * when it was cut off before it could end on its own, [end] is null and [abort] says why.
      */
     class TunnelClosed(
-        override val peer: InetAddress,
+        override val peer: InetAddress?,
         val port: Int,
         val kind: TunnelKind,
         val upBytes: Long,
         val downBytes: Long,
         val durationMs: Long,
         val end: TunnelEnd?,
+        val abort: TunnelAbort? = if (end == null) TunnelAbort.CANCELLED else null,
     ) : ProxyEvent {
+        /** [end], or [abort] when it didn't end on its own. */
+        val outcome: String get() = end?.name ?: abort?.name ?: TunnelAbort.CANCELLED.name
+
         override fun toString() =
-            "TunnelClosed(peer=${peer.hostAddress}, port=$port, kind=$kind, upBytes=$upBytes, " +
-                "downBytes=$downBytes, durationMs=$durationMs, end=${end ?: "CANCELLED"})"
+            "TunnelClosed(peer=${describePeer(peer)}, port=$port, kind=$kind, upBytes=$upBytes, " +
+                "downBytes=$downBytes, durationMs=$durationMs, end=$outcome)"
     }
 
     /** [errorClass] is the simple class name of the exception behind the failure (never its
      *  message, which can name the host), or "none" when no exception was involved. */
     class UpstreamFailed(
-        override val peer: InetAddress,
+        override val peer: InetAddress?,
         val port: Int,
         val failure: UpstreamFailure,
         val errorClass: String,
     ) : ProxyEvent {
-        override fun toString() = "UpstreamFailed(peer=${peer.hostAddress}, port=$port, failure=$failure, errorClass=$errorClass)"
+        override fun toString() = "UpstreamFailed(peer=${describePeer(peer)}, port=$port, failure=$failure, errorClass=$errorClass)"
     }
 
     /** An idle auto slot was evicted to seat [peer], the newcomer. */
-    class Evicted(override val peer: InetAddress) : ProxyEvent {
-        override fun toString() = "Evicted(peer=${peer.hostAddress})"
+    class Evicted(override val peer: InetAddress?) : ProxyEvent {
+        override fun toString() = "Evicted(peer=${describePeer(peer)})"
+    }
+
+    companion object {
+        /** How every event prints its peer: the bare address, or "off-link peer" for null. */
+        fun describePeer(peer: InetAddress?): String = peer?.hostAddress ?: "off-link peer"
     }
 }

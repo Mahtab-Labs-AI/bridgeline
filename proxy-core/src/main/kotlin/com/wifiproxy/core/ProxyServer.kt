@@ -321,13 +321,15 @@ class ProxyServer(
             r.nio.closeChannel(client)
             return
         }
+        // A peer outside the subnet isn't on the local link: its address never reaches an event.
+        val reportedPeer = peer.takeIf { config.peerSubnet.contains(it) }
         val overGlobalCap = r.inFlight.get() >= config.maxConnections
         val overPendingHeadsTotalCap = r.pendingHeadsTotal.get() >= config.maxPendingHeads
         if (overGlobalCap || overPendingHeadsTotalCap) {
             rejectPreAdmission(r, client)
             safeOnEvent(
                 ProxyEvent.Refused(
-                    peer,
+                    reportedPeer,
                     if (overGlobalCap) ProxyEvent.RefusalReason.CONNECTION_CAP else ProxyEvent.RefusalReason.PENDING_HEADS_CAP,
                 ),
             )
@@ -340,7 +342,7 @@ class ProxyServer(
         }
         if (!admittedPeer) {
             rejectPreAdmission(r, client)
-            safeOnEvent(ProxyEvent.Refused(peer, ProxyEvent.RefusalReason.PER_PEER_CAP))
+            safeOnEvent(ProxyEvent.Refused(reportedPeer, ProxyEvent.RefusalReason.PER_PEER_CAP))
             return
         }
         r.pendingHeadsTotal.incrementAndGet()
@@ -372,7 +374,7 @@ class ProxyServer(
         val pendingHead = PendingHead(r, peer)
         try {
             if (!config.peerSubnet.contains(peer)) {
-                safeOnEvent(ProxyEvent.Refused(peer, ProxyEvent.RefusalReason.OUTSIDE_SUBNET))
+                safeOnEvent(ProxyEvent.Refused(null, ProxyEvent.RefusalReason.OUTSIDE_SUBNET))
                 return
             }
             // Tells a head timeout (a refusal) apart from a peer that just closed before sending
@@ -477,6 +479,7 @@ class ProxyServer(
         val downBytes = AtomicLong()
         var openedAtMs = -1L
         var end: TunnelEnd? = null
+        var abort = ProxyEvent.TunnelAbort.CANCELLED
         try {
             // A revoke that raced with the admission check above must still win. Never creates a
             // slot, even under open admission: a revoked auto slot's replacement is a new slot,
@@ -547,6 +550,15 @@ class ProxyServer(
             if (mustAbort) {
                 abortOnClose(client)
             }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: IOException) {
+            // Only for the TunnelClosed event; handle() still treats it as a routine reset.
+            abort = ProxyEvent.TunnelAbort.IO_ERROR
+            throw e
+        } catch (e: Exception) {
+            abort = ProxyEvent.TunnelAbort.ERROR
+            throw e
         } finally {
             registry.releaseTunnel(slot.id)
             tunnels.computeIfPresent(slot.id) { _, s -> s.remove(job); s.ifEmpty { null } }
@@ -557,6 +569,7 @@ class ProxyServer(
                 safeOnEvent(
                     ProxyEvent.TunnelClosed(
                         peer, port, kind, upBytes.get(), downBytes.get(), monotonicMs() - openedAtMs, end,
+                        abort = if (end == null) abort else null,
                     ),
                 )
             }

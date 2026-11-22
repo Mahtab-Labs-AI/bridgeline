@@ -6,11 +6,13 @@ import com.wifiproxy.core.egress.Egress
 import com.wifiproxy.core.io.TunnelEnd
 import com.wifiproxy.core.net.Cidr
 import com.wifiproxy.core.net.DestinationFilter
+import kotlinx.coroutines.awaitCancellation
 import java.io.IOException
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketException
+import java.net.SocketTimeoutException
 import java.net.UnknownHostException
 import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.concurrent.thread
@@ -18,6 +20,7 @@ import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlin.test.fail
 
@@ -35,11 +38,18 @@ class ProxyEventTest {
         filter: DestinationFilter = DestinationFilter(emptyList()),
         openAdmission: Boolean = false,
         wifi: WifiCredentials? = null,
+        peerSubnet: Cidr = Cidr.parse("127.0.0.0/8"),
+        maxConnections: Int = 832,
+        maxPendingHeads: Int = 64,
+        maxPendingHeadsPerPeer: Int = 16,
+        headTimeoutMs: Long = 10_000,
+        connectTimeoutMs: Long = 10_000,
         onEvent: (ProxyEvent) -> Unit = { events += it },
     ) {
         val config = ProxyConfig(
-            bindAddress = loopback, port = 0, peerSubnet = Cidr.parse("127.0.0.0/8"), wifi = wifi,
-            openAdmission = openAdmission,
+            bindAddress = loopback, port = 0, peerSubnet = peerSubnet, wifi = wifi,
+            openAdmission = openAdmission, maxConnections = maxConnections, maxPendingHeads = maxPendingHeads,
+            maxPendingHeadsPerPeer = maxPendingHeadsPerPeer, headTimeoutMs = headTimeoutMs, connectTimeoutMs = connectTimeoutMs,
         )
         server = ProxyServer(config, registry, egress, filter, onEvent = onEvent).also { it.start() }
     }
@@ -181,7 +191,192 @@ class ProxyEventTest {
         server = ProxyServer(config, registry, DirectEgress(), DestinationFilter(emptyList()), onEvent = { events += it })
             .also { it.start() }
         rawRequest("GET /x HTTP/1.1\r\n\r\n")
-        assertEquals(ProxyEvent.RefusalReason.OUTSIDE_SUBNET, awaitEvent<ProxyEvent.Refused>().reason)
+        val refused = awaitEvent<ProxyEvent.Refused>()
+        assertEquals(ProxyEvent.RefusalReason.OUTSIDE_SUBNET, refused.reason)
+        // Off the local link: never its address.
+        assertNull(refused.peer)
+        assertEquals("Refused(peer=off-link peer, reason=OUTSIDE_SUBNET)", refused.toString())
+    }
+
+    /** A connection that sends nothing, so it sits in the pending-head caps; kept open by the
+     *  test until [tearDown]. Returns once the server has counted it (its handler is reading). */
+    private fun holdSilent(from: InetAddress? = null): Socket {
+        val s = connect(from)
+        closeables += s
+        // A refusal would close it at once; still open after a short read timeout means it got
+        // to the head-reading stage, so the caps now count it.
+        s.soTimeout = 200
+        val r = try { s.getInputStream().read() } catch (e: SocketTimeoutException) { -2 }
+        assertEquals(-2, r, "the held connection was refused")
+        return s
+    }
+
+    /** Connects and expects a pre-admission reject (RST or EOF, no response). */
+    private fun expectRejected(from: InetAddress? = null) {
+        connect(from).use { s ->
+            s.soTimeout = 5000
+            val r = try { s.getInputStream().read() } catch (e: SocketException) { -1 }
+            assertEquals(-1, r)
+        }
+    }
+
+    @Test
+    fun `the global connection cap is refused as connection cap`() {
+        start(maxConnections = 1)
+        holdSilent()
+        expectRejected()
+        val refused = awaitEvent<ProxyEvent.Refused>()
+        assertEquals(ProxyEvent.RefusalReason.CONNECTION_CAP, refused.reason)
+        assertEquals(loopback, refused.peer)
+    }
+
+    @Test
+    fun `the pending-heads total cap is refused as pending heads cap`() {
+        start(maxPendingHeads = 1)
+        holdSilent()
+        expectRejected(from = guest)
+        val refused = awaitEvent<ProxyEvent.Refused>()
+        assertEquals(ProxyEvent.RefusalReason.PENDING_HEADS_CAP, refused.reason)
+        assertEquals(guest, refused.peer)
+    }
+
+    @Test
+    fun `the per-peer pending-heads cap is refused as per peer cap`() {
+        start(maxPendingHeadsPerPeer = 1)
+        holdSilent()
+        expectRejected()
+        assertEquals(ProxyEvent.RefusalReason.PER_PEER_CAP, awaitEvent<ProxyEvent.Refused>().reason)
+    }
+
+    @Test
+    fun `a cap refusal of an off-link peer never carries its address`() {
+        // Only 127.0.0.2 is on the "link": it holds the only pending-head seat, and loopback
+        // (off-link here) is turned away by the cap before the subnet check ever runs.
+        start(peerSubnet = Cidr.parse("127.0.0.2/32"), maxPendingHeads = 1)
+        holdSilent(from = guest)
+        expectRejected()
+        val refused = awaitEvent<ProxyEvent.Refused>()
+        assertEquals(ProxyEvent.RefusalReason.PENDING_HEADS_CAP, refused.reason)
+        assertNull(refused.peer)
+        assertFalse("127.0.0.1" in refused.toString(), refused.toString())
+    }
+
+    @Test
+    fun `no head within the head timeout is refused as head timeout`() {
+        start(headTimeoutMs = 200)
+        val s = connect(null)
+        closeables += s
+        val refused = awaitEvent<ProxyEvent.Refused>()
+        assertEquals(ProxyEvent.RefusalReason.HEAD_TIMEOUT, refused.reason)
+        assertEquals(loopback, refused.peer)
+    }
+
+    @Test
+    fun `closing before sending a head emits nothing`() {
+        start(headTimeoutMs = 2_000)
+        connect(null).close()
+        // Let that handler see the EOF, then mark the stream with a known event.
+        Thread.sleep(300)
+        assertTrue(rawRequest("hello\r\n\r\n").startsWith("HTTP/1.1 400"))
+        awaitEvent<ProxyEvent.Refused>()
+        Thread.sleep(100)
+        assertEquals(listOf(ProxyEvent.RefusalReason.MALFORMED), events.map { (it as ProxyEvent.Refused).reason })
+    }
+
+    @Test
+    fun `an oversized head is refused as head too large`() {
+        start()
+        val response = rawRequest("a".repeat(65 * 1024))
+        assertTrue(response.isEmpty() || response.startsWith("HTTP/1.1 400"), response)
+        assertEquals(ProxyEvent.RefusalReason.HEAD_TOO_LARGE, awaitEvent<ProxyEvent.Refused>().reason)
+    }
+
+    @Test
+    fun `a POST for a pac is refused as method not allowed`() {
+        start()
+        val slot = registry.addSlot("test")!!
+        assertTrue(rawRequest("POST /${slot.token}.pac HTTP/1.1\r\nContent-Length: 0\r\n\r\n").startsWith("HTTP/1.1 405"))
+        assertEquals(ProxyEvent.RefusalReason.METHOD_NOT_ALLOWED, awaitEvent<ProxyEvent.Refused>().reason)
+    }
+
+    @Test
+    fun `a slot replaced while admitting is refused as slot changed`() {
+        // The registry reads its clock under its lock, during admission's first lookup. Armed, that
+        // one read binds a second slot to the peer (unbinding the first): a slot change landing
+        // between admission and the re-check.
+        var armed = false
+        var swap: () -> Unit = {}
+        registry = ClientRegistry(maxClients = 3, clock = {
+            if (armed) {
+                armed = false
+                swap()
+            }
+            System.currentTimeMillis()
+        })
+        start()
+        admit()
+        val replacement = registry.addSlot("replacement")!!
+        swap = { registry.onPacFetch(replacement.token, loopback) }
+        events.clear()
+        armed = true
+        assertTrue(rawRequest("CONNECT 127.0.0.1:1 HTTP/1.1\r\n\r\n").startsWith("HTTP/1.1 403"))
+        assertEquals(ProxyEvent.RefusalReason.SLOT_CHANGED, awaitEvent<ProxyEvent.Refused>().reason)
+    }
+
+    @Test
+    fun `a resolve that never returns is an upstream timeout`() {
+        val hanging = object : Egress by DirectEgress() {
+            override suspend fun resolve(host: String): List<InetAddress> = awaitCancellation()
+        }
+        start(egress = hanging, connectTimeoutMs = 200)
+        admit()
+        assertTrue(rawRequest("CONNECT example.com:443 HTTP/1.1\r\n\r\n").startsWith("HTTP/1.1 504"))
+        val failed = awaitEvent<ProxyEvent.UpstreamFailed>()
+        assertEquals(ProxyEvent.UpstreamFailure.TIMEOUT, failed.failure)
+        assertEquals("none", failed.errorClass)
+    }
+
+    @Test
+    fun `a plain http forward closes with RESPONSE_ENDED and its byte counts`() {
+        val origin = ServerSocket(0, 50, loopback)
+        closeables += origin
+        thread(isDaemon = true) {
+            origin.accept().use { s ->
+                val input = s.getInputStream()
+                val head = StringBuilder()
+                while (!head.endsWith("\r\n\r\n")) head.append(input.read().toChar())
+                s.getOutputStream().write("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello".toByteArray())
+            }
+        }
+        start()
+        admit()
+        events.clear()
+        val response = rawRequest("GET http://127.0.0.1:${origin.localPort}/x HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        assertTrue(response.startsWith("HTTP/1.1 200") && response.endsWith("hello"), response)
+        val closed = awaitEvent<ProxyEvent.TunnelClosed>()
+        assertEquals(ProxyEvent.TunnelKind.FORWARD, closed.kind)
+        assertEquals(origin.localPort, closed.port)
+        assertEquals(TunnelEnd.RESPONSE_ENDED, closed.end)
+        assertNull(closed.abort)
+        assertTrue(closed.downBytes > 5, closed.toString())
+    }
+
+    @Test
+    fun `a revoked tunnel closes as CANCELLED`() {
+        start()
+        admit()
+        val slot = registry.slots().single()
+        val echo = startEcho()
+        val s = connect(null)
+        closeables += s
+        s.soTimeout = 5000
+        s.getOutputStream().write("CONNECT 127.0.0.1:${echo.localPort} HTTP/1.1\r\n\r\n".toByteArray())
+        awaitEvent<ProxyEvent.TunnelOpened>()
+        server.revoke(slot.id)
+        val closed = awaitEvent<ProxyEvent.TunnelClosed>()
+        assertNull(closed.end)
+        assertEquals(ProxyEvent.TunnelAbort.CANCELLED, closed.abort)
+        assertTrue("end=CANCELLED" in closed.toString(), closed.toString())
     }
 
     @Test
@@ -301,6 +496,7 @@ class ProxyEventTest {
             ProxyEvent.TunnelOpened(guest, 443, ProxyEvent.TunnelKind.FORWARD),
             ProxyEvent.TunnelClosed(guest, 443, ProxyEvent.TunnelKind.CONNECT, 1, 2, 3, TunnelEnd.IDLE),
             ProxyEvent.TunnelClosed(guest, 443, ProxyEvent.TunnelKind.CONNECT, 1, 2, 3, null),
+            ProxyEvent.TunnelClosed(guest, 443, ProxyEvent.TunnelKind.CONNECT, 1, 2, 3, null, ProxyEvent.TunnelAbort.IO_ERROR),
             ProxyEvent.UpstreamFailed(guest, 443, ProxyEvent.UpstreamFailure.TIMEOUT, "SocketTimeoutException"),
             ProxyEvent.Evicted(guest),
         )
