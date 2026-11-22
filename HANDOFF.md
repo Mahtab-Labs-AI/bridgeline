@@ -87,13 +87,12 @@ An Android app that shares a phone's **cellular data** with other devices **with
 3. **Build:** `.\gradlew.bat :proxy-core:test :app:assembleDebug :app:testDebugUnitTest`. Versions are pinned: Gradle 8.14.3, AGP 8.13.2, Kotlin 2.2.20, and Compose BOM 2026.06.01 (newer BOMs need compileSdk 37 and AGP 9).
 4. **Emulator:** if `avdmanager` hangs, write the AVD `.ini` and `config.ini` by hand; see the session notes in the plan.
 
-## This machine's environment (2026-11-21)
-- **The Windows PC is a VMware VM** with no GPU (VMware SVGA 3D). The Android emulator only runs with software rendering: ATD images show black screens, and `-gpu host` hangs. The emulator image was removed afterwards to save disk space.
-- **JDK 21 (Temurin)** is in `%LOCALAPPDATA%\Programs\Temurin\` (no winget). `scripts/env.ps1` finds it.
-- **The SDK** is in `%LOCALAPPDATA%\Android\Sdk`. `sdkmanager` now delegates to the new `android` CLI; install packages with `android.exe --sdk=<sdk> sdk install platforms/android-36` (slash-separated package names).
-- **Android Studio was uninstalled.** It isn't needed.
-- **Write `local.properties` with escaped backslashes.** The Bash tool collapses `\\`, so use a proper editor.
-- **Install note:** debug APKs built on different machines have different debug keys, so uninstall the old app before installing a build from another machine.
+## Setup tips
+- **`sdkmanager`** in recent command-line tools delegates to the new `android` CLI. Install packages with `android --sdk=<sdk> sdk install platforms/android-36` (slash-separated package names).
+- **Android Studio is not required.** JDK 21, the SDK and Gradle are enough.
+- **The emulator** needs a working GPU for a visible screen. On a VM without one, use real phones; the lightweight ATD images render black under software rendering.
+- **`local.properties`** needs escaped backslashes on Windows (`sdk.dir=C\:\\Users\\…`).
+- **Debug APKs** built on different machines have different debug keys. Uninstall the old app before installing a build from another machine.
 
 ## Working conventions used so far
 - Superpowers workflow: brainstorm → spec → plan → subagent-driven implementation, with a spec-compliance review and a code-quality review per task, plus a final branch review.

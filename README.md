@@ -106,3 +106,7 @@ Code review turned up these points. Status below reflects Plan 2a (USB) and Plan
 
 **Toolchain**
 - No Android SDK was found via `ANDROID_HOME`, but `C:\Program Files\Android\openjdk\jdk-21.0.8` exists. Android tooling may be partly installed.
+
+## Licence
+
+Bridgeline is released under the [MIT License](LICENSE). Copyright (c) 2026 Mahtab Labs AI.
