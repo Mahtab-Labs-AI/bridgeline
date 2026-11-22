@@ -46,6 +46,7 @@ import java.nio.channels.SocketChannel
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 /** `acceptLoop` failed to `accept()` a connection but the server socket itself is still usable. */
 class AcceptFailedException(cause: IOException) : IOException(cause)
@@ -66,8 +67,28 @@ class ProxyServer(
      *  on it, but a slow callback still delays the thread that just admitted a peer. Exceptions
      *  are caught, same as [onError]. */
     private val onEvicted: () -> Unit = {},
+    /** Verbose diagnostics: one [ProxyEvent] per refusal, local fetch, tunnel open/close, upstream
+     *  failure and eviction. Never a hostname, path, token or destination address (see
+     *  [ProxyEvent]). Called synchronously on whichever thread produced the event (the accept loop
+     *  or a connection handler) and never while [evictLock] is held. Must be quick and must not
+     *  block: admission and the data path both wait for it to return. Exceptions are caught, same
+     *  as [onError]. */
+    private val onEvent: (ProxyEvent) -> Unit = {},
 ) {
-    private class ProxyFailure(val response: HttpResponse) : Exception()
+    /** An upstream open that failed with [response]: either a refusal ([refusal], e.g. a blocked
+     *  destination) or an upstream failure ([failure], with the exception class behind it). */
+    private class ProxyFailure(
+        val response: HttpResponse,
+        val failure: ProxyEvent.UpstreamFailure? = null,
+        val refusal: ProxyEvent.RefusalReason? = null,
+        val error: Throwable? = null,
+    ) : Exception() {
+        fun event(peer: InetAddress, port: Int): ProxyEvent = if (refusal != null) {
+            ProxyEvent.Refused(peer, refusal)
+        } else {
+            ProxyEvent.UpstreamFailed(peer, port, checkNotNull(failure), error?.javaClass?.simpleName ?: "none")
+        }
+    }
 
     /** Releases one admitted connection's share of the per-peer and total pending-head caps,
      *  exactly once no matter how many times (or from where) release() is called. Held for the
@@ -213,9 +234,12 @@ class ProxyServer(
                 registry.admitOrCreate(peer)
             }
         }
-        // Outside evictLock, not before: onEvicted is diagnostics-only and must never run while
-        // this holds the lock (see its KDoc).
-        if (evicted) safeOnEvicted()
+        // Outside evictLock, not before: onEvicted and onEvent are diagnostics-only and must never
+        // run while this holds the lock (see their KDoc).
+        if (evicted) {
+            safeOnEvicted()
+            safeOnEvent(ProxyEvent.Evicted(peer))
+        }
         return admitted
     }
 
@@ -224,6 +248,20 @@ class ProxyServer(
         // caller's thread.
         runCatching { onEvicted() }
     }
+
+    private fun safeOnEvent(event: ProxyEvent) {
+        // Same guard again: verbose diagnostics must never throw into admission or the data path.
+        runCatching { onEvent(event) }
+    }
+
+    /** Why [admitOpen] just returned null for [peer]: only a peer that open admission would seat
+     *  (so never the owner) can have been turned away by a full registry. */
+    private fun noSeatReason(peer: InetAddress) =
+        if (config.openAdmission && peer != config.bindAddress) {
+            ProxyEvent.RefusalReason.REGISTRY_FULL
+        } else {
+            ProxyEvent.RefusalReason.NOT_ADMITTED
+        }
 
     private fun safeOnError(e: Throwable) {
         // A throwing callback must not bring down the accept loop or the Android process.
@@ -287,6 +325,12 @@ class ProxyServer(
         val overPendingHeadsTotalCap = r.pendingHeadsTotal.get() >= config.maxPendingHeads
         if (overGlobalCap || overPendingHeadsTotalCap) {
             rejectPreAdmission(r, client)
+            safeOnEvent(
+                ProxyEvent.Refused(
+                    peer,
+                    if (overGlobalCap) ProxyEvent.RefusalReason.CONNECTION_CAP else ProxyEvent.RefusalReason.PENDING_HEADS_CAP,
+                ),
+            )
             return
         }
         var admittedPeer = false
@@ -296,6 +340,7 @@ class ProxyServer(
         }
         if (!admittedPeer) {
             rejectPreAdmission(r, client)
+            safeOnEvent(ProxyEvent.Refused(peer, ProxyEvent.RefusalReason.PER_PEER_CAP))
             return
         }
         r.pendingHeadsTotal.incrementAndGet()
@@ -326,12 +371,28 @@ class ProxyServer(
         // response) releases it here, in the outer finally, exactly once via the CAS in release().
         val pendingHead = PendingHead(r, peer)
         try {
-            if (!config.peerSubnet.contains(peer)) return
-            val head = withTimeoutOrNull(config.headTimeoutMs) { readHead(r.nio, client) }
-            val h = head ?: return
+            if (!config.peerSubnet.contains(peer)) {
+                safeOnEvent(ProxyEvent.Refused(peer, ProxyEvent.RefusalReason.OUTSIDE_SUBNET))
+                return
+            }
+            // Tells a head timeout (a refusal) apart from a peer that just closed before sending
+            // one (nothing to report): both come back from withTimeoutOrNull as null.
+            var headTimedOut = true
+            val head = withTimeoutOrNull(config.headTimeoutMs) { readHead(r.nio, client).also { headTimedOut = false } }
+            val h = head ?: run {
+                if (headTimedOut) safeOnEvent(ProxyEvent.Refused(peer, ProxyEvent.RefusalReason.HEAD_TIMEOUT))
+                return
+            }
             when (val request = RequestParser.parse(h.text)) {
-                is ProxyRequest.Malformed -> respond(r.nio, client, HttpResponse.BAD_REQUEST)
-                is ProxyRequest.Local -> respond(r.nio, client, r.local.serve(request, peer))
+                is ProxyRequest.Malformed -> {
+                    safeOnEvent(ProxyEvent.Refused(peer, ProxyEvent.RefusalReason.MALFORMED))
+                    respond(r.nio, client, HttpResponse.BAD_REQUEST)
+                }
+                is ProxyRequest.Local -> {
+                    val response = r.local.serve(request, peer)
+                    safeOnEvent(localEvent(peer, request, response))
+                    respond(r.nio, client, response)
+                }
                 is ProxyRequest.Connect ->
                     proxy(r, client, peer, pendingHead, request.host, request.port, h.leftover, forward = null)
                 is ProxyRequest.Forward ->
@@ -340,6 +401,7 @@ class ProxyServer(
         } catch (e: CancellationException) {
             throw e
         } catch (e: HeadTooLargeException) {
+            safeOnEvent(ProxyEvent.Refused(peer, ProxyEvent.RefusalReason.HEAD_TOO_LARGE))
             try {
                 respond(r.nio, client, HttpResponse.BAD_REQUEST)
             } catch (e: IOException) {
@@ -360,6 +422,19 @@ class ProxyServer(
         }
     }
 
+    /** What [LocalContent.serve] did, as an event: the kind of file served (from the path's
+     *  extension - never the path itself, which can carry a token) or why it refused. */
+    private fun localEvent(peer: InetAddress, request: ProxyRequest.Local, response: HttpResponse): ProxyEvent =
+        when (response.status) {
+            200 -> ProxyEvent.LocalServed(
+                peer,
+                if (request.path.endsWith(".mobileconfig")) ProxyEvent.LocalKind.MOBILECONFIG else ProxyEvent.LocalKind.PAC,
+            )
+            HttpResponse.FORBIDDEN.status -> ProxyEvent.Refused(peer, noSeatReason(peer))
+            HttpResponse.METHOD_NOT_ALLOWED.status -> ProxyEvent.Refused(peer, ProxyEvent.RefusalReason.METHOD_NOT_ALLOWED)
+            else -> ProxyEvent.Refused(peer, ProxyEvent.RefusalReason.UNKNOWN_LOCAL_PATH)
+        }
+
     private suspend fun proxy(
         r: Run,
         client: SocketChannel,
@@ -375,29 +450,50 @@ class ProxyServer(
         // group owner's own address (the host phone's apps) never gets an auto slot either -
         // admitOpen itself enforces both of those (see its KDoc), so there's exactly one place
         // that owner/open-admission rule lives.
-        val slot = admitOpen(peer) ?: return respond(r.nio, client, HttpResponse.FORBIDDEN)
+        val slot = admitOpen(peer) ?: run {
+            safeOnEvent(ProxyEvent.Refused(peer, noSeatReason(peer)))
+            return respond(r.nio, client, HttpResponse.FORBIDDEN)
+        }
         // The peer is genuinely admitted now; it's no longer part of the pre-admission DoS surface
         // the pending-head caps exist to bound, even though its response (or tunnel) isn't done yet.
         pendingHead.release()
         if (forward != null && egress.isValidated) {
-            Probes.match(forward)?.let { return respond(r.nio, client, it) }
+            Probes.match(forward)?.let {
+                safeOnEvent(ProxyEvent.LocalServed(peer, ProxyEvent.LocalKind.PROBE))
+                return respond(r.nio, client, it)
+            }
         }
-        if (!registry.tryAcquireTunnel(slot.id)) return respond(r.nio, client, HttpResponse.SERVICE_UNAVAILABLE)
+        if (!registry.tryAcquireTunnel(slot.id)) {
+            safeOnEvent(ProxyEvent.Refused(peer, ProxyEvent.RefusalReason.TUNNEL_CAP))
+            return respond(r.nio, client, HttpResponse.SERVICE_UNAVAILABLE)
+        }
 
         val job = currentCoroutineContext().job
         tunnels.compute(slot.id) { _, existing -> (existing ?: ConcurrentHashMap.newKeySet()).apply { add(job) } }
         var upstream: SocketChannel? = null
+        // Verbose diagnostics for this one connection; registry.addBytes keeps the slot's totals.
+        val kind = if (forward == null) ProxyEvent.TunnelKind.CONNECT else ProxyEvent.TunnelKind.FORWARD
+        val upBytes = AtomicLong()
+        val downBytes = AtomicLong()
+        var openedAtMs = -1L
+        var end: TunnelEnd? = null
         try {
             // A revoke that raced with the admission check above must still win. Never creates a
             // slot, even under open admission: a revoked auto slot's replacement is a new slot,
             // so its id differs and this connection is refused.
-            if (registry.admittedSlot(peer)?.id != slot.id) return respond(r.nio, client, HttpResponse.FORBIDDEN)
+            if (registry.admittedSlot(peer)?.id != slot.id) {
+                safeOnEvent(ProxyEvent.Refused(peer, ProxyEvent.RefusalReason.SLOT_CHANGED))
+                return respond(r.nio, client, HttpResponse.FORBIDDEN)
+            }
             val up = try {
                 open(r, host, port)
             } catch (e: ProxyFailure) {
+                safeOnEvent(e.event(peer, port))
                 return respond(r.nio, client, e.response)
             }
             upstream = up
+            openedAtMs = monotonicMs()
+            safeOnEvent(ProxyEvent.TunnelOpened(peer, port, kind))
             if (forward == null) {
                 writeFully(r.nio, client, HttpResponse.CONNECTION_ESTABLISHED)
             } else {
@@ -406,12 +502,19 @@ class ProxyServer(
             if (leftover.isNotEmpty()) {
                 writeFully(r.nio, up, leftover)
                 registry.addBytes(slot.id, leftover.size.toLong(), 0)
+                upBytes.addAndGet(leftover.size.toLong())
             }
             val result = try {
                 Tunnel(
                     r.nio, client, up, idleTimeoutFor(up, port),
-                    onUp = { registry.addBytes(slot.id, it.toLong(), 0) },
-                    onDown = { registry.addBytes(slot.id, 0, it.toLong()) },
+                    onUp = {
+                        registry.addBytes(slot.id, it.toLong(), 0)
+                        upBytes.addAndGet(it.toLong())
+                    },
+                    onDown = {
+                        registry.addBytes(slot.id, 0, it.toLong())
+                        downBytes.addAndGet(it.toLong())
+                    },
                 ).run(closeWhenResponseEnds = forward != null)
             } catch (e: CancellationException) {
                 // A revoke or stop() can cut a forward response off mid-stream; closing normally
@@ -422,6 +525,7 @@ class ProxyServer(
                 }
                 throw e
             }
+            end = result.end
 
             // An early response (e.g. a 401/413) cancels the upload pump mid-stream, which can
             // leave unread request bytes sitting in the client's receive buffer. Draining them
@@ -449,25 +553,44 @@ class ProxyServer(
             // See the comment in handle()'s finally: closeChannel nudges the loop so a deferred
             // close (and the abort above, if any) is visible to the upstream peer promptly.
             r.nio.closeChannel(upstream)
+            if (openedAtMs >= 0) {
+                safeOnEvent(
+                    ProxyEvent.TunnelClosed(
+                        peer, port, kind, upBytes.get(), downBytes.get(), monotonicMs() - openedAtMs, end,
+                    ),
+                )
+            }
         }
     }
 
+    /** Resolves and dials [host]:[port]. Every failure is a [ProxyFailure] carrying the response
+     *  and, for diagnostics, what went wrong: a 502 is [ProxyEvent.UpstreamFailure.DNS] if the
+     *  lookup failed and [ProxyEvent.UpstreamFailure.CONNECT_REFUSED] if the dial did. */
     private suspend fun open(r: Run, host: String, port: Int): SocketChannel {
-        if (!egress.isAvailable) throw ProxyFailure(HttpResponse.SERVICE_UNAVAILABLE)
+        if (!egress.isAvailable) {
+            throw ProxyFailure(HttpResponse.SERVICE_UNAVAILABLE, failure = ProxyEvent.UpstreamFailure.NO_EGRESS)
+        }
         val currentFilter = filter
+        var resolving = true
         try {
             val resolved = withTimeoutOrNull(config.connectTimeoutMs) { egress.resolve(host) }
-                ?: throw ProxyFailure(HttpResponse.GATEWAY_TIMEOUT)
-            if (resolved.isEmpty()) throw ProxyFailure(HttpResponse.BAD_GATEWAY)
+                ?: throw ProxyFailure(HttpResponse.GATEWAY_TIMEOUT, failure = ProxyEvent.UpstreamFailure.TIMEOUT)
+            if (resolved.isEmpty()) throw ProxyFailure(HttpResponse.BAD_GATEWAY, failure = ProxyEvent.UpstreamFailure.DNS)
             val allowed = resolved.filter(currentFilter::isAllowed)
-            if (allowed.isEmpty()) throw ProxyFailure(HttpResponse.FORBIDDEN)
+            if (allowed.isEmpty()) {
+                throw ProxyFailure(HttpResponse.FORBIDDEN, refusal = ProxyEvent.RefusalReason.DESTINATION_BLOCKED)
+            }
+            resolving = false
             return r.dialer.dial(allowed, port)
         } catch (e: EgressUnavailableException) {
-            throw ProxyFailure(HttpResponse.SERVICE_UNAVAILABLE)
+            throw ProxyFailure(HttpResponse.SERVICE_UNAVAILABLE, failure = ProxyEvent.UpstreamFailure.NO_EGRESS, error = e)
         } catch (e: SocketTimeoutException) {
-            throw ProxyFailure(HttpResponse.GATEWAY_TIMEOUT)
+            throw ProxyFailure(HttpResponse.GATEWAY_TIMEOUT, failure = ProxyEvent.UpstreamFailure.TIMEOUT, error = e)
         } catch (e: IOException) {
-            throw ProxyFailure(HttpResponse.BAD_GATEWAY)
+            val failure = if (resolving) ProxyEvent.UpstreamFailure.DNS else ProxyEvent.UpstreamFailure.CONNECT_REFUSED
+            // The dialer wraps per-address failures in one IOException; its first cause names the
+            // real one (e.g. ConnectException), which is what a troubleshooter needs.
+            throw ProxyFailure(HttpResponse.BAD_GATEWAY, failure = failure, error = if (resolving) e else e.cause ?: e)
         }
     }
 
