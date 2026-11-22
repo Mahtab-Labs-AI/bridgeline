@@ -45,7 +45,7 @@ fun DiagnosticsScreen(repository: SessionRepository, modifier: Modifier = Modifi
     Column(modifier = modifier.fillMaxSize().padding(16.dp)) {
         ScreenTitle(text = "Diagnostics")
 
-        if (verboseUntil != 0L) {
+        if (rememberVerboseActive(verboseUntil)) {
             Surface(
                 color = MaterialTheme.colorScheme.tertiaryContainer,
                 contentColor = MaterialTheme.colorScheme.onTertiaryContainer,
@@ -53,7 +53,8 @@ fun DiagnosticsScreen(repository: SessionRepository, modifier: Modifier = Modifi
                 modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp),
             ) {
                 Text(
-                    text = "Verbose logging on — turns off at ${formatClockTime(verboseUntil)}",
+                    text = "Verbose logging on — turns off at ${formatClockTime(verboseUntil)}. " +
+                        "Export before then: turning off trims the log to the last 500 lines.",
                     style = MaterialTheme.typography.bodyMedium,
                     modifier = Modifier.padding(12.dp),
                 )

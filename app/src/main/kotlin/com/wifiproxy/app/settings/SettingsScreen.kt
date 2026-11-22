@@ -42,6 +42,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.wifiproxy.app.BuildConfig
 import com.wifiproxy.app.logs.formatClockTime
+import com.wifiproxy.app.logs.rememberVerboseActive
 import com.wifiproxy.app.service.SessionHolder
 import com.wifiproxy.app.session.HostSettings
 import com.wifiproxy.app.session.PasswordStrength
@@ -266,7 +267,7 @@ fun SettingsScreen(
             // Off by default and only ever turned on here; it turns itself off after 30 minutes.
             // Unlike the switches above it applies at once, also while sharing.
             val verboseUntil by repository.verboseUntilMs.collectAsStateWithLifecycle()
-            val verboseOn = verboseUntil != 0L
+            val verboseOn = rememberVerboseActive(verboseUntil)
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
