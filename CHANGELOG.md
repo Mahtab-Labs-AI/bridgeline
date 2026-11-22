@@ -19,7 +19,12 @@ Will become **1.0.0**, the first public release, as **Bridgeline**.
   logo/icon assets.
 - `MAJOR.MINOR.PATCH.BUILD` versioning (`version.properties` + commit-count `BUILD`), shown in
   Settings and the Diagnostics export header.
-- Verbose troubleshooting logging (in progress).
+- "Verbose logging (troubleshooting)" in Settings: off by default, turns itself off after 30
+  minutes. While on, Logs gains `[v]` lines per connection (device IP, destination port, bytes,
+  duration, why it ended or was refused, upstream failures) and per internal step (Wi-Fi Direct
+  group attempts and result codes, link changes, cellular network and VPN changes, watchdog
+  rebuilds, filter refreshes) - never website names, URLs, tokens or the Wi-Fi password. Diagnostics
+  shows a banner while it's on, and the export includes the verbose lines.
 
 Commits: `b33f0e8`..`b01666f`, plus this branding/versioning work.
 

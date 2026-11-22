@@ -164,6 +164,7 @@ Permissions granted, password set, cellular available, battery-optimization exem
 
 - Ring-buffer file log of state transitions; exportable. `ApplicationExitInfo` reason recorded on startup.
 - **No URLs or hostnames logged** — byte and connection counters only.
+- **Verbose mode** (Settings → "Verbose logging (troubleshooting)"; off by default, only ever switched on by the user, off again after 30 minutes, never restored as on after an app update) adds `[v]` lines per connection and per internal step. They may contain client addresses on the local link (192.168.49.x, 127.0.0.1), destination ports, byte counts, durations, exception class names, reason codes, `WifiP2pManager` result codes and network ids — never URLs, hostnames, request paths or tokens, the Wi-Fi name or password, or destination IP addresses. While it is on the log keeps up to 3000 entries, trimmed back to 500 when it turns off.
 
 ## 7. Permissions and manifest
 
