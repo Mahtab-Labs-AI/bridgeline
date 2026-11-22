@@ -17,6 +17,7 @@ import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.wifiproxy.app.MainActivity
+import com.wifiproxy.app.R
 import com.wifiproxy.app.egress.CellularEgress
 import com.wifiproxy.app.session.SessionPhase
 import com.wifiproxy.app.settings.AppPreferences
@@ -241,7 +242,7 @@ class ProxySessionService : Service() {
 
     private fun postStoppedNotification() {
         val notification = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.stat_sys_upload)
+            .setSmallIcon(R.drawable.ic_stat_bridgeline)
             .setContentTitle("Sharing stopped")
             .setContentText("Sharing stopped. Tap to resume.")
             .setContentIntent(openAppIntent())
@@ -523,7 +524,7 @@ class ProxySessionService : Service() {
             ),
         )
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.stat_sys_upload)
+            .setSmallIcon(R.drawable.ic_stat_bridgeline)
             .setContentTitle("Sharing mobile data")
             .setContentText(contentText)
             .setContentIntent(openAppIntent())

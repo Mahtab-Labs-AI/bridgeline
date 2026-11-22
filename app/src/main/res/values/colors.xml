@@ -1,4 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <color name="ic_launcher_background">#1C3A5E</color>
+    <!-- Bridgeline brand colours (docs/brand/README.md is the source of truth for these values). -->
+    <color name="brand_primary">#0F6E7A</color>
+    <color name="brand_on_primary">#FFFFFF</color>
+
+    <color name="ic_launcher_background">@color/brand_primary</color>
 </resources>

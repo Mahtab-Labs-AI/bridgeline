@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Notification small icon (white-only silhouette): the system renders only this vector's alpha
+  channel in white on the status bar/shade, so - like ic_launcher_monochrome.xml - the fill
+  colour is nominal. Same two-phones-and-a-wavy-link mark as the launcher icon, scaled for a
+  24dp canvas. Replaces android.R.drawable.stat_sys_upload in ProxySessionService.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M5.2,6 L7.8,6 A1.2,1.2 0 0 1 9,7.2 L9,16.8 A1.2,1.2 0 0 1 7.8,18 L5.2,18
+            A1.2,1.2 0 0 1 4,16.8 L4,7.2 A1.2,1.2 0 0 1 5.2,6 Z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M16.2,6 L18.8,6 A1.2,1.2 0 0 1 20,7.2 L20,16.8 A1.2,1.2 0 0 1 18.8,18 L16.2,18
+            A1.2,1.2 0 0 1 15,16.8 L15,7.2 A1.2,1.2 0 0 1 16.2,6 Z" />
+    <path
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="1.8"
+        android:strokeLineCap="round"
+        android:pathData="M9,12 C10,10 11,14 12,12 C13,10 14,14 15,12" />
+</vector>
