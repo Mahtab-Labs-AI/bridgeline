@@ -43,7 +43,7 @@ newcomers, and the app warns when a VPN would block sharing.
 - Not yet tested on hardware: 3 Wi-Fi clients at once, Android 10–12 hosts, and Samsung/Xiaomi
   Wi-Fi Direct behaviour.
 
-Commits: `b33f0e8`..`v1.0.0` tag.
+Commits: `f5eb923`..`v1.0.0` tag.
 
 ## [0.6.0] - 2026-11-21
 
@@ -61,7 +61,7 @@ seat for a new device, without the host having to revoke it by hand.
 ### Fixed
 - Only real evictions are counted; the eviction callback is guarded; small UI nits.
 
-Commits: `33de32e`..`1116a02`
+Commits: `8502791`..`d9b0d3b`
 
 ## [0.5.0] - 2026-11-21
 
@@ -83,7 +83,7 @@ invite code needed), with a setting to go back to the old flow; plus a VPN warni
 - Secrets redacted in `HostSettings`/`DeviceInvite`; device-count and credential-change edge cases
   (D7); a sticky resume whose start fails posts "Tap to resume"; dead code removed.
 
-Commits: `7acfd6c`..`f0bca8c`
+Commits: `43b4d2e`..`28d0381`
 
 ## [0.4.0] - 2026-11-21
 
@@ -106,7 +106,7 @@ directly (no laptop/USB needed), alongside a round of review and device-test fix
   wiping stored credentials only when the blob can never open again, and several repository/UI
   fixes (off-Main work, live Wi-Fi listener checks, inline Settings errors, QR encoding off Main).
 
-Commits: `309ef95`..`956b88d`
+Commits: `22d5610`..`a0956bb`
 
 ## [0.3.0] - 2026-11-20
 
@@ -128,7 +128,7 @@ offline Laptop kit for a laptop with no internet of its own.
   and DNS executor/cache fixes; notification removed on every path to idle; early network
   callbacks and CAS phase transitions Main-confined.
 
-Commits: `88434d1`..`3c8b86b`
+Commits: `a94fe2f`..`b9494ba`
 
 ## [0.2.0] - 2026-11-20
 
@@ -143,7 +143,7 @@ check/Diagnostics screens, wired to a fake in-memory repository.
 ### Fixed
 - One-back invite sheet, password warning only shown when changed, consistent screen titles.
 
-Commits: `7c14c73`..`d219617`
+Commits: `e3c6927`..`d6604b5`
 
 ## [0.1.0] - 2026-11-19
 
@@ -163,4 +163,4 @@ Proxy core (Plan 1): the pure Kotlin/JVM data plane, with no Android dependency.
 - Egress abstraction and a happy-eyeballs dialer.
 - `ProxyServer`: admission, tunnels, probes, revoke, and token-gated PAC/mobileconfig endpoints.
 
-Commits: `1e4cdcf`..`7cfb8fa`
+Commits: `8f3ae64`..`4ce1415`

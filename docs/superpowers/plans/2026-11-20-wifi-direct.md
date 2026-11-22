@@ -34,7 +34,7 @@
   ```
   Before this plan: core 142 tests, app 90 tests, zero warnings. Keep zero warnings.
 - **Commits:** commit by explicit paths only. Check `git diff --cached --name-only` before every commit. End every message with `Co-Authored-By: Claude Opus 5.5 (1M context)`.
-- **Branch:** `feature/wifi-direct` (off `main` at `309ef95`).
+- **Branch:** `feature/wifi-direct` (off `main` at `22d5610`).
 - Never change the host PC's proxy settings in tests.
 
 ## Decisions this plan makes (deviations from the spec, recorded in Task 9)
