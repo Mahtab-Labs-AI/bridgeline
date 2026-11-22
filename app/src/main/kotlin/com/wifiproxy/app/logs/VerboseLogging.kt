@@ -59,15 +59,16 @@ class VerboseSwitch(
     private val versionCode: Int,
     private val clock: () -> Long,
     private val scope: CoroutineScope,
+    /** Called after every switch-off; must not block (it can run on a connection handler). A
+     *  constructor parameter, not a settable property, so it is in place before `init` re-arms a
+     *  stored deadline: one about to expire can never fire into a no-op. */
+    private val onEnded: (autoOff: Boolean) -> Unit = {},
 ) {
+    /** The pending auto-off; guarded by `this`. Declared before `init`, which may arm it. */
+    private var timer: Job? = null
+
     private val _untilMs = MutableStateFlow(0L)
     val untilMs: StateFlow<Long> = _untilMs.asStateFlow()
-
-    /** Called after every switch-off; must not block (it can run on a connection handler). */
-    @Volatile var onEnded: (autoOff: Boolean) -> Unit = {}
-
-    /** The pending auto-off; guarded by `this`. */
-    private var timer: Job? = null
 
     init {
         val stored = prefs.verboseUntilMs
@@ -150,9 +151,7 @@ object VerboseLog {
             versionCode = BuildConfig.VERSION_CODE,
             clock = System::currentTimeMillis,
             scope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
-        ).also { switch ->
-            switch.onEnded = { autoOff -> SessionHolder.controller.value?.onVerboseEnded(autoOff) }
-            instance = switch
-        }
+            onEnded = { autoOff -> SessionHolder.controller.value?.onVerboseEnded(autoOff) },
+        ).also { instance = it }
     }
 }

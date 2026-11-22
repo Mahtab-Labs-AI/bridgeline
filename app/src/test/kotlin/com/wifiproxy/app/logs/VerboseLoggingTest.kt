@@ -57,13 +57,14 @@ class VerboseLoggingTest {
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class VerboseSwitchTest {
-    private fun TestScope.switch(prefs: MemoryVerbosePrefs, version: Int = 7, clockOffset: Long = 0L) =
-        VerboseSwitch(prefs, version, clock = { currentTime + clockOffset }, scope = backgroundScope)
+    private val ended = mutableListOf<Boolean>()
+
+    private fun TestScope.switch(prefs: MemoryVerbosePrefs, version: Int = 7, clock: () -> Long = { currentTime }) =
+        VerboseSwitch(prefs, version, clock = clock, scope = backgroundScope, onEnded = { ended += it })
 
     @Test
     fun `off by default`() = runTest {
-        val prefs = MemoryVerbosePrefs()
-        val s = switch(prefs)
+        val s = switch(MemoryVerbosePrefs())
         assertEquals(0L, s.untilMs.value)
         assertFalse(s.isActive())
     }
@@ -72,8 +73,6 @@ class VerboseSwitchTest {
     fun `enable persists and turns itself off once after 30 minutes`() = runTest {
         val prefs = MemoryVerbosePrefs()
         val s = switch(prefs)
-        val ended = mutableListOf<Boolean>()
-        s.onEnded = { ended += it }
 
         s.enable()
         assertEquals(30 * MIN, prefs.until)
@@ -103,9 +102,7 @@ class VerboseSwitchTest {
     fun `the per-event check notices a late timer and switches off exactly once`() = runTest {
         val prefs = MemoryVerbosePrefs()
         var offset = 0L
-        val s = VerboseSwitch(prefs, 7, clock = { currentTime + offset }, scope = backgroundScope)
-        val ended = mutableListOf<Boolean>()
-        s.onEnded = { ended += it }
+        val s = switch(prefs, clock = { currentTime + offset })
         s.enable()
         // The wall clock jumps past the deadline while the timer hasn't fired (the device slept).
         offset = 31 * MIN
@@ -122,8 +119,6 @@ class VerboseSwitchTest {
     fun `disable switches off early without the auto-off`() = runTest {
         val prefs = MemoryVerbosePrefs()
         val s = switch(prefs)
-        val ended = mutableListOf<Boolean>()
-        s.onEnded = { ended += it }
         s.enable()
         advanceTimeBy(5 * MIN)
         s.disable()
@@ -140,10 +135,7 @@ class VerboseSwitchTest {
 
     @Test
     fun `re-enabling restarts the 30 minutes`() = runTest {
-        val prefs = MemoryVerbosePrefs()
-        val s = switch(prefs)
-        val ended = mutableListOf<Boolean>()
-        s.onEnded = { ended += it }
+        val s = switch(MemoryVerbosePrefs())
         s.enable()
         advanceTimeBy(20 * MIN)
         s.enable()
@@ -159,14 +151,23 @@ class VerboseSwitchTest {
     fun `a stored future deadline from the same version is re-armed at process start`() = runTest {
         val prefs = MemoryVerbosePrefs(until = 10 * MIN, version = 7)
         val s = switch(prefs)
-        val ended = mutableListOf<Boolean>()
-        s.onEnded = { ended += it }
         assertEquals(10 * MIN, s.untilMs.value)
         assertTrue(s.isActive())
         advanceTimeBy(10 * MIN)
         runCurrent()
         assertEquals(listOf(true), ended)
         assertEquals(0L, prefs.until)
+    }
+
+    @Test
+    fun `a re-armed deadline that is about to expire still reaches onEnded`() = runTest {
+        // One millisecond left at process start: the first timer run expires it, and that must
+        // reach the callback given at construction.
+        val prefs = MemoryVerbosePrefs(until = 1L, version = 7)
+        switch(prefs)
+        advanceTimeBy(1)
+        runCurrent()
+        assertEquals(listOf(true), ended)
     }
 
     @Test
@@ -181,15 +182,16 @@ class VerboseSwitchTest {
     @Test
     fun `a stored deadline that already passed stays off`() = runTest {
         val prefs = MemoryVerbosePrefs(until = 10 * MIN, version = 7)
-        val s = switch(prefs, clockOffset = 11 * MIN)
+        val s = switch(prefs, clock = { currentTime + 11 * MIN })
         assertEquals(0L, s.untilMs.value)
         assertEquals(0L, prefs.until)
     }
 
     @Test
     fun `a throwing onEnded never escapes`() = runTest {
-        val s = switch(MemoryVerbosePrefs())
-        s.onEnded = { throw IllegalStateException("boom") }
+        val s = VerboseSwitch(MemoryVerbosePrefs(), 7, clock = { currentTime }, scope = backgroundScope) {
+            throw IllegalStateException("boom")
+        }
         s.enable()
         s.disable()
         s.enable()
