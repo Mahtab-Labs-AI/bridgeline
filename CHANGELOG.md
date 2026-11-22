@@ -4,12 +4,17 @@ All notable changes to this project are documented in this file, in the
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) style. Versioning:
 `MAJOR.MINOR.PATCH.BUILD` (see "Versioning and releases" in README.md).
 
-Commit ranges below are commit hashes on `develop`, not tags - the project's first tagged release
-will be 1.0.0.
+Releases from 1.0.0 on are tagged `vX.Y.Z.BUILD` on `main` and published as GitHub releases.
+The 0.x entries are reconstructed history; their commit ranges are commit hashes, not tags.
 
 ## [Unreleased]
 
-Will become **1.0.0**, the first public release, as **Bridgeline**.
+## [1.0.0] - 2026-11-21
+
+The first release under the name **Bridgeline**. It shares an Android phone's mobile data with
+nearby phones and laptops over Wi-Fi Direct (open mode by default, with optional per-device codes)
+or USB, through an app-level proxy rather than system tethering. Idle seats are freed for
+newcomers, and the app warns when a VPN would block sharing.
 
 ### Added
 - CI: GitHub Actions build, unit tests and lint on every push to `develop`/`main`, debug APK
@@ -24,9 +29,21 @@ Will become **1.0.0**, the first public release, as **Bridgeline**.
   duration, why it ended or was refused, upstream failures) and per internal step (Wi-Fi Direct
   group attempts and result codes, link changes, cellular network and VPN changes, watchdog
   rebuilds, filter refreshes) - never website names, URLs, tokens or the Wi-Fi password. Diagnostics
-  shows a banner while it's on, and the export includes the verbose lines.
+  shows a banner while it's on, and the export includes the verbose lines. Lines are rate-limited
+  (per device and in total) so a flood can't wipe the log, and addresses outside the local link
+  are never printed.
+- `main` is protected: changes arrive only by pull request, with merge commits only and a passing
+  "Build and test" check.
 
-Commits: `b33f0e8`..`b01666f`, plus this branding/versioning work.
+### Known limitations
+- A VPN on the host that covers Bridgeline breaks Wi-Fi Direct sharing. Exclude the app from the
+  VPN (split tunnelling) or turn the VPN off.
+- Debug-signed build: install by sideloading. Phones with Google's Advanced Protection only allow
+  Play Store apps.
+- Not yet tested on hardware: 3 Wi-Fi clients at once, Android 10–12 hosts, and Samsung/Xiaomi
+  Wi-Fi Direct behaviour.
+
+Commits: `b33f0e8`..`v1.0.0` tag.
 
 ## [0.6.0] - 2026-11-21
 

@@ -30,9 +30,9 @@ An Android app that shares a phone's **cellular data** with other devices **with
 - **Offline backup:** the newest git bundle in the handoff folder (`android-wifi-proxy-2026-11-21b.bundle`).
 
 ## State
-- **`:proxy-core`** (pure Kotlin/JVM, **187 tests**): the slot registry with pinned slots and unpersisted per-IP auto slots for open admission, a strict parser, PAC/mobileconfig/probes (including the fixed `/proxy.pac` and `/proxy.mobileconfig` paths), a post-DNS destination filter, a happy-eyeballs dialer, the NIO selector loop, a per-direction tunnel failure policy, and a ProxyServer with pre-admission caps and per-run state.
+- **`:proxy-core`** (pure Kotlin/JVM, **214 tests**): the slot registry with pinned slots and unpersisted per-IP auto slots for open admission, a strict parser, PAC/mobileconfig/probes (including the fixed `/proxy.pac` and `/proxy.mobileconfig` paths), a post-DNS destination filter, a happy-eyeballs dialer, the NIO selector loop, a per-direction tunnel failure policy, and a ProxyServer with pre-admission caps and per-run state.
   - **Idle seat eviction (on demand):** under open admission, a full registry evicts (through `ProxyServer.revoke`) the least-recently-active auto slot idle for at least `idleSeatMs` (`ProxyConfig.DEFAULT_IDLE_SEAT_MS`, 3 minutes) before retrying admission once, on the manual-proxy path and through `LocalContent`'s injected `admit` function (fixed paths and the token-path fallback alike). Pinned and coded slots are never candidates; nothing is evicted while there's room, and there's no background sweeper. The slow (eviction) path is serialized through its own lock, re-trying the fast admission inside it first, so a burst of connections from one newcomer can't evict more than one victim. `ProxyServer.onEvicted` surfaces each eviction to the app for diagnostics.
-- **`:app`** (Compose, minSdk 29, targetSdk/compileSdk **36**, **201 tests**):
+- **`:app`** (Compose, minSdk 29, targetSdk/compileSdk **36**, **249 tests**):
   - Demo mode (fake data) versus real mode;
   - `CellularEgress` (DnsResolver, bindSocket);
   - `SessionController` (renamed from `UsbSessionController`), running USB and Wi-Fi Direct listeners side by side, plus a foreground service with a serialized lifecycle and `START_STICKY` restart;
