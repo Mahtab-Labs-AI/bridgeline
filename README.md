@@ -2,9 +2,17 @@
 
 # Bridgeline (Android Wi-Fi Proxy)
 
+[![CI](https://github.com/Mahtab-Labs-AI/bridgeline/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Mahtab-Labs-AI/bridgeline/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/Mahtab-Labs-AI/bridgeline)](https://github.com/Mahtab-Labs-AI/bridgeline/releases/latest)
+[![License: MIT](https://img.shields.io/github/license/Mahtab-Labs-AI/bridgeline)](LICENSE)
+[![Good first issues](https://img.shields.io/github/issues/Mahtab-Labs-AI/bridgeline/good%20first%20issue)](https://github.com/Mahtab-Labs-AI/bridgeline/labels/good%20first%20issue)
+
 Shares a host Android phone's cellular data with up to 3 phones over a Wi-Fi Direct group, using an
 app-level HTTP proxy (no system tethering). Design: `docs/superpowers/specs/2026-11-19-android-wifi-proxy-design.md`.
 Brand assets: `docs/brand/`.
+
+Contributions are welcome — see [`CONTRIBUTING.md`](CONTRIBUTING.md) to get started, or browse the
+[`good first issue`](https://github.com/Mahtab-Labs-AI/bridgeline/labels/good%20first%20issue) label.
 
 ## Modules
 
@@ -123,6 +131,14 @@ Code review turned up these points. Status below reflects Plan 2a (USB) and Plan
 
 **Toolchain**
 - No Android SDK was found via `ANDROID_HOME`, but `C:\Program Files\Android\openjdk\jdk-21.0.8` exists. Android tooling may be partly installed.
+
+## Contributing
+
+Issues and pull requests are welcome. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the build/test
+command, the project's conventions, and where to start. [`good first issue`](https://github.com/Mahtab-Labs-AI/bridgeline/labels/good%20first%20issue)
+and [`help wanted`](https://github.com/Mahtab-Labs-AI/bridgeline/labels/help%20wanted) are the
+labels to browse; [GitHub Discussions](https://github.com/Mahtab-Labs-AI/bridgeline/discussions)
+is open for questions and ideas. This project follows the [Contributor Covenant](CODE_OF_CONDUCT.md).
 
 ## Licence
 

@@ -1,0 +1,49 @@
+name: Bug report
+description: Something isn't working the way it should
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, what happened instead?
+    validations:
+      required: true
+  - type: input
+    id: device
+    attributes:
+      label: Host device and Android version
+      placeholder: e.g. Pixel 7, Android 15
+    validations:
+      required: true
+  - type: input
+    id: client
+    attributes:
+      label: Client device(s), if relevant
+      placeholder: e.g. iPhone 13 (iOS 18), Windows laptop
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Sharing mode
+      options:
+        - Wi-Fi Direct (open, default)
+        - Wi-Fi Direct (per-device code)
+        - USB
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Diagnostics export
+      description: >
+        Settings → turn on "Verbose logging (troubleshooting)" → reproduce → Logs → Export, and
+        paste it here. It never contains website names, URLs or your Wi-Fi password, so it's safe
+        to post.
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: App version
+      description: Settings screen, bottom — e.g. "Bridgeline 1.0.0.124"
+    validations:
+      required: true
