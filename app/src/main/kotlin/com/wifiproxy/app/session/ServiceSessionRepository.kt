@@ -180,7 +180,7 @@ class ServiceSessionRepository(
         watchVpn()
     }
 
-    /** Only VPNs that apply to this app are reported to it, so one that excludes Wi-Fi Proxy
+    /** Only VPNs that apply to this app are reported to it, so one that excludes Bridgeline
      *  (split tunnelling) never warns. Unregistered when [repositoryJob] ends - by [close], or by
      *  the activity scope it is a child of - so a recreated activity never leaks a callback. */
     private fun watchVpn() {
@@ -601,7 +601,7 @@ class ServiceSessionRepository(
         val vpn = _vpnActive.value
         return SetupCheck(
             title = "No VPN active",
-            detail = "A VPN on this phone stops Wi-Fi Direct devices getting replies. Exclude Wi-Fi Proxy " +
+            detail = "A VPN on this phone stops Wi-Fi Direct devices getting replies. Exclude Bridgeline " +
                 "in your VPN app (split tunnelling) or turn the VPN off.",
             status = if (vpn) CheckStatus.ACTION_NEEDED else CheckStatus.OK,
             fixIntent = if (vpn) Intent(Settings.ACTION_VPN_SETTINGS) else null,
@@ -623,7 +623,7 @@ class ServiceSessionRepository(
         val exempt = powerManager?.isIgnoringBatteryOptimizations(context.packageName) == true
         return SetupCheck(
             title = "Battery optimisation",
-            detail = "Exempt Wi-Fi Proxy from battery optimisation so Android doesn't kill it in the background.",
+            detail = "Exempt Bridgeline from battery optimisation so Android doesn't kill it in the background.",
             status = if (exempt) CheckStatus.OK else CheckStatus.ACTION_NEEDED,
             fixIntent = if (exempt) {
                 null

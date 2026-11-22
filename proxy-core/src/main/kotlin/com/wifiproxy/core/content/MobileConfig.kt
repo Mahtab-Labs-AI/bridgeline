@@ -35,7 +35,7 @@ object MobileConfig {
             |<key>PayloadVersion</key><integer>1</integer>
             |<key>PayloadIdentifier</key><string>com.wifiproxy.profile.$profileUuid</string>
             |<key>PayloadUUID</key><string>$profileUuid</string>
-            |<key>PayloadDisplayName</key><string>Wi-Fi Proxy (${escape(ssid)})</string>
+            |<key>PayloadDisplayName</key><string>Bridgeline (${escape(ssid)})</string>
             |<key>PayloadRemovalDisallowed</key><false/>
             |</dict>
             |</plist>

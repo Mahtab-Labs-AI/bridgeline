@@ -65,7 +65,7 @@ fun HomeScreen(repository: SessionRepository, modifier: Modifier = Modifier, onS
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
-        ScreenTitle(text = "Wi-Fi Proxy")
+        ScreenTitle(text = "Bridgeline")
 
         StatusCard(
             phase = session.phase,
@@ -214,7 +214,7 @@ private fun VpnWarning() {
             Icon(Icons.Filled.Warning, contentDescription = null)
             Spacer(modifier = Modifier.width(12.dp))
             Text(
-                text = "A VPN is on. Wi-Fi Direct devices won't get replies through it. Exclude Wi-Fi Proxy " +
+                text = "A VPN is on. Wi-Fi Direct devices won't get replies through it. Exclude Bridgeline " +
                     "in your VPN app (split tunnelling) or turn the VPN off.",
                 style = MaterialTheme.typography.bodyMedium,
             )

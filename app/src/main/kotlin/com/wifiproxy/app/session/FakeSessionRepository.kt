@@ -79,12 +79,12 @@ class FakeSessionRepository(
             ),
             SetupCheck(
                 title = "Battery optimisation",
-                detail = "Exempt Wi-Fi Proxy from battery optimisation so Android doesn't kill it in the background.",
+                detail = "Exempt Bridgeline from battery optimisation so Android doesn't kill it in the background.",
                 status = CheckStatus.ACTION_NEEDED,
             ),
             SetupCheck(
                 title = "Samsung: Never sleeping apps",
-                detail = "Add Wi-Fi Proxy to Never sleeping apps in Device care so One UI doesn't freeze it.",
+                detail = "Add Bridgeline to Never sleeping apps in Device care so One UI doesn't freeze it.",
                 status = CheckStatus.ACTION_NEEDED,
             ),
         ),
