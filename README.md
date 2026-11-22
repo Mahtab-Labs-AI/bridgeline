@@ -1,7 +1,10 @@
-# Android Wi-Fi Proxy
+![Bridgeline logo](docs/brand/logo.svg)
+
+# Bridgeline (Android Wi-Fi Proxy)
 
 Shares a host Android phone's cellular data with up to 3 phones over a Wi-Fi Direct group, using an
 app-level HTTP proxy (no system tethering). Design: `docs/superpowers/specs/2026-11-19-android-wifi-proxy-design.md`.
+Brand assets: `docs/brand/`.
 
 ## Modules
 
@@ -24,6 +27,24 @@ app-level HTTP proxy (no system tethering). Design: `docs/superpowers/specs/2026
 - **Wi-Fi Direct (open mode, the default):** start sharing, then join the host's `DIRECT-xy-…` group with its password. Any joined device can then use `http://<owner>:<port>/proxy.pac` (Automatic/Proxy Auto-Config) or the manual proxy `<owner>:<port>` directly, no PAC fetch needed first. iPhones can instead install `/proxy.mobileconfig` in Safari. "Require a code for each device" in Settings switches back to the per-device invite/token flow.
 - **USB (laptop):** turn on "USB sharing", then run `tools/usb-client/connect-usb.ps1` on the laptop (Windows). It finds `adb`, forwards `tcp:8081`, and sets the laptop's system proxy for you.
 - **VPN note:** a VPN on the host that covers this app routes the proxy's replies to Wi-Fi Direct clients into the tunnel, so those clients time out. The app warns on Home and in the Setup check. Fix by excluding this app from the VPN (split tunnelling) or turning the VPN off; it can't be fixed in-app without root.
+
+## Versioning and releases
+
+Bridgeline uses **MAJOR.MINOR.PATCH.BUILD** (e.g. `1.2.3.45`):
+
+- **MAJOR** - big redesigns.
+- **MINOR** - new features.
+- **PATCH** - bug fixes.
+- **BUILD** - auto-counted per build (the commit count, `git rev-list --count HEAD`; identical locally and on CI). It is only ever read, never hand-edited.
+
+`version.properties` at the repo root (`major`/`minor`/`patch`) is the single source of truth for the first three numbers; `app/build.gradle.kts` reads it and computes BUILD at configuration time, so `versionName`/`versionCode` and the in-app "Bridgeline x.y.z.build" string (Settings, Diagnostics export) always agree.
+
+Release procedure:
+
+1. Bump `version.properties` for the kind of change (major/minor/patch).
+2. Update `CHANGELOG.md`: move `## [Unreleased]` into a new `## [x.y.z] - YYYY-MM-DD` heading (date it, keep its Added/Changed/Fixed/Security lists user-meaningful rather than one line per commit).
+3. Open a PR `develop` -> `main`.
+4. After it merges, tag `main` as `vX.Y.Z.BUILD` and create a GitHub release with that changelog section and the built APK.
 
 ## `:proxy-core` rules
 

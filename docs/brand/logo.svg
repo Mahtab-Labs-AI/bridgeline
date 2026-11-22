@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 460 108" width="460" height="108" role="img" aria-label="Bridgeline logo">
+  <title>Bridgeline</title>
+  <g>
+    <rect width="108" height="108" rx="20" fill="#0F6E7A" />
+    <path fill="#FFFFFF" d="M31,34 L39,34 A3,3 0 0 1 42,37 L42,71 A3,3 0 0 1 39,74 L31,74 A3,3 0 0 1 28,71
+      L28,37 A3,3 0 0 1 31,34 Z" />
+    <path fill="#FFFFFF" d="M69,34 L77,34 A3,3 0 0 1 80,37 L80,71 A3,3 0 0 1 77,74 L69,74 A3,3 0 0 1 66,71
+      L66,37 A3,3 0 0 1 69,34 Z" />
+    <path fill="none" stroke="#FFFFFF" stroke-width="4" stroke-linecap="round"
+      d="M42,54 C46,47 50,61 54,54 C58,47 62,61 66,54" />
+  </g>
+  <!-- Wordmark: common sans-serif fallback stack rather than paths, per the brand brief. -->
+  <text x="130" y="72" font-family="Helvetica, Arial, 'Segoe UI', sans-serif" font-size="52"
+    font-weight="700" fill="#0F6E7A">Bridgeline</text>
+</svg>
