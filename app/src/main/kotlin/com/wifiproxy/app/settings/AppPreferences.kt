@@ -2,6 +2,7 @@ package com.wifiproxy.app.settings
 
 import android.content.Context
 import androidx.core.content.edit
+import com.wifiproxy.app.logs.VerbosePrefs
 
 private const val PREFS_NAME = "wifi_proxy_prefs"
 private const val KEY_USB_SHARING = "usb_sharing_enabled"
@@ -11,6 +12,8 @@ private const val KEY_WIFI_PORT = "wifi_port"
 private const val KEY_PREFER_5GHZ = "prefer_5ghz"
 private const val KEY_SESSION_DESIRED = "session_desired"
 private const val KEY_REQUIRE_DEVICE_CODES = "require_device_codes"
+private const val KEY_VERBOSE_UNTIL = "verbose_until_ms"
+private const val KEY_VERBOSE_VERSION = "verbose_version_code"
 
 /**
  * The app-level settings that live outside [com.wifiproxy.app.session.SessionRepository]:
@@ -18,7 +21,7 @@ private const val KEY_REQUIRE_DEVICE_CODES = "require_device_codes"
  * non-secret host settings ([HostPrefs]; the Wi-Fi name and password live in the encrypted
  * [com.wifiproxy.app.wifi.CredentialStore]) and [sessionDesired].
  */
-class AppPreferences(context: Context) : HostPrefs {
+class AppPreferences(context: Context) : HostPrefs, VerbosePrefs {
     private val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
     override var usbSharingEnabled: Boolean
@@ -54,4 +57,14 @@ class AppPreferences(context: Context) : HostPrefs {
     var sessionDesired: Boolean
         get() = prefs.getBoolean(KEY_SESSION_DESIRED, false)
         set(value) = prefs.edit { putBoolean(KEY_SESSION_DESIRED, value) }
+
+    /** "Verbose logging (troubleshooting)": when it turns itself off, 0 = off (the default). Only
+     *  ever set by the user's switch; see [com.wifiproxy.app.logs.VerboseSwitch]. */
+    override var verboseUntilMs: Long
+        get() = prefs.getLong(KEY_VERBOSE_UNTIL, 0L)
+        set(value) = prefs.edit { putLong(KEY_VERBOSE_UNTIL, value) }
+
+    override var verboseVersionCode: Int
+        get() = prefs.getInt(KEY_VERBOSE_VERSION, 0)
+        set(value) = prefs.edit { putInt(KEY_VERBOSE_VERSION, value) }
 }

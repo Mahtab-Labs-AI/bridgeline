@@ -1,6 +1,8 @@
 package com.wifiproxy.app.service
 
 import com.wifiproxy.app.egress.SessionEgress
+import com.wifiproxy.app.logs.VERBOSE_AUTO_OFF_MESSAGE
+import com.wifiproxy.app.logs.VERBOSE_PREFIX
 import com.wifiproxy.app.session.ClientPlatform
 import com.wifiproxy.app.session.SessionPhase
 import com.wifiproxy.app.wifi.LinkConfig
@@ -11,6 +13,8 @@ import com.wifiproxy.app.wifi.REASON_CREATING
 import com.wifiproxy.app.wifi.REASON_LOST
 import com.wifiproxy.app.wifi.SlotPersistence
 import com.wifiproxy.core.ProxyConfig
+import com.wifiproxy.core.ProxyEvent
+import com.wifiproxy.core.io.TunnelEnd
 import com.wifiproxy.core.ProxyServer
 import com.wifiproxy.core.WifiCredentials
 import com.wifiproxy.core.clients.SlotRecord
@@ -207,18 +211,114 @@ class SessionControllerTest {
         slots: MemorySlots = MemorySlots(),
         config: SessionConfig = USB_ONLY,
         servers: MutableList<Pair<ProxyConfig, FakeSessionServer>>? = null,
+        verbose: () -> Boolean = { false },
+        /** Collects each server's `onEvent`, in creation order (USB first). */
+        eventSinks: MutableList<(ProxyEvent) -> Unit>? = null,
     ) = SessionController(
         egress = egress,
         link = link,
         slots = slots,
         config = { config },
-        serverFactory = SessionServerFactory { cfg, _, _, _, _, _ ->
+        serverFactory = SessionServerFactory { cfg, _, _, _, _, _, onEvent ->
+            eventSinks?.add(onEvent)
             if (servers == null) server else FakeSessionServer().also { servers += cfg to it }
         },
         scope = scope,
         watchdogIntervalMs = watchdogIntervalMs,
         now = now,
+        verbose = verbose,
     )
+
+    private val peer = InetAddress.getByName("192.168.49.87")
+
+    @Test
+    fun `proxy events from both listeners are logged as verbose lines only while verbose is on`() = runTest {
+        var verboseOn = false
+        val sinks = mutableListOf<(ProxyEvent) -> Unit>()
+        val link = FakeLink()
+        val servers = mutableListOf<Pair<ProxyConfig, FakeSessionServer>>()
+        val c = controller(
+            scope = backgroundScope, link = link, config = BOTH, servers = servers,
+            verbose = { verboseOn }, eventSinks = sinks,
+        )
+        c.start(); runCurrent(); link.up(); runCurrent()
+        assertEquals(2, sinks.size)
+        val closed = ProxyEvent.TunnelClosed(peer, 443, ProxyEvent.TunnelKind.CONNECT, 1229, 49_152, 3_100, TunnelEnd.BOTH_EOF)
+
+        sinks[0](closed)
+        assertTrue(c.log.value.none { it.message.startsWith(VERBOSE_PREFIX) })
+
+        verboseOn = true
+        sinks[0](closed)
+        sinks[1](ProxyEvent.Refused(InetAddress.getByName("192.168.49.12"), ProxyEvent.RefusalReason.REGISTRY_FULL))
+        val verboseLines = c.log.value.map { it.message }.filter { it.startsWith(VERBOSE_PREFIX) }
+        assertTrue("[v] 192.168.49.87 CONNECT :443 closed (BOTH_EOF) ↑1.2 KB ↓48.0 KB 3.1 s" in verboseLines, verboseLines.toString())
+        assertTrue("[v] 192.168.49.12 refused: registry full" in verboseLines, verboseLines.toString())
+
+        // Turned off mid-session: the very next event is no longer logged.
+        verboseOn = false
+        val before = c.log.value.size
+        sinks[1](closed)
+        assertEquals(before, c.log.value.size)
+    }
+
+    @Test
+    fun `link transitions are logged with their reasons while verbose is on`() = runTest {
+        val link = FakeLink()
+        val c = controller(scope = backgroundScope, link = link, config = WIFI_ONLY, verbose = { true })
+        c.start(); runCurrent()
+        link.up(); runCurrent()
+        link.state.value = LinkState.Down(REASON_LOST); runCurrent()
+        val lines = c.log.value.map { it.message }
+        assertTrue("[v] Wi-Fi Direct link down: $REASON_CREATING" in lines, lines.toString())
+        assertTrue("[v] Wi-Fi Direct link up (group owner 192.168.49.1)" in lines, lines.toString())
+        assertTrue("[v] Wi-Fi Direct link down: $REASON_LOST" in lines, lines.toString())
+        // Never the Wi-Fi name or password.
+        assertTrue(lines.none { WIFI.credentials.ssid in it || WIFI.credentials.password in it }, lines.toString())
+    }
+
+    @Test
+    fun `logVerbose is a no-op while verbose is off`() = runTest {
+        val c = controller(scope = backgroundScope)
+        c.logVerbose("detail")
+        assertTrue(c.log.value.isEmpty())
+    }
+
+    @Test
+    fun `the log keeps 3000 entries while verbose is on and trims to 500 with one line at auto-off`() = runTest {
+        var verboseOn = true
+        val c = controller(scope = backgroundScope, verbose = { verboseOn })
+        repeat(3_200) { c.logVerbose("line $it") }
+        assertEquals(3_000, c.log.value.size)
+        assertEquals("[v] line 3199", c.log.value.last().message)
+
+        verboseOn = false
+        c.onVerboseEnded(autoOff = true)
+        assertEquals(500, c.log.value.size)
+        assertEquals(VERBOSE_AUTO_OFF_MESSAGE, c.log.value.last().message)
+        assertEquals("[v] line 3199", c.log.value[498].message)
+    }
+
+    @Test
+    fun `switching verbose off early trims without the auto-off line`() = runTest {
+        var verboseOn = true
+        val c = controller(scope = backgroundScope, verbose = { verboseOn })
+        repeat(800) { c.logVerbose("line $it") }
+        verboseOn = false
+        c.onVerboseEnded(autoOff = false)
+        assertEquals(500, c.log.value.size)
+        assertEquals("[v] line 799", c.log.value.last().message)
+    }
+
+    @Test
+    fun `plain lines keep the normal 500 cap while verbose is off`() = runTest {
+        val c = controller(scope = backgroundScope)
+        repeat(300) {
+            c.start(); runCurrent()
+            c.stop(); runCurrent()
+        }
+        assertEquals(500, c.log.value.size)
+    }
 
     @Test
     fun `start reaches RUNNING when egress is available`() = runTest {
@@ -523,7 +623,7 @@ class SessionControllerTest {
             link = FakeLink(),
             slots = MemorySlots(),
             config = { USB_ONLY },
-            serverFactory = SessionServerFactory { _, _, _, _, _, _ -> FakeSessionServer() },
+            serverFactory = SessionServerFactory { _, _, _, _, _, _, _ -> FakeSessionServer() },
             scope = backgroundScope,
         )
 
@@ -600,7 +700,7 @@ class SessionControllerTest {
             link = FakeLink(),
             slots = MemorySlots(),
             config = { USB_ONLY },
-            serverFactory = SessionServerFactory { _, _, _, _, _, _ -> server },
+            serverFactory = SessionServerFactory { _, _, _, _, _, _, _ -> server },
             scope = backgroundScope,
         )
 
@@ -663,7 +763,7 @@ class SessionControllerTest {
                 link = FakeLink(),
                 slots = MemorySlots(),
                 config = { USB_ONLY },
-                serverFactory = SessionServerFactory { _, _, _, _, _, _ -> server },
+                serverFactory = SessionServerFactory { _, _, _, _, _, _, _ -> server },
                 scope = realScope,
             )
 
@@ -951,7 +1051,7 @@ class SessionControllerTest {
             link = link,
             slots = slots,
             config = { config },
-            serverFactory = SessionServerFactory { cfg, _, _, _, _, _ -> FakeSessionServer().also { servers += cfg to it } },
+            serverFactory = SessionServerFactory { cfg, _, _, _, _, _, _ -> FakeSessionServer().also { servers += cfg to it } },
             scope = backgroundScope,
             now = { 0L },
         )
@@ -1052,7 +1152,7 @@ class SessionControllerTest {
             link = link,
             slots = slots,
             config = { CODED_WIFI_ONLY },
-            serverFactory = SessionServerFactory { _, _, _, _, _, _ ->
+            serverFactory = SessionServerFactory { _, _, _, _, _, _, _ ->
                 FakeSessionServer(onRevoke = {
                     if (stopDuringRevoke) {
                         c.stop()
@@ -1090,7 +1190,7 @@ class SessionControllerTest {
             link = link,
             slots = slots,
             config = { config },
-            serverFactory = SessionServerFactory { cfg, registry, egress, filter, _, _ ->
+            serverFactory = SessionServerFactory { cfg, registry, egress, filter, _, _, _ ->
                 created += cfg
                 RegistryRevokingServer(ProxyServer(cfg, registry, egress, filter))
             },
@@ -1202,7 +1302,7 @@ class SessionControllerTest {
             link = link,
             slots = slots,
             config = { config },
-            serverFactory = SessionServerFactory { cfg, registry, egress, filter, _, _ ->
+            serverFactory = SessionServerFactory { cfg, registry, egress, filter, _, _, _ ->
                 RegistryRevokingServer(ProxyServer(cfg, registry, egress, filter))
             },
             scope = backgroundScope,
@@ -1239,7 +1339,7 @@ class SessionControllerTest {
             link = link,
             slots = MemorySlots(),
             config = { WIFI_ONLY },
-            serverFactory = SessionServerFactory { cfg, _, _, _, _, _ ->
+            serverFactory = SessionServerFactory { cfg, _, _, _, _, _, _ ->
                 FakeSessionServer().also {
                     if (!cfg.bindAddress.isLoopbackAddress && portInUse) it.startThrows = java.net.BindException("in use")
                 }
