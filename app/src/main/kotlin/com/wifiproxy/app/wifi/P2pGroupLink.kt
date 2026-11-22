@@ -23,6 +23,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlin.time.TimeSource
 
 const val REASON_CREATING = "Creating the Wi-Fi Direct group"
 const val REASON_RETRYING = "Wi-Fi Direct group failed; retrying"
@@ -61,6 +62,11 @@ class P2pGroupLink(
     private val infoRetryDelayMs: Long = 1_000L,
     /** How many poll intervals to wait in total (30 × 1 s) before treating the create as failed. */
     private val infoRetries: Int = 30,
+    /** Verbose diagnostics: one line per step of each group attempt (adopt or create, the band,
+     *  `WifiP2pManager` result codes, the group-info wait, the 5 GHz fallback, retries and
+     *  losses). Never the Wi-Fi name or password. Called from the run coroutine, outside
+     *  [lifecycle]; it must not block, and an exception from it is ignored. */
+    private val debug: (String) -> Unit = {},
 ) : LinkManager {
     private val _state = MutableStateFlow<LinkState>(LinkState.Idle)
     override val state: StateFlow<LinkState> = _state.asStateFlow()
@@ -134,6 +140,10 @@ class P2pGroupLink(
         healthChecks.trySend(Unit)
     }
 
+    private fun log(message: String) {
+        runCatching { debug(message) }
+    }
+
     private sealed interface Attempt {
         data class Up(val state: LinkState.Up) : Attempt
         data class Fatal(val message: String) : Attempt
@@ -149,6 +159,7 @@ class P2pGroupLink(
             runUntilStoppedOrFatal(config)
         } catch (e: Exception) {
             if (e is CancellationException) rethrowIfCancelled(e)
+            log("group run failed: ${e::class.simpleName ?: "unknown"}")
             _state.value = LinkState.Failed("Wi-Fi Direct error: ${e::class.simpleName ?: "unknown"}")
         }
     }
@@ -162,6 +173,7 @@ class P2pGroupLink(
         var lostPreviously = false
         while (true) {
             if (!api.p2pEnabled.value) {
+                log("Wi-Fi P2P is off; waiting for it")
                 _state.value = LinkState.Down(REASON_WIFI_OFF)
                 api.p2pEnabled.first { it }
             }
@@ -177,14 +189,21 @@ class P2pGroupLink(
                 is Attempt.Up -> {
                     failures = 0
                     _state.value = attempt.state
-                    if (awaitLoss()) lostPreviously = true
+                    if (awaitLoss()) {
+                        log("group lost")
+                        lostPreviously = true
+                    } else {
+                        log("Wi-Fi P2P turned off while the group was up")
+                    }
                 }
                 is Attempt.Fatal -> {
+                    log("attempt failed for good; needs the user")
                     _state.value = LinkState.Failed(attempt.message)
                     return
                 }
                 is Attempt.Retry -> {
                     if (!api.p2pEnabled.value) {
+                        log("attempt failed (reason ${attempt.reason}) while Wi-Fi P2P went off; not counted")
                         // Wi-Fi dropped during this attempt (create failed, or disappeared, because
                         // of it); that's not a consecutive failure of our own doing. Reset the count
                         // and let the top of the loop wait for Wi-Fi to come back.
@@ -192,12 +211,15 @@ class P2pGroupLink(
                     } else {
                         failures++
                         if (failures >= maxConsecutiveFailures) {
+                            log("attempt failed (reason ${attempt.reason}); giving up after $failures in a row")
                             _state.value =
                                 LinkState.Failed("Couldn't create the Wi-Fi Direct group (error ${attempt.reason}).")
                             return
                         }
+                        val backoffMs = minOf(1000L shl (failures - 1), MAX_BACKOFF_MS)
+                        log("attempt failed (reason ${attempt.reason}); failure $failures, retrying in $backoffMs ms")
                         _state.value = LinkState.Down(REASON_RETRYING)
-                        delay(minOf(1000L shl (failures - 1), MAX_BACKOFF_MS))
+                        delay(backoffMs)
                     }
                 }
             }
@@ -212,36 +234,63 @@ class P2pGroupLink(
         api.groupInfo()?.let { existing ->
             val owner = existing.ownerAddress
             if (owner != null && existing.networkName == creds.ssid && existing.passphrase == creds.password) {
+                log("adopting the existing group (owner ${owner.hostAddress})")
                 return Attempt.Up(LinkState.Up(owner, creds))
             }
+            log("an existing group doesn't match (or isn't complete); removing it")
         }
         api.removeGroup()
         var band = if (config.prefer5Ghz) GroupBand.GHZ_5 else GroupBand.AUTO
-        var result = api.createGroup(GroupRequest(creds.ssid, creds.password, band))
+        var result = createLogged(creds.ssid, creds.password, band)
         if (band == GroupBand.GHZ_5 && result is CreateResult.Failure && result.reason !in NO_BAND_FALLBACK) {
+            log("5 GHz create failed; falling back to AUTO")
             band = GroupBand.AUTO
-            result = api.createGroup(GroupRequest(creds.ssid, creds.password, band))
+            result = createLogged(creds.ssid, creds.password, band)
         }
         if (result is CreateResult.Failure) return failureAttempt(result.reason)
-        var info = awaitGroupInfo()
+        var info = awaitGroupInfoLogged()
         if (info == null && band == GroupBand.GHZ_5) {
             // Some firmware accepts a 5 GHz group and then never brings it up; try AUTO once
             // before counting this attempt as a failure.
+            log("5 GHz group never came up; recreating at AUTO")
             api.removeGroup()
             band = GroupBand.AUTO
-            val retry = api.createGroup(GroupRequest(creds.ssid, creds.password, band))
+            val retry = createLogged(creds.ssid, creds.password, band)
             if (retry is CreateResult.Failure) return failureAttempt(retry.reason)
-            info = awaitGroupInfo()
+            info = awaitGroupInfoLogged()
         }
         if (info == null) return Attempt.Retry(CreateResult.ERROR)
         val ownerAddress = info.ownerAddress ?: return Attempt.Retry(CreateResult.ERROR)
         if (info.networkName != creds.ssid || info.passphrase != creds.password) {
+            log("the group came up with a different name or password than requested")
             api.removeGroup()
             return Attempt.Fatal(
                 "This phone ($deviceModel) ignored the requested Wi-Fi name or password. Wi-Fi Direct sharing can't be used on it.",
             )
         }
+        log("group up at $band (owner ${ownerAddress.hostAddress})")
         return Attempt.Up(LinkState.Up(ownerAddress, creds))
+    }
+
+    /** [P2pApi.createGroup], logging the band and the result code (never the name or password). */
+    private suspend fun createLogged(ssid: String, passphrase: String, band: GroupBand): CreateResult {
+        val result = api.createGroup(GroupRequest(ssid, passphrase, band))
+        log(
+            when (result) {
+                CreateResult.Success -> "createGroup($band): success"
+                is CreateResult.Failure -> "createGroup($band): failure, reason ${result.reason}"
+            },
+        )
+        return result
+    }
+
+    /** [awaitGroupInfo], logging how long the group info took (or that it never came). */
+    private suspend fun awaitGroupInfoLogged(): GroupInfo? {
+        val mark = TimeSource.Monotonic.markNow()
+        val info = awaitGroupInfo()
+        val waitedMs = mark.elapsedNow().inWholeMilliseconds
+        log(if (info != null) "group info after $waitedMs ms" else "no complete group info after $waitedMs ms")
+        return info
     }
 
     private fun failureAttempt(reason: Int): Attempt = when (reason) {
