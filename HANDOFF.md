@@ -19,8 +19,8 @@ An Android app that shares a phone's **cellular data** with other devices **with
 | `tools/usb-client/README.md` | Laptop-side usage (Windows script, macOS/Linux manual steps) |
 
 ## Repository and branches
-- **GitHub:** private repo `Mahtab-Labs-AI/bridgeline` (the project's public name), remote `origin`.
-- **`main`:** the stable, released line. Its latest release is **Bridgeline 1.0.0** (tag `v1.0.0.124`, a GitHub release with the APK attached). It is **protected** by the `protect-main` ruleset:
+- **GitHub:** the repo lives at `Mahtab-Labs-AI/bridgeline` (the project's public name), remote `origin`. This history was rewritten on 2026-11-22 so that every commit and tag is authored by **Mahtab Labs AI** `<359696312+Mahtab-Labs-AI@users.noreply.github.com>`, and no personal, company or co-author email appears anywhere. Commit IDs differ from the earlier private repo; the code and the BUILD numbers are unchanged.
+- **`main`:** the stable, released line. Its latest release is **Bridgeline 1.0.0** (tag `v1.0.0.124`). Set up on GitHub (recreate the release, ruleset and CI if they're missing). It is **protected** by the `protect-main` ruleset:
   - changes arrive only by pull request;
   - merge commits only, because BUILD is the commit count;
   - the CI check "Build and test" is required;
@@ -31,7 +31,7 @@ An Android app that shares a phone's **cellular data** with other devices **with
   2. Build and test on phones from `develop`.
   3. When it's good, open a PR from `develop` to `main` and merge it.
 - **Old feature branches** (`feature/*`) are kept for history.
-- **Offline backup:** the newest git bundle in the handoff folder (`android-wifi-proxy-2026-11-21b.bundle`).
+- **Offline backup:** a git bundle of this rewritten history (`bridgeline-mahtab-1.0.0.bundle`) in the handoff folder. Bundles made earlier contain the old author emails, so don't share them.
 
 ## State
 - **`:proxy-core`** (pure Kotlin/JVM, **214 tests**): the slot registry with pinned slots and unpersisted per-IP auto slots for open admission, a strict parser, PAC/mobileconfig/probes (including the fixed `/proxy.pac` and `/proxy.mobileconfig` paths), a post-DNS destination filter, a happy-eyeballs dialer, the NIO selector loop, a per-direction tunnel failure policy, and a ProxyServer with pre-admission caps and per-run state.
@@ -93,11 +93,10 @@ An Android app that shares a phone's **cellular data** with other devices **with
 - **The SDK** is in `%LOCALAPPDATA%\Android\Sdk`. `sdkmanager` now delegates to the new `android` CLI; install packages with `android.exe --sdk=<sdk> sdk install platforms/android-36` (slash-separated package names).
 - **Android Studio was uninstalled.** It isn't needed.
 - **Write `local.properties` with escaped backslashes.** The Bash tool collapses `\\`, so use a proper editor.
-- **Branches:** `main` (309ef95) has only Plan 1 and Plan 2a; `feature/wifi-direct` (head `051b9e6`) adds Plan 2b and is not yet merged. The backup is the git bundle in the handoff folder.
 - **Install note:** debug APKs built on different machines have different debug keys, so uninstall the old app before installing a build from another machine.
 
 ## Working conventions used so far
 - Superpowers workflow: brainstorm → spec → plan → subagent-driven implementation, with a spec-compliance review and a code-quality review per task, plus a final branch review.
 - Commit by **explicit paths only**. Check `git diff --cached --name-only` before committing, because parallel agents share the index.
-- Commit trailer: `Co-Authored-By: Claude Opus 5.5 (1M context)`.
+- Commits are authored as `Mahtab Labs AI <359696312+Mahtab-Labs-AI@users.noreply.github.com>` (set in this repo's local git config), with **no** `Co-Authored-By` trailer and no other email in messages or files.
 - Never change the host PC's proxy settings in tests; use `connect-usb.ps1 -DryRun`.
