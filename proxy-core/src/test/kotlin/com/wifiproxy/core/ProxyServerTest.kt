@@ -103,6 +103,33 @@ class ProxyServerTest {
         return ss
     }
 
+    /** An upstream that reads one HTTP request head, replies with a fixed "101 Switching
+     *  Protocols" handshake, then echoes every byte after that raw. Used to prove a CONNECT
+     *  tunnel relays an Upgrade handshake, and the binary frames that follow it, unchanged -
+     *  see github.com/Mahtab-Labs-AI/bridgeline/issues/11. */
+    private fun startWebSocketUpstream(): ServerSocket {
+        val ss = ServerSocket(0, 50, loopback)
+        closeables += ss
+        thread(isDaemon = true) {
+            while (!ss.isClosed) {
+                val s = try { ss.accept() } catch (e: IOException) { break }
+                thread(isDaemon = true) {
+                    s.use {
+                        runCatching {
+                            readHeadBlocking(it.getInputStream())
+                            it.getOutputStream().write(
+                                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+                                    .toByteArray(Charsets.ISO_8859_1),
+                            )
+                            it.getInputStream().copyTo(it.getOutputStream())
+                        }
+                    }
+                }
+            }
+        }
+        return ss
+    }
+
     private fun readHeadBlocking(input: InputStream): String {
         val sb = StringBuilder()
         while (!sb.endsWith("\r\n\r\n")) {
@@ -206,6 +233,34 @@ class ProxyServerTest {
         assertTrue(slot.auto)
         assertEquals(guest, slot.boundIp)
         assertTrue(registry.snapshot().isEmpty())
+    }
+
+    @Test
+    fun `a CONNECT tunnel relays a websocket upgrade handshake and binary frames unchanged`() {
+        // github.com/Mahtab-Labs-AI/bridgeline/issues/11: CONNECT never parses HTTP once the
+        // tunnel is open (Tunnel is a raw ByteBuffer pump), so an inner wss:// WebSocket handshake
+        // and whatever binary frames follow it must pass through byte-for-byte, unlike a plain
+        // ws:// upgrade attempted over the Forward path (see RequestParserTest, which covers that
+        // the Forward path strips it instead).
+        start(openAdmission = true)
+        val upstream = startWebSocketUpstream()
+        val (s, head) = openConnect(upstream.localPort, from = guest)
+        assertTrue(head.startsWith("HTTP/1.1 200 Connection Established"), head)
+
+        val upgradeRequest = "GET /chat HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\n" +
+            "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        s.getOutputStream().write(upgradeRequest.toByteArray(Charsets.ISO_8859_1))
+        val handshakeResponse = readHeadBlocking(s.getInputStream())
+        assertEquals(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+            handshakeResponse,
+        )
+
+        // A binary "frame" including a NUL byte and values past 0x7F: CONNECT must not treat this
+        // as text, unlike the Forward path which parses a head line by line.
+        val frame = byteArrayOf(0x00, 0x01.toByte(), 0xFF.toByte(), 0x7E.toByte(), 0x80.toByte(), 'x'.code.toByte())
+        s.getOutputStream().write(frame)
+        assertEquals(frame.toList(), s.getInputStream().readNBytes(frame.size).toList())
     }
 
     @Test

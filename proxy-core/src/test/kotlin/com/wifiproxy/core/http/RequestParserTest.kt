@@ -29,6 +29,16 @@ class RequestParserTest {
     }
 
     @Test
+    fun `connect accepts any destination port, including non-standard ones apps use for raw traffic`() {
+        // github.com/Mahtab-Labs-AI/bridgeline/issues/11: IBKR's Android app uses unproxied TCP
+        // 4000/4001. The parser has no port allowlist/denylist at all (DestinationFilter only
+        // blocks by IP range), so CONNECT to any of these must parse identically.
+        for (port in listOf(443, 4000, 4001)) {
+            assertEquals(Connect("example.com", port), parse("CONNECT example.com:$port HTTP/1.1\r\nHost: example.com:$port"))
+        }
+    }
+
+    @Test
     fun `absolute http uri becomes forward`() {
         val r = assertIs<Forward>(parse("GET http://example.com:8081/a/b?q=1 HTTP/1.1\r\nHost: example.com:8081\r\nAccept: */*"))
         assertEquals("GET", r.method)
@@ -75,6 +85,24 @@ class RequestParserTest {
             "POST /x HTTP/1.1\r\nHost: example.com\r\nContent-Length: 3\r\nConnection: close\r\n\r\n",
             r.upstreamHead().text(),
         )
+    }
+
+    @Test
+    fun `upstream head strips a plain-HTTP (not TLS) websocket upgrade attempt`() {
+        // github.com/Mahtab-Labs-AI/bridgeline/issues/11: `upgrade` is hop-by-hop (HOP_BY_HOP
+        // above), so a plain ws:// upgrade sent through the Forward path is always stripped and
+        // Connection is always forced to close - a plain WebSocket can never establish this way.
+        // This does NOT apply to wss://, which almost every real app uses: that goes through
+        // ProxyRequest.Connect (a raw byte tunnel, see ProxyServerTest's websocket-over-CONNECT
+        // test), not this Forward path, and is unaffected.
+        val r = parse(
+            "GET http://example.com/chat HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\n" +
+                "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13"
+        ) as Forward
+        val head = r.upstreamHead().text()
+        assertTrue("Upgrade" !in head, head)
+        assertTrue("websocket" !in head, head)
+        assertTrue(head.endsWith("Connection: close\r\n\r\n"), head)
     }
 
     @Test
