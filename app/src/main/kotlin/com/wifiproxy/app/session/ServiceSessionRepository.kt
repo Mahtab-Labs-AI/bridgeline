@@ -383,6 +383,7 @@ class ServiceSessionRepository(
             // nothing else about the session changed, which would otherwise leave the StateFlow's
             // equality check suppressing the recomposition.
             nowMs = System.currentTimeMillis(),
+            activeWifiSeatCapacity = controller?.wifiSeatCapacity,
         )
     }
 

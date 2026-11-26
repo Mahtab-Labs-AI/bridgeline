@@ -214,11 +214,12 @@ class SessionControllerTest {
         verbose: () -> Boolean = { false },
         /** Collects each server's `onEvent`, in creation order (USB first). */
         eventSinks: MutableList<(ProxyEvent) -> Unit>? = null,
+        configSource: (() -> SessionConfig)? = null,
     ) = SessionController(
         egress = egress,
         link = link,
         slots = slots,
-        config = { config },
+        config = configSource ?: { config },
         serverFactory = SessionServerFactory { cfg, _, _, _, _, _, onEvent ->
             eventSinks?.add(onEvent)
             if (servers == null) server else FakeSessionServer().also { servers += cfg to it }
@@ -628,6 +629,7 @@ class SessionControllerTest {
         assertEquals(1, egress.stopCalls)
         assertEquals("bind failed", c.lastError.value)
         assertNull(c.registry)
+        assertNull(c.wifiSeatCapacity)
     }
 
     @Test
@@ -1408,5 +1410,87 @@ class SessionControllerTest {
         assertEquals(SessionPhase.RUNNING, c.state.value)
         assertEquals(8080, c.wifiEndpoint?.port)
         assertNotNull(c.addDevice("Pixel", ClientPlatform.ANDROID))
+    }
+
+    @Test
+    fun `wifi seat capacity follows the effective startup configuration`() = runTest {
+        val cases = listOf(
+            Triple(true, 1, 0), Triple(true, 2, 1), Triple(true, 3, 2),
+            Triple(false, 1, 1), Triple(true, 0, 0), Triple(true, 4, 2),
+        )
+        for (requireCodes in listOf(false, true)) {
+            for ((usbEnabled, limit, expected) in cases) {
+                val cfg = (if (usbEnabled) BOTH else WIFI_ONLY).copy(
+                    maxClients = limit, requireDeviceCodes = requireCodes,
+                )
+                val c = controller(scope = backgroundScope, config = cfg)
+                assertNull(c.wifiSeatCapacity)
+                c.start(); runCurrent()
+                assertEquals(expected, c.wifiSeatCapacity)
+                assertEquals(expected, c.registry!!.maxClients - (if (usbEnabled) 1 else 0))
+                c.stop(); runCurrent()
+                assertNull(c.wifiSeatCapacity)
+            }
+        }
+    }
+
+    @Test
+    fun `wifi seat capacity stays with the active config until restart`() = runTest {
+        // Hand-derived capacities for both directions of the saved-limit change.
+        val transitions = listOf(
+            listOf(1, 2, 0, 1), listOf(1, 3, 0, 2),
+            listOf(2, 1, 1, 0), listOf(3, 1, 2, 0),
+        )
+        for ((initialLimit, nextLimit, initialCapacity, nextCapacity) in transitions) {
+            val egress = FakeSessionEgress()
+            val link = FakeLink()
+            var cfg = BOTH.copy(maxClients = initialLimit)
+            val c = controller(
+                scope = backgroundScope, egress = egress, link = link,
+                configSource = { cfg }, servers = mutableListOf(),
+            )
+            c.start(); runCurrent(); link.up(); runCurrent()
+            assertEquals(SessionPhase.RUNNING, c.state.value)
+            assertEquals(initialCapacity, c.wifiSeatCapacity)
+
+            cfg = cfg.copy(maxClients = nextLimit)
+            assertEquals(initialCapacity, c.wifiSeatCapacity)
+            egress.setAvailable(false); runCurrent()
+            assertEquals(SessionPhase.DEGRADED, c.state.value)
+            assertEquals(initialCapacity, c.wifiSeatCapacity)
+
+            c.stop(); runCurrent()
+            assertNull(c.wifiSeatCapacity)
+            egress.setAvailable(true)
+            c.start(); runCurrent(); link.up(); runCurrent()
+            assertEquals(SessionPhase.RUNNING, c.state.value)
+            assertEquals(nextCapacity, c.wifiSeatCapacity)
+            c.stop(); runCurrent()
+            assertNull(c.wifiSeatCapacity)
+        }
+    }
+
+    @Test
+    fun `occupied and inactive wifi slots do not reduce configured capacity`() = runTest {
+        for (requireCodes in listOf(false, true)) {
+            val link = FakeLink()
+            val c = controller(
+                scope = backgroundScope, link = link, slots = MemorySlots(storedSlots(2)),
+                config = BOTH.copy(requireDeviceCodes = requireCodes), servers = mutableListOf(),
+            )
+            c.start(); runCurrent(); link.up(); runCurrent()
+            assertEquals(2, c.wifiSeatCapacity)
+            val registry = c.registry!!
+            if (!requireCodes) {
+                // Saved coded slots are inactive; fill both open-admission seats instead.
+                assertEquals(1, registry.slots().size)
+                assertNotNull(registry.admitOrCreate(InetAddress.getByName("192.168.49.20")))
+                assertNotNull(registry.admitOrCreate(InetAddress.getByName("192.168.49.21")))
+            }
+            assertEquals(3, registry.slots().size)
+            assertEquals(2, c.wifiSeatCapacity)
+            c.stop(); runCurrent()
+            assertNull(c.wifiSeatCapacity)
+        }
     }
 }

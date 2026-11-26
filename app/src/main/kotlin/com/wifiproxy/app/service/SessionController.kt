@@ -275,6 +275,14 @@ class SessionController(
      *  idle, when the next start's setting is what counts. */
     val openAdmission: Boolean? get() = sessionConfig?.let { !it.requireDeviceCodes }
 
+    /** Configured Wi-Fi capacity after this session's USB reservation, independent of occupancy.
+     *  Null without an active startup snapshot; saved next-start settings do not affect it. */
+    val wifiSeatCapacity: Int?
+        get() {
+            val cfg = sessionConfig ?: return null
+            return cfg.maxClients.coerceIn(1, ClientRegistry.MAX_CLIENTS_LIMIT) - (if (cfg.usbEnabled) 1 else 0)
+        }
+
     private var availabilityJob: Job? = null
     private var networkGenerationJob: Job? = null
     private var linkJob: Job? = null
