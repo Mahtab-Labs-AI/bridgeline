@@ -111,12 +111,21 @@ absence of the warnings was not reproduced on a device in this session.
 
 | Case | Required check | Status |
 | --- | --- | --- |
-| M1 | Idle USB on + limit 1: both hints; slider 2/3 clears previews, back to 1 restores; USB off clears | **DEFERRED TO ORIGINATING SESSION** |
-| M2 | Active zero-capacity Home banner, locked USB stop instructions, slider save/restart instructions, error colors and simultaneous VPN-banner layout | **DEFERRED TO ORIGINATING SESSION** |
-| M3 | Running limit 1 to 2: preview changes; Home before Save, after Save and after restart | **DEFERRED TO ORIGINATING SESSION** |
-| M4 | Running limit 2 to 1 with no saved Wi-Fi devices: Home before Save, after Save and after restart | **DEFERRED TO ORIGINATING SESSION** |
-| M5 | Unsaved/rejected edits and loading/unreadable settings preserve active state, validation/locking and visible save rejection | **DEFERRED TO ORIGINATING SESSION** |
-| M6 | IDLE/null/positive capacity hides Home warning, including occupied seats; startup/degradation/stop/restart has no stale banner | **DEFERRED TO ORIGINATING SESSION** |
+| M1 | Idle USB on + limit 1: both hints; slider 2/3 clears previews, back to 1 restores; USB off clears | **PASS** (user-reported) |
+| M2 | Active zero-capacity Home banner, locked USB stop instructions, slider save/restart instructions, error colors and simultaneous VPN-banner layout | **PASS** (user-reported) |
+| M3 | Running limit 1 to 2: preview changes; Home before Save, after Save and after restart | **PASS** (user-reported) |
+| M4 | Running limit 2 to 1 with no saved Wi-Fi devices: Home before Save, after Save and after restart | **PASS** (user-reported) |
+| M5 | Unsaved/rejected edits and loading/unreadable settings preserve active state, validation/locking and visible save rejection | **PASS** (user-reported) |
+| M6 | IDLE/null/positive capacity hides Home warning, including occupied seats; startup/degradation/stop/restart has no stale banner | **PASS** (user-reported) |
+
+### Device acceptance result (2026-11-27)
+
+Using the step-by-step checklist in `2026-11-27-usb-seat-wifi-warning-device-checklist.md` (this same
+folder), the user ran M2-M6 on a **Pixel 11, Android API 36**, and reported all cases PASS. Installed
+package/version was not independently re-confirmed in this record (expected `1.0.0.139`, matching the
+reviewed/frozen evidence APK), and no screenshots were attached to this record. The M5 unreadable-
+credentials sub-case's exact reproduction method was not separately itemized; it is included in the
+overall M5 pass as reported.
 
 Screenshots still required: Home warning, locked USB hint, and pending higher-limit state, without credentials/client details.
 No deferred manual checkbox is marked complete in the implementation plan.
@@ -169,6 +178,21 @@ Full current ledger: `C:\source\android-wifi-proxy-handoff\docs\handoffs\usb-sea
 ### Chrome browsing follow-up (user-reported)
 
 Following successful explicit curl requests, the user reported that Chrome could not browse and `scutil --proxy` returned an empty dictionary. The session supplied graphical FoxyProxy setup for an individual HTTP proxy at `127.0.0.1:8081`, blank credentials, selected for all websites. The user then confirmed "it is working with foxyproxy". Chrome browser connectivity with that configuration is PASS by user report. Mac Wi-Fi off was instructed but not separately confirmed; browser/extension versions, loaded pages and screenshots were not supplied. This does not establish automatic forwarding recovery or M2-M6 warning acceptance. The archive FINAL-VERIFICATION.md contains the current detailed ledger. No implementation or test source changed.
+
+### M2-M6 device acceptance complete (2026-11-27)
+
+The user ran the full M2-M6 matrix via the step-by-step checklist (`2026-11-27-usb-seat-wifi-warning-
+device-checklist.md`, this same folder) on a **Pixel 11, Android API 36**, and reported **all cases
+PASS**. This resolves the "M2-M6 and pre-warning device reproduction remain UNVERIFIED" statements
+above for M2-M6 specifically; pre-warning absence-of-warning reproduction on a physical device was not
+separately re-run. Installed package/version was not independently re-confirmed against the device in
+this record (expected `1.0.0.139`); no screenshots were attached to this record, though the checklist
+calls for them under `evidence\device\`. The M5 unreadable-credentials sub-case's specific reproduction
+method was not itemized separately; it is included in the overall user-reported M5 pass.
+
+Updated disposition: **AUTOMATED VERIFICATION PASSED; M1-M6 DEVICE ACCEPTANCE PASSED (user-reported)**.
+Package/version re-confirmation and screenshots remain open evidence gaps, not failing checks. No merge,
+push, release, or publication is authorized by this record alone.
 
 ## Draft PR handoff
 
