@@ -84,6 +84,10 @@ fun HomeScreen(repository: SessionRepository, modifier: Modifier = Modifier, onS
             VpnWarning()
         }
 
+        if (session.activeWifiSeatCapacity == 0 && session.phase != SessionPhase.IDLE) {
+            ZeroWifiSeatWarning()
+        }
+
         // The activity decides when Start really happens (after any permission dialog).
         StartStopButton(
             phase = session.phase,
@@ -216,6 +220,27 @@ private fun VpnWarning() {
             Text(
                 text = "A VPN is on. Wi-Fi Direct devices won't get replies through it. Exclude Bridgeline " +
                     "in your VPN app (split tunnelling) or turn the VPN off.",
+                style = MaterialTheme.typography.bodyMedium,
+            )
+        }
+    }
+}
+
+@Composable
+private fun ZeroWifiSeatWarning() {
+    Card(
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.errorContainer,
+            contentColor = MaterialTheme.colorScheme.onErrorContainer,
+        ),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Row(modifier = Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Filled.Warning, contentDescription = null)
+            Spacer(modifier = Modifier.width(12.dp))
+            Text(
+                text = "USB sharing reserves the only client seat in this session. For Wi-Fi devices, " +
+                    "set Max clients to 2 or 3, save, and restart sharing; or stop sharing and turn off USB sharing.",
                 style = MaterialTheme.typography.bodyMedium,
             )
         }

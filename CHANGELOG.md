@@ -9,6 +9,16 @@ The 0.x entries are reconstructed history; their commit ranges are commit hashes
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-28
+
+### Added
+- USB seat Wi-Fi warning: when USB sharing reserves the only client seat (Max clients = 1 with USB
+  sharing on), Home warns while the session is active and Settings shows an immediate hint explaining
+  how to raise the limit or turn USB sharing off. A running session only picks up a saved limit change
+  after sharing restarts, so Home keeps warning until then even if Settings no longer would.
+- CI: publish a GitHub release with the built debug APK when a `vX.Y.Z.BUILD` tag is pushed, using the
+  matching section of this file as the release body.
+
 ## [1.0.0] - 2026-11-21
 
 The first release under the name **Bridgeline**. It shares an Android phone's mobile data with

@@ -134,4 +134,86 @@ class FakeSessionRepositoryTest {
         assertTrue(repo.session.value.slots.none { it.id == slotId })
         assertTrue(repo.log.value.any { it.message.contains(slotName) })
     }
+
+    @Test
+    fun `active capacity snapshots demo inputs until restart`() = runTest {
+        var usbOn = true
+        val repo = FakeSessionRepository(scope = backgroundScope, now = { currentTime }, usbEnabled = { usbOn })
+        repo.session.value.slots.forEach { repo.revoke(it.id) }
+        assertEquals(SettingsUpdate.SAVED, repo.updateSettings(repo.settings.value.copy(maxClients = 1)))
+        assertNull(repo.session.value.activeWifiSeatCapacity)
+
+        repo.start(); runCurrent()
+        assertEquals(SessionPhase.STARTING, repo.session.value.phase)
+        assertEquals(0, repo.session.value.activeWifiSeatCapacity)
+        advanceTimeBy(1_500); runCurrent()
+        assertEquals(SettingsUpdate.SAVED, repo.updateSettings(repo.settings.value.copy(maxClients = 2)))
+        assertEquals(0, repo.session.value.activeWifiSeatCapacity)
+        assertEquals(2, repo.session.value.maxClients)
+
+        repo.stop(); runCurrent()
+        assertEquals(0, repo.session.value.activeWifiSeatCapacity) // retained through STOPPING
+        advanceTimeBy(500); runCurrent()
+        assertNull(repo.session.value.activeWifiSeatCapacity)
+        repo.start(); advanceTimeBy(1_500); runCurrent()
+        assertEquals(1, repo.session.value.activeWifiSeatCapacity)
+
+        usbOn = false
+        assertEquals(1, repo.session.value.activeWifiSeatCapacity)
+        repo.stop(); advanceTimeBy(500); runCurrent()
+        assertNull(repo.session.value.activeWifiSeatCapacity)
+        repo.start(); advanceTimeBy(1_500); runCurrent()
+        assertEquals(2, repo.session.value.activeWifiSeatCapacity)
+        repo.close()
+
+        val reverse = FakeSessionRepository(scope = backgroundScope, now = { currentTime }, usbEnabled = { true })
+        reverse.session.value.slots.forEach { reverse.revoke(it.id) }
+        assertEquals(SettingsUpdate.SAVED, reverse.updateSettings(reverse.settings.value.copy(maxClients = 2)))
+        reverse.start(); advanceTimeBy(1_500); runCurrent()
+        assertEquals(1, reverse.session.value.activeWifiSeatCapacity)
+        assertEquals(SettingsUpdate.SAVED, reverse.updateSettings(reverse.settings.value.copy(maxClients = 1)))
+        assertEquals(1, reverse.session.value.maxClients)
+        assertEquals(1, reverse.session.value.activeWifiSeatCapacity)
+        reverse.stop(); advanceTimeBy(500); runCurrent()
+        assertNull(reverse.session.value.activeWifiSeatCapacity)
+        reverse.start(); advanceTimeBy(1_500); runCurrent()
+        assertEquals(0, reverse.session.value.activeWifiSeatCapacity)
+        reverse.close()
+    }
+
+    @Test
+    fun `rejected demo settings leave active capacity unchanged`() = runTest {
+        val repo = FakeSessionRepository(scope = backgroundScope, now = { currentTime }, usbEnabled = { true })
+        val saved = repo.settings.value
+        repo.start(); advanceTimeBy(1_500); runCurrent()
+        assertEquals(2, repo.session.value.activeWifiSeatCapacity)
+        assertEquals(SettingsUpdate.REJECTED, repo.updateSettings(saved.copy(maxClients = 1)))
+        assertEquals(saved, repo.settings.value)
+        assertEquals(3, repo.session.value.maxClients)
+        assertEquals(2, repo.session.value.activeWifiSeatCapacity)
+        repo.close()
+    }
+
+    @Test
+    fun `demo capacity survives degradation and clears on stop`() = runTest {
+        val repo = FakeSessionRepository(scope = backgroundScope, now = { currentTime }, usbEnabled = { true })
+        repo.session.value.slots.forEach { repo.revoke(it.id) }
+        assertEquals(SettingsUpdate.SAVED, repo.updateSettings(repo.settings.value.copy(maxClients = 1)))
+        assertNull(repo.session.value.activeWifiSeatCapacity)
+        repo.start(); advanceTimeBy(1_500); runCurrent()
+        assertEquals(0, repo.session.value.activeWifiSeatCapacity)
+        advanceTimeBy(30_000); runCurrent()
+        assertEquals(SessionPhase.DEGRADED, repo.session.value.phase)
+        assertEquals(0, repo.session.value.activeWifiSeatCapacity)
+        advanceTimeBy(4_000); runCurrent()
+        assertEquals(SessionPhase.RUNNING, repo.session.value.phase)
+        assertEquals(0, repo.session.value.activeWifiSeatCapacity)
+        repo.stop(); runCurrent()
+        assertEquals(SessionPhase.STOPPING, repo.session.value.phase)
+        assertEquals(0, repo.session.value.activeWifiSeatCapacity)
+        advanceTimeBy(500); runCurrent()
+        assertEquals(SessionPhase.IDLE, repo.session.value.phase)
+        assertNull(repo.session.value.activeWifiSeatCapacity)
+        repo.close()
+    }
 }

@@ -1,0 +1,66 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history: BUILD is the commit count, same as ci.yml.
+          fetch-depth: 0
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Android SDK packages
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36" "build-tools;36.0.0" > /dev/null
+
+      - name: Build debug APK
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon :app:assembleDebug
+
+      - name: Extract changelog section
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          XYZ="$(echo "$VERSION" | cut -d. -f1-3)"
+          START=$(grep -n "^## \[$XYZ\]" CHANGELOG.md | head -1 | cut -d: -f1)
+          if [ -z "$START" ]; then
+            echo "No CHANGELOG.md section found for [$XYZ]; using a placeholder." >&2
+            echo "Release $GITHUB_REF_NAME" > release_notes.md
+          else
+            REST=$(tail -n +$((START + 1)) CHANGELOG.md | grep -n "^## \[" | head -1 | cut -d: -f1)
+            if [ -z "$REST" ]; then
+              sed -n "$((START + 1)),\$p" CHANGELOG.md > release_notes.md
+            else
+              END=$((START + REST - 1))
+              sed -n "$((START + 1)),${END}p" CHANGELOG.md > release_notes.md
+            fi
+          fi
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          body_path: release_notes.md
+          files: app/build/outputs/apk/debug/app-debug.apk

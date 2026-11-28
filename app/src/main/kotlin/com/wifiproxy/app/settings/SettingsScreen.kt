@@ -110,6 +110,7 @@ fun SettingsScreen(
         liveController?.state ?: MutableStateFlow(SessionPhase.IDLE)
     }.collectAsStateWithLifecycle()
     val demoSwitchLocked = liveControllerPhase != SessionPhase.IDLE
+    val zeroWifiSeatPreview = usbSharingEnabled && maxClients <= 1
 
     val suffixError = if (suffix.isNotEmpty()) WifiCredentialRules.suffixError(suffix) else null
     val passwordError = if (password.isNotEmpty()) WifiCredentialRules.passwordError(password) else null
@@ -186,14 +187,20 @@ fun SettingsScreen(
             }
             Text(
                 text = when {
+                    zeroWifiSeatPreview -> if (demoSwitchLocked) {
+                        "With this limit, USB sharing reserves the only client seat. Raise Max clients, save, " +
+                            "and restart sharing; or stop sharing to turn USB sharing off."
+                    } else {
+                        "With this limit, USB sharing reserves the only client seat. Raise Max clients or turn USB sharing off."
+                    }
                     demoSwitchLocked -> "Applies the next time sharing starts. Stop sharing to change it."
                     usbNeedsFreeSlot ->
                         "Remove a Wi-Fi device or raise the device limit first: the laptop needs a free slot."
                     else -> "Start sharing, then connect a laptop over USB."
                 },
                 style = MaterialTheme.typography.bodySmall,
-                // Only the D7 refusal is an error; the "applies next start" lock is information.
-                color = if (usbNeedsFreeSlot) {
+                // Zero capacity and the D7 refusal are warnings; the generic lock is information.
+                color = if (zeroWifiSeatPreview || usbNeedsFreeSlot) {
                     MaterialTheme.colorScheme.error
                 } else {
                     MaterialTheme.colorScheme.onSurfaceVariant
@@ -377,7 +384,18 @@ fun SettingsScreen(
                 valueRange = 1f..3f,
                 steps = 1,
             )
-            if (demoSwitchLocked) {
+            if (zeroWifiSeatPreview) {
+                Text(
+                    text = if (demoSwitchLocked) {
+                        "This limit leaves no Wi-Fi seat with USB sharing on. Raise the limit, save, and restart sharing; " +
+                            "or stop sharing to turn USB sharing off."
+                    } else {
+                        "This limit leaves no Wi-Fi seat with USB sharing on. Raise the limit or turn USB sharing off."
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            } else if (demoSwitchLocked) {
                 Text(
                     text = "Applies the next time sharing starts.",
                     style = MaterialTheme.typography.bodySmall,

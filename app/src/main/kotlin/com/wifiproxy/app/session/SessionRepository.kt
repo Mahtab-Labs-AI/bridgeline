@@ -66,6 +66,9 @@ data class SessionUi(
      *  [SlotUi.lastActivityMs]) keeps advancing on the 1 Hz poll even when nothing else about the
      *  session has changed. Always 0 for the fake, which has no idle auto slots to show. */
     val nowMs: Long = 0L,
+    /** This session's configured Wi-Fi capacity after the USB reservation, not free seats.
+     *  Null means unknown/inactive. Unlike saved [maxClients], this changes only on restart. */
+    val activeWifiSeatCapacity: Int? = null,
 )
 
 data class HostSettings(
