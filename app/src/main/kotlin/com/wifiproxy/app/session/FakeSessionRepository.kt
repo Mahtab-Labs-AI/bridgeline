@@ -2,6 +2,7 @@ package com.wifiproxy.app.session
 
 import com.wifiproxy.app.logs.VerbosePrefs
 import com.wifiproxy.app.logs.VerboseSwitch
+import com.wifiproxy.core.clients.ClientRegistry
 import java.security.SecureRandom
 import java.util.Base64
 import kotlinx.coroutines.CoroutineScope
@@ -30,6 +31,7 @@ class FakeSessionRepository(
     private val scope: CoroutineScope,
     private val now: () -> Long = { System.currentTimeMillis() },
     private val delayMs: suspend (Long) -> Unit = { delay(it) },
+    private val usbEnabled: () -> Boolean = { false },
 ) : SessionRepository {
 
     // A child Job of [scope] (I7), mirroring ServiceSessionRepository: [close] stops this
@@ -165,7 +167,9 @@ class FakeSessionRepository(
     override fun start() {
         if (_session.value.phase != SessionPhase.IDLE) return
         runJob = repositoryScope.launch {
-            _session.update { it.copy(phase = SessionPhase.STARTING) }
+            val limit = _settings.value.maxClients.coerceIn(1, ClientRegistry.MAX_CLIENTS_LIMIT)
+            val wifiSeatCapacity = limit - (if (usbEnabled()) 1 else 0)
+            _session.update { it.copy(phase = SessionPhase.STARTING, activeWifiSeatCapacity = wifiSeatCapacity) }
             appendLog("Starting session")
             delayMs(STARTING_DELAY_MS)
             _session.update {
@@ -218,6 +222,7 @@ class FakeSessionRepository(
             _session.update {
                 it.copy(
                     phase = SessionPhase.IDLE,
+                    activeWifiSeatCapacity = null,
                     degradedReason = null,
                     slots = it.slots.map { slot -> slot.copy(activeTunnels = 0) },
                 )
